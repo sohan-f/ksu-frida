@@ -1,3 +1,6 @@
+# v1.9.20
+- Fixed WebUI-saved config file permissions so the target app can read them (thanks @limbang, #7)
+
 # v1.9.4
 - Frida gadget updated to 17.9.1
 - Switched to own patched Frida fork
