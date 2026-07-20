@@ -4,9 +4,9 @@ ext {
     moduleName = "ksufrida"
     moduleAuthor = "gorkemgun"
     moduleDescription = "Frida gadget injection module for KernelSU via Zygisk"
-    moduleVersion = "v1.9.27"
-    moduleVersionCode = 37
+    moduleVersion = "v1.9.28"
+    moduleVersionCode = 38
 
     // Frida
-    fridaVersion = "17.16.1"
+    fridaVersion = "17.16.2"
 }
