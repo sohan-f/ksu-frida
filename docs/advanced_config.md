@@ -125,17 +125,15 @@ interactively if the child is only doing a quick check and exits.
 Please be aware as the child is forked, it already contains all libraries loaded that the parent process had.
 But as only a single thread returns from the fork the loaded frida gadget thread is not present in the child process.
 
-Reloading the same bundled gadget will fail to start. For this to work you have to load a copy of the gadget.
-You can't load the same file into the process again, a symbolic link won't work either it must be a copy.
+The module automatically stages a copy of the gadget (plus its config) into the app's data
+directory for each child process before injecting it. The same file cannot be loaded into the
+process twice and a symbolic link won't work either — it must be a copy.
 
-```shell
-adb shell su -c 'cp /data/local/tmp/libsec/libsecmon.so /data/local/tmp/libsec/libsecmon-child.so'
-```
+The default gadget configuration uses `"on_port_conflict": "pick-next"`, so the child's gadget
+binds the next free port instead of failing on the parent's 27042.
 
-The default configuration of a gadget will fail to start due to port conflict with the gadget in the parent process.
-So for the child process you would have to configure the gadget to use a different port.
-
-Create a gadget configuration at `/data/local/tmp/libsec/libsecmon-child.config.so`.
+If you want a dedicated gadget for child processes (different port or script), create its
+configuration at `/data/local/tmp/libsec/libsecmon-child.config.so`.
 See [Gadget Doc](https://frida.re/docs/gadget/) for reference.
 ```json
 {

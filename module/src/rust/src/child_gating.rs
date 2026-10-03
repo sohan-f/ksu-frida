@@ -4,7 +4,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::config::ChildGatingConfig;
-use crate::inject::inject_lib;
+use crate::inject::{current_app_name, stage_and_inject};
 use crate::log::logi;
 use crate::sys::{RTLD_DEFAULT, dlsym};
 
@@ -70,9 +70,9 @@ unsafe extern "C" fn fork_replacement() -> libc::pid_t {
         }
         "inject" => {
             if let Some(libraries) = INJECTED_LIBRARIES.get() {
+                let app_name = current_app_name();
                 for lib_path in libraries {
-                    logi(format!("{context}Injecting {lib_path}"));
-                    inject_lib(lib_path, &context);
+                    stage_and_inject(lib_path, &app_name, &context);
                 }
             }
             0
