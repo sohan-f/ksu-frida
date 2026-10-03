@@ -144,8 +144,80 @@ fn copy_file(src: &str, dst: &str) -> bool {
         }
     };
 
+    match copy_file_range_all(&input, &output, src, dst, src_len) {
+        RangeOutcome::Done => true,
+        RangeOutcome::Failed => false,
+        RangeOutcome::Unsupported => copy_file_loop(&mut input, &mut output, src, dst, 0, src_len),
+    }
+}
+
+#[derive(PartialEq, Eq)]
+enum RangeOutcome {
+    Done,
+    Failed,
+    Unsupported,
+}
+
+fn copy_file_range_all(
+    input: &File,
+    output: &File,
+    src: &str,
+    dst: &str,
+    src_len: u64,
+) -> RangeOutcome {
+    use std::os::unix::io::AsRawFd;
+
+    let mut remaining = src_len;
+    let mut first = true;
+    while remaining > 0 {
+        let chunk = remaining.min(1 << 30) as usize;
+        match crate::sys::copy_file_range(input.as_raw_fd(), output.as_raw_fd(), chunk) {
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err) => {
+                if first
+                    && matches!(
+                        err.raw_os_error(),
+                        Some(libc::ENOSYS)
+                            | Some(libc::EXDEV)
+                            | Some(libc::EINVAL)
+                            | Some(libc::EOPNOTSUPP)
+                    )
+                {
+                    return RangeOutcome::Unsupported;
+                }
+                loge(format!(
+                    "stage: kernel copy of {src} -> {dst} failed: {err}"
+                ));
+                return RangeOutcome::Failed;
+            }
+            Ok(0) => break,
+            Ok(n) => {
+                remaining -= n;
+                first = false;
+            }
+        }
+    }
+
+    if remaining != 0 {
+        loge(format!(
+            "stage: short kernel copy of {src} -> {dst}: {} of {src_len} bytes",
+            src_len - remaining
+        ));
+        return RangeOutcome::Failed;
+    }
+    RangeOutcome::Done
+}
+
+fn copy_file_loop(
+    input: &mut File,
+    output: &mut File,
+    src: &str,
+    dst: &str,
+    already: u64,
+    src_len: u64,
+) -> bool {
     let mut buf = [0u8; 65536];
-    let mut copied: u64 = 0;
+    let mut copied: u64 = already;
     loop {
         let n = match input.read(&mut buf) {
             Ok(0) => break,
@@ -563,6 +635,64 @@ mod tests {
         let dst = dir.join("dst.bin");
 
         assert!(!copy_file(dir.to_str().unwrap(), dst.to_str().unwrap()));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn copy_file_loop_copies_every_byte() {
+        let dir = scratch("loop-direct");
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.bin");
+        let dst = dir.join("dst.bin");
+
+        let payload: Vec<u8> = (0..200_000).map(|i| (i % 251) as u8).collect();
+        fs::write(&src, &payload).unwrap();
+
+        let mut input = File::open(&src).unwrap();
+        let len = input.metadata().unwrap().len();
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&dst)
+            .unwrap();
+        assert!(copy_file_loop(
+            &mut input,
+            &mut output,
+            "src",
+            "dst",
+            0,
+            len
+        ));
+        assert_eq!(fs::read(&dst).unwrap(), payload);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn copy_file_range_matches_source_size() {
+        let dir = scratch("range");
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.bin");
+        let dst = dir.join("dst.bin");
+
+        let payload: Vec<u8> = (0..200_000).map(|i| (i % 251) as u8).collect();
+        fs::write(&src, &payload).unwrap();
+
+        let input = File::open(&src).unwrap();
+        let len = input.metadata().unwrap().len();
+        let output = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&dst)
+            .unwrap();
+        match copy_file_range_all(&input, &output, "src", "dst", len) {
+            RangeOutcome::Done => assert_eq!(fs::read(&dst).unwrap(), payload),
+            RangeOutcome::Unsupported => {}
+            RangeOutcome::Failed => panic!("kernel copy failed outright"),
+        }
 
         fs::remove_dir_all(&dir).ok();
     }
