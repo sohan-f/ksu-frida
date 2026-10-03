@@ -1,5 +1,6 @@
 
 use std::ffi::{CStr, CString, NulError, c_char, c_int, c_void};
+use std::io;
 
 pub const RTLD_NOW: c_int = 2;
 
@@ -61,6 +62,31 @@ pub fn set_errno(value: c_int) {
     // SAFETY: bionic documents `__errno()` with the same contract.
     unsafe {
         *libc::__errno() = value;
+    }
+}
+
+/// # Safety
+/// `fd_in`/`fd_out` must be open files (readable/writable respectively);
+/// `len` bounds the transfer.
+pub fn copy_file_range(fd_in: c_int, fd_out: c_int, len: usize) -> Result<u64, io::Error> {
+    // SAFETY: plain syscall with two live fds, NULL offsets (the documented
+    // file-offset form), and a bounded length; the return/errno contract is
+    // read immediately below.
+    let n = unsafe {
+        libc::syscall(
+            libc::SYS_copy_file_range,
+            fd_in,
+            std::ptr::null::<libc::c_void>(),
+            fd_out,
+            std::ptr::null::<libc::c_void>(),
+            len,
+            0 as libc::c_uint,
+        )
+    };
+    if n < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(n as u64)
     }
 }
 
