@@ -1,17 +1,17 @@
 
 use std::ffi::{c_int, c_void};
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::thread;
 use std::time::Duration;
 
 use crate::config::ChildGatingConfig;
 use crate::inject::{current_app_name, stage_and_inject};
-use crate::log::logi;
-use crate::sys::{RTLD_DEFAULT, dlsym};
+use crate::log::{loge, logi};
+use crate::sys::{RTLD_DEFAULT, dlsym, set_errno};
 
 type ForkFn = unsafe extern "C" fn() -> libc::pid_t;
 
-static mut ORIG_FORK: Option<ForkFn> = None;
-static mut ORIG_VFORK: Option<ForkFn> = None;
+static ORIG_FORK: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 static CHILD_GATING_MODE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static INJECTED_LIBRARIES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
@@ -34,16 +34,73 @@ unsafe fn ksufrida_dobby_hook(
     0
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ChildAction {
+    Kill,
+    Freeze,
+    Inject,
+    Pass,
+}
+
+fn child_action(mode: &str) -> ChildAction {
+    match mode {
+        "kill" => ChildAction::Kill,
+        "freeze" => ChildAction::Freeze,
+        "inject" => ChildAction::Inject,
+        _ => ChildAction::Pass,
+    }
+}
+
+fn run_child_action(action: ChildAction, libraries: &[String]) -> libc::pid_t {
+    match action {
+        ChildAction::Kill => {
+            // SAFETY: `_exit(2)` takes a plain status and never returns.
+            unsafe { libc::_exit(0) }
+        }
+        ChildAction::Freeze => loop {
+            thread::sleep(Duration::from_secs(3600));
+        },
+        ChildAction::Inject => {
+            if libraries.is_empty() {
+                return 0;
+            }
+            // SAFETY: `getpid(2)` cannot fail.
+            let child_pid = unsafe { libc::getpid() };
+            let context = format!("[child_gating][pid {child_pid}] ");
+            let app_name = current_app_name();
+            for lib_path in libraries {
+                stage_and_inject(lib_path, &app_name, &context);
+            }
+            0
+        }
+        ChildAction::Pass => 0,
+    }
+}
+
 unsafe extern "C" fn fork_replacement() -> libc::pid_t {
+    let orig_ptr = ORIG_FORK.load(Ordering::Acquire);
+    if orig_ptr.is_null() {
+        logi("[child_gating] fork hook fired before its origin was published");
+        set_errno(libc::EAGAIN);
+        return -1;
+    }
+    // SAFETY: `orig_ptr` is the non-null fork trampoline published by
+    // `enable_child_gating`; `transmute` between two pointer-sized types is
+    // rejected at compile time on any target where the sizes differ.
+    let orig: ForkFn = unsafe { std::mem::transmute(orig_ptr) };
+
+    let mode = CHILD_GATING_MODE
+        .get()
+        .map(String::as_str)
+        .unwrap_or_default();
+
     // SAFETY: `getpid(2)` cannot fail.
     let parent_pid = unsafe { libc::getpid() };
     logi(format!(
-        "[child_gating][pid {parent_pid}] detected fork/vfork"
+        "[child_gating][pid {parent_pid}] detected fork/vfork (child_gating_mode {mode})"
     ));
 
-    // SAFETY: written by the Dobby shim before the hook can ever fire (`enable_child_gating` calls the shim first).
-    let orig = unsafe { ORIG_FORK }.expect("fork hook used before installation");
-    // SAFETY: `ORIG_FORK` is a valid function pointer installed by the shim; a null value is rejected by the `.expect` above.
+    // SAFETY: `orig` is the published trampoline and behaves as `fork(2)`.
     let child_pid = unsafe { orig() };
     if child_pid != 0 {
         logi(format!(
@@ -54,46 +111,23 @@ unsafe extern "C" fn fork_replacement() -> libc::pid_t {
 
     crate::remap::after_fork();
 
-    // SAFETY: `getpid(2)` cannot fail.
-    let child_pid = unsafe { libc::getpid() };
-    let context = format!("[child_gating][pid {child_pid}] ");
-
-    let mode = CHILD_GATING_MODE
+    let libraries = INJECTED_LIBRARIES
         .get()
-        .map(String::as_str)
+        .map(Vec::as_slice)
         .unwrap_or_default();
-
-    match mode {
-        "kill" => {
-            logi(format!("{context}killing child process"));
-            // SAFETY: `exit(2)` takes a plain `c_int` and never returns.
-            unsafe { libc::exit(0) };
-        }
-        "freeze" => {
-            logi(format!("{context}freezing child process"));
-            loop {
-                thread::sleep(Duration::from_secs(3600));
-            }
-        }
-        "inject" => {
-            if let Some(libraries) = INJECTED_LIBRARIES.get() {
-                let app_name = current_app_name();
-                for lib_path in libraries {
-                    stage_and_inject(lib_path, &app_name, &context);
-                }
-            }
-            0
-        }
-        other => {
-            logi(format!("{context}unknown child_gating_mode {other}"));
-            0
-        }
-    }
+    run_child_action(child_action(mode), libraries)
 }
 
 pub fn enable_child_gating(cfg: &ChildGatingConfig) {
     let _ = CHILD_GATING_MODE.set(cfg.mode.clone());
     let _ = INJECTED_LIBRARIES.set(cfg.injected_libraries.clone());
+
+    if child_action(&cfg.mode) == ChildAction::Pass {
+        loge(format!(
+            "unknown child_gating_mode {:?}; children will run ungated",
+            cfg.mode
+        ));
+    }
 
     logi("[child_gating] enabling child gating");
 
@@ -106,17 +140,29 @@ pub fn enable_child_gating(cfg: &ChildGatingConfig) {
 
     let replacement = fork_replacement as *const () as *mut c_void;
 
-    // SAFETY: addresses come from the `dlsym` calls above; the shim writes `ORIG_FORK` before committing the hook.
-    unsafe {
-        ksufrida_dobby_hook(fork_addr, replacement, (&raw mut ORIG_FORK).cast());
+    let mut fork_trampoline: *mut c_void = std::ptr::null_mut();
+    // SAFETY: `fork_addr` comes from the `dlsym` call above, `fork_trampoline`
+    // lives in this frame, and the shim only writes through `orig`.
+    let rc = unsafe { ksufrida_dobby_hook(fork_addr, replacement, &raw mut fork_trampoline) };
+    ORIG_FORK.store(fork_trampoline, Ordering::Release);
+    if rc == 0 {
+        logi("[child_gating] fork hook installed");
+    } else {
+        loge(format!(
+            "[child_gating] fork hook installation failed: {rc}"
+        ));
     }
-    logi("[child_gating] fork hook installed");
 
-    // SAFETY: as above; the shim writes `ORIG_VFORK` (deliberately never read — see the comment on that static).
-    unsafe {
-        ksufrida_dobby_hook(vfork_addr, replacement, (&raw mut ORIG_VFORK).cast());
+    let mut vfork_trampoline: *mut c_void = std::ptr::null_mut();
+    // SAFETY: as above, for the vfork slot; nothing ever reads the value.
+    let rc = unsafe { ksufrida_dobby_hook(vfork_addr, replacement, &raw mut vfork_trampoline) };
+    if rc == 0 {
+        logi("[child_gating] vfork hook installed");
+    } else {
+        loge(format!(
+            "[child_gating] vfork hook installation failed: {rc}"
+        ));
     }
-    logi("[child_gating] vfork hook installed");
 
     logi("[child_gating] child gating enabled");
 }
@@ -124,6 +170,42 @@ pub fn enable_child_gating(cfg: &ChildGatingConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicI32;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ORIGIN_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_origin() -> MutexGuard<'static, ()> {
+        ORIGIN_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    static ATEXIT_PROBE_FD: AtomicI32 = AtomicI32::new(-1);
+
+    extern "C" fn atexit_probe() {
+        let fd = ATEXIT_PROBE_FD.load(Ordering::Relaxed);
+        if fd < 0 {
+            return;
+        }
+        let byte = [1u8];
+        // SAFETY: `fd` is a test-owned pipe write end; a one-byte write
+        // either lands or fails, and the reader below accounts for both.
+        unsafe { libc::write(fd, byte.as_ptr().cast(), 1) };
+    }
+
+    fn pipe_pair() -> (i32, i32) {
+        let mut fds = [0; 2];
+        // SAFETY: `fds` is a valid two-element output buffer for `pipe(2)`.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe(2)");
+        (fds[0], fds[1])
+    }
+
+    unsafe extern "C" fn stand_in_fork() -> libc::pid_t {
+        4242
+    }
+
+    fn stand_in_ptr() -> *mut c_void {
+        stand_in_fork as *const () as *mut c_void
+    }
 
     #[test]
     fn hook_shim_is_callable() {
@@ -148,5 +230,163 @@ mod tests {
         let _ = INJECTED_LIBRARIES.set(cfg.injected_libraries.clone());
         assert_eq!(CHILD_GATING_MODE.get().map(String::as_str), Some("kill"));
         assert_eq!(INJECTED_LIBRARIES.get().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn child_action_dispatch_matches_the_mode() {
+        assert_eq!(child_action("kill"), ChildAction::Kill);
+        assert_eq!(child_action("freeze"), ChildAction::Freeze);
+        assert_eq!(child_action("inject"), ChildAction::Inject);
+        assert_eq!(child_action(""), ChildAction::Pass);
+        assert_eq!(child_action("kilo"), ChildAction::Pass);
+    }
+
+    #[test]
+    fn inject_without_libraries_stages_nothing() {
+        assert_eq!(run_child_action(ChildAction::Inject, &[]), 0);
+    }
+
+    #[test]
+    fn pass_mode_ignores_the_library_list() {
+        assert_eq!(run_child_action(ChildAction::Pass, &["/a.so".into()]), 0);
+    }
+
+    #[test]
+    fn fork_hook_without_origin_fails_the_fork_instead_of_panicking() {
+        let _guard = lock_origin();
+        ORIG_FORK.store(std::ptr::null_mut(), Ordering::Release);
+
+        // SAFETY: with no origin published the hook must fail without
+        // dereferencing anything — the same call the Dobby shim intercepts
+        // on device.
+        let pid = unsafe { fork_replacement() };
+
+        assert_eq!(pid, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EAGAIN),
+            "a failed fork must report a defined errno"
+        );
+    }
+
+    #[test]
+    fn fork_hook_returns_the_result_of_the_real_fork() {
+        let _guard = lock_origin();
+        ORIG_FORK.store(stand_in_ptr(), Ordering::Release);
+
+        // SAFETY: a valid published origin is installed for the call.
+        let pid = unsafe { fork_replacement() };
+        ORIG_FORK.store(std::ptr::null_mut(), Ordering::Release);
+
+        assert_eq!(pid, 4242);
+    }
+
+    #[test]
+    fn origin_publication_is_race_free_under_concurrent_hook_reads() {
+        let _guard = lock_origin();
+        let published = stand_in_ptr();
+        let absent = std::ptr::null_mut();
+        let iterations = if cfg!(miri) { 25 } else { 250 };
+
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for _ in 0..iterations {
+                        // SAFETY: both outcomes of the published origin are
+                        // valid: call the trampoline or fail the fork.
+                        match unsafe { fork_replacement() } {
+                            -1 | 4242 => {}
+                            other => panic!("fork_replacement returned {other}"),
+                        }
+                    }
+                });
+            }
+            for i in 0..iterations {
+                ORIG_FORK.store(
+                    if i % 2 == 0 { published } else { absent },
+                    Ordering::Release,
+                );
+            }
+        });
+
+        ORIG_FORK.store(std::ptr::null_mut(), Ordering::Release);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn kill_child_exits_zero_without_running_atexit_handlers() {
+        let _guard = lock_origin();
+        let _ = CHILD_GATING_MODE.set("kill".to_string());
+
+        static REGISTER: std::sync::Once = std::sync::Once::new();
+        let (read_fd, write_fd) = pipe_pair();
+        REGISTER.call_once(|| {
+            // SAFETY: `atexit_probe` has the required `extern "C" fn()`
+            // signature and lives as long as the process, and `Once`
+            // registers it exactly once; the return code is irrelevant — a
+            // failed registration only weakens the probe, never the logic.
+            let _ = unsafe { libc::atexit(atexit_probe) };
+        });
+        ATEXIT_PROBE_FD.store(write_fd, Ordering::Relaxed);
+
+        let fork_origin: ForkFn = libc::fork;
+        ORIG_FORK.store(fork_origin as *const () as *mut c_void, Ordering::Release);
+
+        // SAFETY: a valid origin is published for the call.
+        let child = unsafe { fork_replacement() };
+        assert!(child > 0, "the parent branch must return the child pid");
+
+        let mut status = 0;
+        // SAFETY: `child` is a live child of this process and `status` is a
+        // valid output slot.
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+
+        ATEXIT_PROBE_FD.store(-1, Ordering::Relaxed);
+        ORIG_FORK.store(std::ptr::null_mut(), Ordering::Release);
+        // SAFETY: both ends are test-owned. Closing the write end before the
+        // read makes an empty pipe report 0 instead of blocking.
+        unsafe {
+            libc::close(write_fd);
+            let mut byte = [0u8; 1];
+            let n = libc::read(read_fd, byte.as_mut_ptr().cast(), 1);
+            libc::close(read_fd);
+            assert_eq!(n, 0, "the child ran atexit handlers: exit(3) was used");
+        }
+
+        assert!(
+            libc::WIFEXITED(status),
+            "the kill child must exit normally, not die to a signal"
+        );
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn freeze_child_stays_alive_until_killed() {
+        // SAFETY: plain fork; only the calling thread exists in the child.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork(2)");
+        if child == 0 {
+            run_child_action(ChildAction::Freeze, &[]);
+            // SAFETY: child-only path; never returns in a correct build.
+            unsafe { libc::_exit(99) };
+        }
+
+        thread::sleep(Duration::from_millis(200));
+        let mut status = 0;
+        // SAFETY: `WNOHANG` reaps only if the child already exited.
+        let seen = unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) };
+        if seen == 0 {
+            // SAFETY: the child is ours and still running.
+            unsafe { libc::kill(child, libc::SIGKILL) };
+            // SAFETY: blocking reap of our own child.
+            unsafe { libc::waitpid(child, &mut status, 0) };
+        }
+
+        assert_eq!(seen, 0, "the freeze child exited early");
+        assert!(
+            libc::WIFSIGNALED(status),
+            "the freeze child must still have been alive to kill"
+        );
     }
 }
