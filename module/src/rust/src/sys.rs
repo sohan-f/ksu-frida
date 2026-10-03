@@ -42,6 +42,28 @@ pub fn android_log(prio: c_int, msg: &str) {
     }
 }
 
+#[cfg(not(target_os = "android"))]
+unsafe extern "C" {
+    fn __errno_location() -> *mut c_int;
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn set_errno(value: c_int) {
+    // SAFETY: glibc/musl document `__errno_location()` as returning a valid
+    // writable pointer to the calling thread's errno slot; it is never null.
+    unsafe {
+        *__errno_location() = value;
+    }
+}
+
+#[cfg(target_os = "android")]
+pub fn set_errno(value: c_int) {
+    // SAFETY: bionic documents `__errno()` with the same contract.
+    unsafe {
+        *libc::__errno() = value;
+    }
+}
+
 pub fn dlerror_string() -> String {
     // SAFETY: `dlerror()` returns null or a valid NUL-terminated string owned by libc; it is copied before any later dl call.
     unsafe {
