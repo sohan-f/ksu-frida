@@ -35,12 +35,15 @@ unsafe fn ksufrida_dobby_hook(
 }
 
 unsafe extern "C" fn fork_replacement() -> libc::pid_t {
+    // SAFETY: `getpid(2)` cannot fail.
     let parent_pid = unsafe { libc::getpid() };
     logi(format!(
         "[child_gating][pid {parent_pid}] detected fork/vfork"
     ));
 
+    // SAFETY: written by the Dobby shim before the hook can ever fire (`enable_child_gating` calls the shim first).
     let orig = unsafe { ORIG_FORK }.expect("fork hook used before installation");
+    // SAFETY: `ORIG_FORK` is a valid function pointer installed by the shim; a null value is rejected by the `.expect` above.
     let child_pid = unsafe { orig() };
     if child_pid != 0 {
         logi(format!(
@@ -51,6 +54,7 @@ unsafe extern "C" fn fork_replacement() -> libc::pid_t {
 
     crate::remap::after_fork();
 
+    // SAFETY: `getpid(2)` cannot fail.
     let child_pid = unsafe { libc::getpid() };
     let context = format!("[child_gating][pid {child_pid}] ");
 
@@ -62,6 +66,7 @@ unsafe extern "C" fn fork_replacement() -> libc::pid_t {
     match mode {
         "kill" => {
             logi(format!("{context}killing child process"));
+            // SAFETY: `exit(2)` takes a plain `c_int` and never returns.
             unsafe { libc::exit(0) };
         }
         "freeze" => {
@@ -92,18 +97,22 @@ pub fn enable_child_gating(cfg: &ChildGatingConfig) {
 
     logi("[child_gating] enabling child gating");
 
+    // SAFETY: `RTLD_DEFAULT` is the documented sentinel handle and `c"fork"` is a valid NUL-terminated literal.
     let fork_addr = unsafe { dlsym(RTLD_DEFAULT, c"fork".as_ptr()) };
     logi(format!("[child_gating] fork address {fork_addr:p}"));
+    // SAFETY: as above, with `c"vfork"`.
     let vfork_addr = unsafe { dlsym(RTLD_DEFAULT, c"vfork".as_ptr()) };
     logi(format!("[child_gating] vfork address {vfork_addr:p}"));
 
     let replacement = fork_replacement as *const () as *mut c_void;
 
+    // SAFETY: addresses come from the `dlsym` calls above; the shim writes `ORIG_FORK` before committing the hook.
     unsafe {
         ksufrida_dobby_hook(fork_addr, replacement, (&raw mut ORIG_FORK).cast());
     }
     logi("[child_gating] fork hook installed");
 
+    // SAFETY: as above; the shim writes `ORIG_VFORK` (deliberately never read — see the comment on that static).
     unsafe {
         ksufrida_dobby_hook(vfork_addr, replacement, (&raw mut ORIG_VFORK).cast());
     }
@@ -120,6 +129,7 @@ mod tests {
     fn hook_shim_is_callable() {
         let mut orig: *mut c_void = std::ptr::null_mut();
         assert_eq!(
+            // SAFETY: the host stub accepts null arguments; on device the shim handles them.
             unsafe {
                 ksufrida_dobby_hook(std::ptr::null_mut(), std::ptr::null_mut(), &raw mut orig)
             },

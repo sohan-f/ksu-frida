@@ -19,6 +19,7 @@ pub fn check_and_inject(app_name: &str) -> bool {
         return false;
     };
 
+    // SAFETY: `getpid(2)` cannot fail.
     let pid = unsafe { libc::getpid() };
 
     logi(format!("App detected: {app_name}"));
@@ -170,6 +171,7 @@ fn copy_file(src: &str, dst: &str) -> bool {
 }
 
 fn ensure_dir(path: &str, mode: libc::mode_t) -> bool {
+    // SAFETY: `cstring(path)` is NUL-terminated and the return value is checked below.
     if unsafe { libc::mkdir(cstring(path).as_ptr(), mode) } == 0 {
         return true;
     }
@@ -183,6 +185,7 @@ fn ensure_dir(path: &str, mode: libc::mode_t) -> bool {
 }
 
 fn remove_file(path: &str) -> bool {
+    // SAFETY: `cstring(path)` is NUL-terminated and the return value is checked below.
     if unsafe { libc::unlink(cstring(path).as_ptr()) } == 0 {
         return true;
     }
@@ -196,6 +199,7 @@ fn remove_file(path: &str) -> bool {
 }
 
 fn remove_dir(path: &str) -> bool {
+    // SAFETY: `cstring(path)` is NUL-terminated and the return value is checked below.
     if unsafe { libc::rmdir(cstring(path).as_ptr()) } == 0 {
         return true;
     }
@@ -228,6 +232,7 @@ fn stage_gadget(app_name: &str, src_lib_path: &str) -> String {
     if !ensure_dir(&cache_dir, 0o700) {
         return String::new();
     }
+    // SAFETY: `getpid(2)` cannot fail.
     let stage_dir = format!("{cache_dir}/{}", unsafe { libc::getpid() });
     if !ensure_dir(&stage_dir, 0o700) {
         return String::new();
@@ -271,6 +276,7 @@ fn unlink_staged(staged_lib_path: &str) {
 pub fn inject_lib(lib_path: &str, log_context: &str) {
     let c_path = cstring(lib_path);
 
+    // SAFETY: `c_path` is a live `CString`; the returned handle is checked for null below.
     let handle = unsafe { xdl_open(c_path.as_ptr(), XDL_TRY_FORCE_LOAD) };
     if !handle.is_null() {
         logi(format!(
@@ -281,6 +287,7 @@ pub fn inject_lib(lib_path: &str, log_context: &str) {
     }
     let xdl_err = dlerror_string();
 
+    // SAFETY: `c_path` is a live `CString`; the returned handle is checked for null below.
     let handle = unsafe { dlopen(c_path.as_ptr(), RTLD_NOW) };
     if !handle.is_null() {
         logi(format!(

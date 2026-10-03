@@ -102,9 +102,11 @@ fn get_modules_by_name(m_name: &str) -> Vec<ProcMapsInfo> {
 /// Installed only by [`install_fault_retry`]; `info` comes from the kernel.
 unsafe extern "C" fn park_or_forward(sig: c_int, info: *mut libc::siginfo_t, context: *mut c_void) {
     let start = IN_FLIGHT_START.load(Ordering::Acquire);
+    // SAFETY: `gettid(2)` takes no arguments, cannot fail and allocates nothing — safe inside a signal handler.
     let tid = unsafe { libc::gettid() };
     if start != 0 && tid != REBUILDER_TID.load(Ordering::Relaxed) as c_int {
         let end = IN_FLIGHT_END.load(Ordering::Relaxed);
+        // SAFETY: the kernel hands SA_SIGINFO handlers a non-null `siginfo_t`; `si_addr` is defined for SIGSEGV/SIGBUS.
         let fault = unsafe { (*info).si_addr() } as usize;
         if (start..end).contains(&fault) {
             for _ in 0..PARK_SPIN_LIMIT {
@@ -116,6 +118,7 @@ unsafe extern "C" fn park_or_forward(sig: c_int, info: *mut libc::siginfo_t, con
         }
     }
 
+    // SAFETY: `forward_fault` only chains to actions captured by `install_fault_retry` earlier in this rebuild.
     unsafe { forward_fault(sig, info, context) };
 }
 
@@ -128,6 +131,7 @@ unsafe fn forward_fault(sig: c_int, info: *mut libc::siginfo_t, context: *mut c_
 
     let handler = PREVIOUS_HANDLER[index].load(Ordering::Relaxed);
     if handler == libc::SIG_DFL || handler == libc::SIG_IGN {
+        // SAFETY: plain `signal(2)`/`raise(2)` on the faulting thread; the pending signal is delivered before we return to it.
         unsafe {
             libc::signal(sig, libc::SIG_DFL);
             libc::raise(sig);
@@ -136,6 +140,7 @@ unsafe fn forward_fault(sig: c_int, info: *mut libc::siginfo_t, context: *mut c_
     }
 
     let flags = PREVIOUS_FLAGS[index].load(Ordering::Relaxed) as c_int;
+    // SAFETY: `PREVIOUS_HANDLER`/`PREVIOUS_FLAGS` were read from a real `sigaction`, so the transmuted signature matches the flag branched on below.
     unsafe {
         if flags & libc::SA_SIGINFO != 0 {
             let handler: unsafe extern "C" fn(c_int, *mut libc::siginfo_t, *mut c_void) =
@@ -176,14 +181,18 @@ struct FaultRetry {
 
 fn install_fault_retry() -> FaultRetry {
     let mut retry = FaultRetry {
+        // SAFETY: `libc::sigaction` is a plain FFI struct — all-zeroed is a valid starting state.
         previous: std::array::from_fn(|_| unsafe { std::mem::zeroed() }),
         installed: [false; 2],
         _rebuild: RebuildGuard::acquire(),
     };
+    // SAFETY: `gettid(2)` cannot fail.
     REBUILDER_TID.store(unsafe { libc::gettid() } as usize, Ordering::Relaxed);
 
     for (index, &sig) in GUARDED_SIGNALS.iter().enumerate() {
+        // SAFETY: output buffer for the query below; zeroed is valid padding-initialised state.
         let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: query-only call (`act == NULL`); fills the buffer above.
         if unsafe { libc::sigaction(sig, std::ptr::null(), &mut current) } != 0 {
             loge(format!(
                 "fault retry: cannot read handler for signal {sig}: {}",
@@ -201,9 +210,11 @@ fn install_fault_retry() -> FaultRetry {
         PREVIOUS_FLAGS[index].store(current.sa_flags as usize, Ordering::Relaxed);
         retry.previous[index] = current;
 
+        // SAFETY: zeroed `sigaction` is the documented way to build a fresh action; every field used is set before install.
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
         action.sa_sigaction = park_or_forward as *const () as usize;
         action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+        // SAFETY: installs the fully initialised `action` above; the kernel copies it synchronously.
         if unsafe { libc::sigaction(sig, &action, std::ptr::null_mut()) } != 0 {
             loge(format!(
                 "fault retry: cannot install handler for signal {sig}: {}",
@@ -224,7 +235,9 @@ impl Drop for FaultRetry {
                 continue;
             }
 
+            // SAFETY: output buffer for the restore-time query below.
             let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+            // SAFETY: query-only call (`act == NULL`).
             if unsafe { libc::sigaction(sig, std::ptr::null(), &mut current) } != 0 {
                 continue;
             }
@@ -232,6 +245,7 @@ impl Drop for FaultRetry {
                 continue;
             }
 
+            // SAFETY: only reached when the current handler is still ours; `previous` was saved at install time for this process.
             unsafe { libc::sigaction(sig, &self.previous[index], std::ptr::null_mut()) };
         }
         REBUILDER_TID.store(0, Ordering::Relaxed);
@@ -271,6 +285,7 @@ unsafe fn relocate_segment(
     perms: c_int,
     path: &str,
 ) -> Result<*mut c_void, RelocateError> {
+    // SAFETY: anonymous private mapping of `size`, which comes from `/proc/self/maps` and is page-aligned.
     let map = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -287,13 +302,16 @@ unsafe fn relocate_segment(
 
     if perms & libc::PROT_READ == 0 {
         logi(format!("Removing memory protection: {path}"));
+        // SAFETY: `address`/`size` describe a live mapping from `/proc/self/maps`; the result is checked immediately.
         if unsafe { libc::mprotect(address, size, libc::PROT_READ) } != 0 {
             let err = io::Error::last_os_error();
+            // SAFETY: `map`/`size` are ours from the `mmap` above; best-effort cleanup, result deliberately ignored.
             unsafe { libc::munmap(map, size) };
             return Err(RelocateError::Protect(err));
         }
     }
 
+    // SAFETY: source is the live segment, destination is the scratch mapping — both `size` bytes and non-overlapping.
     unsafe {
         std::ptr::copy(address as *const u8, map as *mut u8, size);
 
@@ -350,6 +368,7 @@ pub fn remap_lib(lib_path: &str) {
         let address = info.start as *mut c_void;
         let size = info.end - info.start;
 
+        // SAFETY: `address`/`size`/`perms` come from the maps scan for this exact path and we hold the rebuild lock via `install_fault_retry`; the full contract is on `relocate_segment`.
         match unsafe { relocate_segment(address, size, info.perms, &info.path) } {
             Ok(map) => logi(format!("Allocated at address {map:p} with size of {size}")),
             Err(RelocateError::Allocate(e)) => {
@@ -409,6 +428,7 @@ mod tests {
 
         let _retry = install_fault_retry();
 
+        // SAFETY: fresh anonymous mapping for this test; failure is asserted inside the block.
         unsafe {
             let address = libc::mmap(
                 std::ptr::null_mut(),
@@ -454,8 +474,10 @@ mod tests {
     }
 
     fn current_handler(sig: c_int) -> usize {
+        // SAFETY: output buffer for the query below.
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
         assert_eq!(
+            // SAFETY: query-only call (`act == NULL`); fills the buffer above.
             unsafe { libc::sigaction(sig, std::ptr::null(), &mut action) },
             0
         );
@@ -500,6 +522,7 @@ mod tests {
 
         let _retry = install_fault_retry();
 
+        // SAFETY: fresh anonymous mapping for this test; failure is asserted inside the block.
         unsafe {
             let address = libc::mmap(
                 std::ptr::null_mut(),
