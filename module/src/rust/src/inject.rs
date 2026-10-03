@@ -535,9 +535,11 @@ pub(crate) fn stage_and_inject(
         String::new()
     };
     let inject_path = if staged.is_empty() {
-        loge(format!(
-            "{log_context}Staging {lib_path} failed; falling back to the raw path"
-        ));
+        if stage {
+            loge(format!(
+                "{log_context}Staging {lib_path} failed; falling back to the raw path"
+            ));
+        }
         lib_path
     } else {
         &staged
@@ -566,6 +568,8 @@ fn inject_libs(cfg: &TargetConfig, pid: libc::pid_t) {
     if cfg.kernel_assisted_evasion {
         logi(format!("KSIE enabled for PID: {pid}"));
     }
+
+    sweep_stale_stage_dirs(&format!("/data/data/{}/.cache", package_of(&cfg.app_name)));
 
     delay_start_up(cfg.start_up_delay_ms);
 
