@@ -6,7 +6,7 @@ import java.nio.file.Files
 import java.security.MessageDigest
 
 plugins {
-    id "de.undercouch.download" version "5.4.0"
+    id "de.undercouch.download" version "5.7.0"
 }
 
 apply plugin: 'com.android.library'
@@ -43,14 +43,14 @@ task downloadFrida(type: Download) {
 
 android {
     namespace = "zygisk.frida"
-    compileSdkVersion rootProject.ext.targetSdkVersion
-    ndkVersion '25.2.9519653'
+    compileSdk rootProject.ext.compileSdkVersion
+    buildToolsVersion "37.0.0"
+    ndkVersion "29.0.14206865"
 
     flavorDimensions += "api"
 
     defaultConfig {
-        minSdkVersion rootProject.ext.minSdkVersion
-        targetSdkVersion rootProject.ext.targetSdkVersion
+        minSdk = rootProject.ext.minSdkVersion
 
         externalNativeBuild {
             ndkBuild {
@@ -85,19 +85,18 @@ android {
     }
 }
 
-afterEvaluate {
-    android.libraryVariants.forEach { variant ->
+androidComponents {
+    onVariants(selector().all()) { variant ->
         def variantCapped = variant.name.capitalize()
-        def variantLowered = variant.name.toLowerCase()
-        def buildTypeCapped = variant.buildType.name.capitalize()
-        def buildTypeLowered = variant.buildType.name.toLowerCase()
-        def flavorCapped = variant.flavorName.capitalize()
-        def flavorLowered = variant.flavorName.toLowerCase()
+        def buildTypeLowered = (variant.buildType ?: "release").toLowerCase()
+        def flavorName = variant.hasProperty('flavorName') && variant.flavorName ?
+                variant.flavorName : (variant.productFlavors ? variant.productFlavors[0][1] : "zygisk")
+        def flavorLowered = flavorName.toLowerCase()
 
         def zipName = "${moduleName}-${moduleVersion}-${flavorLowered}-${buildTypeLowered}.zip"
         def magiskDir = file("${outDir}/magisk_module_${flavorLowered}_${buildTypeLowered}")
 
-        task("prepareMagiskFiles${variantCapped}", type: Sync) {
+        def prepare = tasks.register("prepareMagiskFiles${variantCapped}", Sync) {
             dependsOn("assemble$variantCapped")
             dependsOn downloadFrida
             duplicatesStrategy = DuplicatesStrategy.EXCLUDE
@@ -138,7 +137,12 @@ afterEvaluate {
             from(templatePath + "/webroot") {
                 into 'webroot'
             }
-            from("$buildDir/intermediates/stripped_native_libs/$variantCapped/out/lib") {
+            // AGP 9 nests the strip task dir: stripped_native_libs/<Variant>/<stripTask>/out/lib
+            from({
+                def base = project.file("$buildDir/intermediates/stripped_native_libs/$variantCapped")
+                def hits = base.listFiles()?.findAll { new File(it, "out/lib").isDirectory() }
+                hits?.collect { new File(it, "out/lib").path } ?: []
+            }) {
                 into 'lib'
             }
             from("$rootDir/gadget") {
@@ -166,30 +170,33 @@ afterEvaluate {
             }
         }
 
-        task("zip${variantCapped}", type: Zip) {
-            dependsOn("prepareMagiskFiles${variantCapped}")
+        def zip = tasks.register("zip${variantCapped}", Zip) {
+            dependsOn(prepare)
             from magiskDir
             archiveFileName.set(zipName)
             destinationDirectory.set(outDir)
         }
 
-        task("push${variantCapped}", type: Exec) {
-            dependsOn("zip${variantCapped}")
+        tasks.register("push${variantCapped}", Exec) {
+            dependsOn(zip)
             workingDir outDir
-            commandLine android.adbExecutable, "push", zipName, "/data/local/tmp/"
+            commandLine "adb", "push", zipName, "/data/local/tmp/"
         }
 
-        task("flash${variantCapped}", type: Exec) {
+        tasks.register("flash${variantCapped}", Exec) {
             dependsOn("push${variantCapped}")
-            commandLine android.adbExecutable, "shell", "su", "-c",
+            commandLine "adb", "shell", "su", "-c",
                     "magisk --install-module /data/local/tmp/${zipName}"
         }
 
-        task("flashAndReboot${variantCapped}", type: Exec) {
+        tasks.register("flashAndReboot${variantCapped}", Exec) {
             dependsOn("flash${variantCapped}")
-            commandLine android.adbExecutable, "shell", "reboot"
+            commandLine "adb", "shell", "reboot"
         }
 
-        variant.assembleProvider.get().finalizedBy("zip${variantCapped}")
+        // assemble<Variant> finalizes with the module zip (matches old assembleProvider hook)
+        tasks.matching { it.name == "assemble${variantCapped}" }.configureEach {
+            finalizedBy(zip)
+        }
     }
 }
