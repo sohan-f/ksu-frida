@@ -27,6 +27,18 @@
             padding: 16px;
             display: flex;
             justify-content: center;
+            /* Touch feel: no double-tap zoom delay, no highlight flash, and no
+               accidental long-press text selection (which locks scrolling). */
+            touch-action: manipulation;
+            -webkit-tap-highlight-color: transparent;
+            -webkit-user-select: none;
+            user-select: none;
+        }
+
+        /* Text that has to stay selectable for manual copy/paste. */
+        input, textarea, select, .cmd, .app-label {
+            -webkit-user-select: text;
+            user-select: text;
         }
 
         .container { width: 100%; max-width: 600px; }
