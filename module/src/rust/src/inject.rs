@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use crate::child_gating::enable_child_gating;
 use crate::config::{TargetConfig, load_config};
+use crate::linkmap::scrub_dlpi_name;
 use crate::log::{loge, logi};
 use crate::remap::remap_lib;
 use crate::sys::{RTLD_NOW, cstring, dlerror_string, dlopen};
@@ -517,6 +518,7 @@ fn hide_or_show(lib_path: &str, log_context: &str, hide_maps: bool) {
     } else {
         logi(format!("{log_context}Map hiding disabled for {lib_path}"));
     }
+    scrub_dlpi_name(lib_path);
 }
 
 pub(crate) fn stage_and_inject(lib_path: &str, app_name: &str, log_context: &str, hide_maps: bool) {

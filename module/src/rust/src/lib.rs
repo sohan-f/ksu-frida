@@ -5,6 +5,7 @@
 mod child_gating;
 mod config;
 mod inject;
+mod linkmap;
 mod log;
 mod remap;
 mod sys;
