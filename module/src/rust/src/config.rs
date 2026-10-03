@@ -169,8 +169,19 @@ fn parse_injected_libraries(module_dir: &str) -> Vec<String> {
 }
 
 fn load_advanced_config(module_dir: &str, app_name: &str) -> Option<TargetConfig> {
-    let content = fs::read_to_string(format!("{module_dir}/config.json")).ok()?;
+    if app_name.is_empty() {
+        return None;
+    }
+    let bytes = fs::read(format!("{module_dir}/config.json")).ok()?;
 
+    if !bytes
+        .windows(app_name.len())
+        .any(|window| window == app_name.as_bytes())
+    {
+        return None;
+    }
+
+    let content = String::from_utf8_lossy(&bytes);
     let doc: Value = match serde_json::from_str(&content) {
         Ok(doc) => doc,
         Err(err) => {
@@ -282,6 +293,40 @@ mod tests {
         let dir = temp_dir("unknown");
         fs::write(dir.join("config.json"), ADVANCED).unwrap();
         assert!(load_config(dir.to_str().unwrap(), "com.unknown.app").is_none());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn non_target_skips_parse_entirely() {
+        let dir = temp_dir("noparse");
+        fs::write(dir.join("config.json"), "{ not json at all").unwrap();
+        assert!(load_config(dir.to_str().unwrap(), "com.unknown.app").is_none());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn substring_hit_falls_through_to_exact_match() {
+        let dir = temp_dir("substr");
+        fs::write(
+            dir.join("config.json"),
+            r#"{"targets":[{"app_name":"com.example.approx","enabled":true,
+                "kernel_assisted_evasion":true,"start_up_delay_ms":0,
+                "injected_libraries":[]}]}"#,
+        )
+        .unwrap();
+        assert!(load_config(dir.to_str().unwrap(), "com.example.app").is_none());
+        assert!(load_config(dir.to_str().unwrap(), "com.example.approx").is_some());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn empty_app_name_matches_nothing() {
+        let dir = temp_dir("empty");
+        fs::write(dir.join("config.json"), ADVANCED).unwrap();
+        assert!(load_config(dir.to_str().unwrap(), "").is_none());
+
         fs::remove_dir_all(&dir).ok();
     }
 
