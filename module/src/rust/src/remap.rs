@@ -83,6 +83,65 @@ fn get_modules_by_name(m_name: &str) -> Vec<ProcMapsInfo> {
     maps
 }
 
+#[derive(Debug)]
+enum RelocateError {
+    Allocate(io::Error),
+    Commit(io::Error),
+}
+
+/// # Safety
+/// `address` must be page aligned and backed by a mapping of exactly `size`
+/// bytes whose contents may be read (a `PROT_READ` hole is punched first if the
+/// segment is not readable).
+unsafe fn relocate_segment(
+    address: *mut c_void,
+    size: usize,
+    perms: c_int,
+    path: &str,
+) -> Result<*mut c_void, RelocateError> {
+    let map = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_WRITE,
+            libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+            -1,
+            0,
+        )
+    };
+    if map == libc::MAP_FAILED {
+        return Err(RelocateError::Allocate(io::Error::last_os_error()));
+    }
+
+    if perms & libc::PROT_READ == 0 {
+        logi(format!("Removing memory protection: {path}"));
+        unsafe {
+            libc::mprotect(address, size, libc::PROT_READ);
+        }
+    }
+
+    unsafe {
+        std::ptr::copy(address as *const u8, map as *mut u8, size);
+        let moved = crate::sys::mremap(
+            map,
+            size,
+            size,
+            crate::sys::MREMAP_MAYMOVE | crate::sys::MREMAP_FIXED,
+            address,
+        );
+        if moved == libc::MAP_FAILED {
+            let err = io::Error::last_os_error();
+            libc::munmap(map, size);
+            return Err(RelocateError::Commit(err));
+        }
+    }
+
+    unsafe {
+        libc::mprotect(address, size, perms);
+    }
+    Ok(map)
+}
+
 pub fn remap_lib(lib_path: &str) {
     let lib_name = match lib_path.rfind('/') {
         Some(slash) => &lib_path[slash + 1..],
@@ -100,50 +159,16 @@ pub fn remap_lib(lib_path: &str) {
         let address = info.start as *mut c_void;
         let size = info.end - info.start;
 
-        let map = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                size,
-                libc::PROT_WRITE,
-                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
-                -1,
-                0,
-            )
-        };
-
-        if map == libc::MAP_FAILED {
-            loge(format!(
-                "Failed to Allocate Memory: {}",
-                io::Error::last_os_error()
-            ));
-            return;
-        }
-
-        if info.perms & libc::PROT_READ == 0 {
-            logi(format!("Removing memory protection: {}", info.path));
-            unsafe {
-                libc::mprotect(address, size, libc::PROT_READ);
+        match unsafe { relocate_segment(address, size, info.perms, &info.path) } {
+            Ok(map) => logi(format!("Allocated at address {map:p} with size of {size}")),
+            Err(RelocateError::Allocate(e)) => {
+                loge(format!("Failed to Allocate Memory: {e}"));
+                return;
+            }
+            Err(RelocateError::Commit(e)) => {
+                loge(format!("mremap failed: {e}"));
             }
         }
-
-        unsafe {
-            std::ptr::copy(map as *const u8, info.start as *mut u8, size);
-            let moved = crate::sys::mremap(
-                map,
-                size,
-                size,
-                crate::sys::MREMAP_MAYMOVE | crate::sys::MREMAP_FIXED,
-                address,
-            );
-            if moved == libc::MAP_FAILED {
-                loge(format!("mremap failed: {}", io::Error::last_os_error()));
-            }
-        }
-
-        unsafe {
-            libc::mprotect(address, size, info.perms);
-        }
-        logi(format!("Allocated at address {map:p} with size of {size}"));
     }
 
     logi("Remapped");
@@ -159,6 +184,58 @@ mod tests {
         assert_eq!(field, "7ac49c2000-7ac4a26000");
         let (perms, _) = next_field(rest).unwrap();
         assert_eq!(perms, "r--p");
+    }
+
+    fn perms_at(addr: usize) -> String {
+        for line in std::fs::read_to_string("/proc/self/maps").unwrap().lines() {
+            let Some((range, rest)) = next_field(line) else {
+                continue;
+            };
+            let Some((start_hex, end_hex)) = range.split_once('-') else {
+                continue;
+            };
+            let (Ok(start), Ok(end)) = (
+                usize::from_str_radix(start_hex, 16),
+                usize::from_str_radix(end_hex, 16),
+            ) else {
+                continue;
+            };
+            if (start..end).contains(&addr) {
+                return next_field(rest).unwrap().0.to_string();
+            }
+        }
+        panic!("no mapping contains {addr:#x}");
+    }
+
+    #[test]
+    fn relocate_segment_preserves_contents_and_protections() {
+        const SIZE: usize = 4096;
+        let expected: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8).collect();
+
+        unsafe {
+            let address = libc::mmap(
+                std::ptr::null_mut(),
+                SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                -1,
+                0,
+            );
+            assert_ne!(address, libc::MAP_FAILED, "{}", io::Error::last_os_error());
+            std::ptr::copy_nonoverlapping(expected.as_ptr(), address as *mut u8, SIZE);
+
+            assert_eq!(libc::mprotect(address, SIZE, libc::PROT_READ), 0);
+            assert_eq!(perms_at(address as usize), "r--p");
+
+            relocate_segment(address, SIZE, libc::PROT_READ, "/test/libgadget.so")
+                .expect("relocate_segment failed");
+
+            let after = std::slice::from_raw_parts(address as *const u8, SIZE);
+            assert_eq!(after, &expected[..], "segment contents must survive");
+            assert_eq!(perms_at(address as usize), "r--p", "protections restored");
+
+            assert_eq!(libc::munmap(address, SIZE), 0);
+        }
     }
 
     #[test]
