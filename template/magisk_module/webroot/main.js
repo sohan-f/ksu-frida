@@ -23,7 +23,6 @@ const APPS_CACHE_KEY = "ksufrida.apps.v1";
 const GADGET_VERSION_KEY = "ksufrida.gadgetver.v1";
 const APP_BATCH = 50;
 const LABEL_CHUNK = 100;
-const SHELL_LABEL_BATCH = 8;
 let appsLoading = false;
 let labelsPending = false;
 let labelsTried = false;
@@ -35,6 +34,22 @@ let appSearchTimer = null;
 let nativeIcons = false;
 let statusTimer = null;
 let renderScheduled = false;
+let targetStatusTimer = null;
+let versionScanning = false;
+let lastAppsSync = 0;
+let lastInteraction = 0;
+const APPS_SYNC_TTL = 60000;
+
+if (typeof document !== "undefined") {
+    document.addEventListener("pointerdown", function () {
+        lastInteraction = Date.now();
+    }, { capture: true, passive: true });
+}
+
+async function awaitQuietWindow(ms) {
+    var window_ = ms == null ? 500 : ms;
+    while (Date.now() - lastInteraction < window_) await delay(120);
+}
 
 function delay(ms) {
     return new Promise(function (r) { setTimeout(r, ms); });
@@ -63,6 +78,14 @@ function scheduleRenderTargets() {
     requestAnimationFrame(function () { renderScheduled = false; renderTargets(); });
 }
 
+function scheduleTargetStatus(ms) {
+    clearTimeout(targetStatusTimer);
+    targetStatusTimer = setTimeout(function () {
+        targetStatusTimer = null;
+        refreshTargetStatus();
+    }, ms == null ? 150 : ms);
+}
+
 function exec(cmd) {
     return new Promise(function (resolve) {
         var name = "_ksu_cb_" + (++callbackId);
@@ -76,6 +99,61 @@ function exec(cmd) {
 
 function shQuote(s) {
     return "'" + String(s).replace(/'/g, "'\\''") + "'";
+}
+
+const DONE_MARK = "@@__KSUFRIDA_DONE__";
+const LABEL_FILE = "/data/local/tmp/libsec/.webui-labels.tmp";
+const SCAN_FILE = "/data/local/tmp/libsec/.webui-scan.tmp";
+const PKGS_FILE = "/data/local/tmp/libsec/.webui-packages.tmp";
+const POLL_INTERVAL_MS = 1000;
+
+async function runDetached(script, path, onBody, opts) {
+    opts = opts || {};
+    await exec("{ " + script + "; echo \"" + DONE_MARK + "\"; } > " + path +
+        " </dev/null 2>/dev/null &");
+    var deadline = Date.now() + (opts.timeout || 120000);
+    var maxStale = opts.maxStale == null ? 8 : opts.maxStale;
+    var lastLen = -1;
+    var stale = 0;
+    var done = false;
+    while (Date.now() < deadline) {
+        await delay(POLL_INTERVAL_MS);
+        await awaitQuietWindow();
+        var r = await exec("cat " + path + " 2>/dev/null");
+        var text = (r.errno === 0 && r.stdout) || "";
+        done = text.indexOf(DONE_MARK) !== -1;
+        var body = done ? text : text.slice(0, text.lastIndexOf("\n") + 1);
+        if (body && onBody) onBody(body, done);
+        if (done) break;
+        if (text.length === lastLen) {
+            if (maxStale > 0 && ++stale >= maxStale) break;
+        } else {
+            stale = 0;
+            lastLen = text.length;
+        }
+    }
+    exec("rm -f " + path);
+    return done;
+}
+
+function parseLabelLines(body) {
+    var pairs = new Map();
+    body.split("\n").forEach(function (line) {
+        if (!line || line === DONE_MARK) return;
+        var i = line.indexOf("|");
+        if (i > 0) pairs.set(line.slice(0, i), line.slice(i + 1).trim());
+    });
+    return pairs;
+}
+
+function splitMarked(text, marks) {
+    var parts = {};
+    var cur = null;
+    String(text || "").split("\n").forEach(function (line) {
+        if (marks.indexOf(line) !== -1) { cur = line; parts[cur] = []; return; }
+        if (cur) parts[cur].push(line);
+    });
+    return parts;
 }
 
 function patEsc(s) {
@@ -110,26 +188,43 @@ function copyText(text) {
     }
 }
 
-async function loadConfig() {
-    var r = await exec("cat " + CONFIG_PATH);
-    if (r.errno === 0 && r.stdout.trim().length > 0) {
+const CONFIG_MARK = "@@__KSUFRIDA_CONFIG__";
+const GADGET_MARK = "@@__KSUFRIDA_GADGET__";
+
+async function loadConfigs() {
+    var r = await exec(
+        "echo " + CONFIG_MARK + ";" +
+        "if [ -s " + CONFIG_PATH + " ]; then cat " + CONFIG_PATH + "; " +
+        "else cat /data/local/tmp/libsec/config.json.example 2>/dev/null; fi;" +
+        "echo;" +
+        "echo " + GADGET_MARK + ";" +
+        "cat " + GADGET_CONFIG_PATH + " 2>/dev/null"
+    );
+    var parts = {};
+    var cur = null;
+    (r.errno === 0 ? r.stdout : "").split("\n").forEach(function (line) {
+        if (line === CONFIG_MARK) { cur = "cfg"; parts.cfg = []; return; }
+        if (line === GADGET_MARK) { cur = "gadget"; parts.gadget = []; return; }
+        if (cur) parts[cur].push(line);
+    });
+    applyConfigText((parts.cfg || []).join("\n"));
+    applyGadgetText((parts.gadget || []).join("\n"));
+}
+
+function applyConfigText(text) {
+    if (text && text.trim().length > 0) {
         try {
-            config = JSON.parse(r.stdout);
+            config = JSON.parse(text);
         } catch (e) {
             ksu.toast("Config parse error: " + e.message);
             return;
-        }
-    } else {
-        var ex = await exec("cat /data/local/tmp/libsec/config.json.example");
-        if (ex.errno === 0) {
-            try { config = JSON.parse(ex.stdout); } catch (_) {}
         }
     }
     if (!config.targets || !Array.isArray(config.targets)) config.targets = [];
     dirtyConfig = false;
     updateDirtyBadge();
     renderTargets();
-    refreshTargetStatus();
+    scheduleTargetStatus();
     checkLibraries();
     resolveLabels(config.targets.map(function (t) { return t.app_name; }).filter(Boolean), true, false);
 }
@@ -178,12 +273,11 @@ async function checkLibraries() {
     scheduleStatus();
 }
 
-async function loadGadgetConfig() {
+function applyGadgetText(text) {
     var editor = document.getElementById("gadget-editor");
-    var r = await exec("cat " + GADGET_CONFIG_PATH);
-    if (r.errno === 0 && r.stdout.trim().length > 0) {
+    if (text && text.trim().length > 0) {
         gadgetFileOk = true;
-        editor.value = r.stdout;
+        editor.value = text;
     } else {
         gadgetFileOk = false;
         editor.value = DEFAULT_GADGET;
@@ -242,7 +336,7 @@ async function saveGadgetConfig() {
     }
 }
 
-function appendStatusRow(label, value, bad) {
+function appendStatusRow(label, value, bad, valueId) {
     var el = document.getElementById("status-rows");
     var row = document.createElement("div");
     row.className = "status-row";
@@ -250,6 +344,7 @@ function appendStatusRow(label, value, bad) {
     k.className = "kv";
     k.textContent = label;
     var v = document.createElement("span");
+    if (valueId) v.id = valueId;
     v.textContent = value;
     if (bad) v.style.color = "var(--danger)";
     row.appendChild(k);
@@ -257,21 +352,40 @@ function appendStatusRow(label, value, bad) {
     el.appendChild(row);
 }
 
-async function gadgetVersion(key) {
-    if (key) {
-        var cached = null;
-        try { cached = JSON.parse(localStorage.getItem(GADGET_VERSION_KEY) || "null"); } catch (_) {}
+function setStatusValue(id, value, bad) {
+    var v = document.getElementById(id);
+    if (!v) return;
+    v.textContent = value;
+    v.style.color = bad ? "var(--danger)" : "";
+}
+
+function readVersionCache(key) {
+    if (!key) return null;
+    try {
+        var cached = JSON.parse(localStorage.getItem(GADGET_VERSION_KEY) || "null");
         if (cached && cached.k === key && cached.v) return cached.v;
-    }
-    var r = await exec(
+    } catch (_) {}
+    return null;
+}
+
+function startVersionScan(key) {
+    if (versionScanning) return;
+    versionScanning = true;
+    var found = "";
+    var script =
         "strings -a " + GADGET_PATH + " 2>/dev/null | " +
-        "grep -E '^(1[6-9]|2[0-9])\\.[0-9]+\\.[0-9]+$' | head -1"
-    );
-    var v = (r.errno === 0 && r.stdout.trim()) || "unknown";
-    if (key) {
-        try { localStorage.setItem(GADGET_VERSION_KEY, JSON.stringify({ k: key, v: v })); } catch (_) {}
-    }
-    return v;
+        "grep -E '^(1[6-9]|2[0-9])\\.[0-9]+\\.[0-9]+$' | head -1";
+    runDetached(script, SCAN_FILE, function (body) {
+        found = body.split("\n").filter(function (l) { return l && l !== DONE_MARK; })[0] || "";
+    }, { timeout: 60000, maxStale: 40 })
+        .then(function () {
+            versionScanning = false;
+            var v = found.trim() || "unknown";
+            if (key) {
+                try { localStorage.setItem(GADGET_VERSION_KEY, JSON.stringify({ k: key, v: v })); } catch (_) {}
+            }
+            setStatusValue("status-gadget", v, v === "unknown");
+        });
 }
 
 async function loadStatus() {
@@ -292,16 +406,20 @@ async function loadStatus() {
         });
     }
 
-    if (!("GADGET" in rows)) {
-        rows.GADGET = await gadgetVersion(rows.GADGETKEY || "");
+    var gad = "unknown";
+    if ("GADGET" in rows) {
+        gad = rows.GADGET;
+    } else {
+        gad = readVersionCache(rows.GADGETKEY || "") || "…";
+        if (gad === "…") startVersionScan(rows.GADGETKEY || "");
     }
 
     el.innerHTML = "";
     el.className = "";
     var mod = rows.MOD || "unknown";
     appendStatusRow("Module", mod, mod === "not installed" || mod === "unknown");
-    var gad = rows.GADGET || "unknown";
-    appendStatusRow("Gadget", gad, gad === "missing" || gad === "unknown");
+    appendStatusRow("Gadget", gad, gad === "missing" || gad === "unknown", "status-gadget");
+
     appendStatusRow("Gadget config", gadgetFileOk ? "saved" : "not found", !gadgetFileOk);
     var total = config.targets.length;
     var enabled = config.targets.filter(function (t) { return !!t.enabled; }).length;
@@ -312,28 +430,39 @@ async function loadStatus() {
     }
 }
 
-async function refreshTargetStatus() {
-    var names = config.targets
+function targetNames() {
+    return config.targets
         .map(function (t) { return t.app_name; })
         .filter(function (n) { return !!n; });
+}
 
+function targetStatusCmd(names) {
+    return "for c in $(grep -a -l -F " +
+        names.map(function (n) { return "-e " + shQuote(n); }).join(" ") +
+        " /proc/[0-9]*/cmdline 2>/dev/null); do " +
+        "n=$(tr '\\0' '\\n' 2>/dev/null < \"$c\" | head -1); " +
+        "case \"$n\" in " + names.map(patEsc).join("|") + ") " +
+        "p=${c#/proc/}; echo \"$n ${p%%/cmdline}\";; esac; done";
+}
+
+function applyTargetStatus(stdout, names) {
     targetStatus = {};
-    if (names.length > 0) {
-        var pat = names.map(patEsc).join("|");
-        var r = await exec(
-            "for c in /proc/[0-9]*/cmdline; do set -- $(tr \"\\0\" \" \" 2>/dev/null < \"$c\"); " +
-            "case \"$1\" in " + pat + ") p=${c#/proc/}; echo \"$1 ${p%%/cmdline}\";; esac; done"
-        );
-        if (r.errno === 0) {
-            r.stdout.split("\n").forEach(function (line) {
-                var parts = line.trim().split(/\s+/);
-                if (parts.length === 2 && names.indexOf(parts[0]) !== -1) {
-                    (targetStatus[parts[0]] = targetStatus[parts[0]] || []).push(parts[1]);
-                }
-            });
-        }
+    if (stdout) {
+        stdout.split("\n").forEach(function (line) {
+            var parts = line.trim().split(/\s+/);
+            if (parts.length === 2 && names.indexOf(parts[0]) !== -1) {
+                (targetStatus[parts[0]] = targetStatus[parts[0]] || []).push(parts[1]);
+            }
+        });
     }
     updateStatusPills();
+}
+
+async function refreshTargetStatus() {
+    var names = targetNames();
+    if (names.length === 0) { applyTargetStatus("", names); return; }
+    var r = await exec(targetStatusCmd(names));
+    applyTargetStatus(r.stdout, names);
 }
 
 function updateStatusPills() {
@@ -355,22 +484,24 @@ function stopApp(i) {
     var t = config.targets[i];
     if (!t) return;
     var pkg = t.app_name.split(":")[0];
-    exec("am force-stop " + shQuote(pkg)).then(function (r) {
-        ksu.toast(r.errno === 0 ? "Stopped " + pkg : "force-stop failed: " + (r.stderr || r.errno));
-        setTimeout(refreshTargetStatus, 800);
-        setTimeout(refreshConnect, 1500);
-    });
+    exec("am force-stop " + shQuote(pkg) + " </dev/null >/dev/null 2>&1 &")
+        .then(function () {
+            ksu.toast("Stopping " + pkg);
+            setTimeout(refreshTargetStatus, 800);
+            setTimeout(refreshConnect, 1500);
+        });
 }
 
 function startApp(i) {
     var t = config.targets[i];
     if (!t) return;
     var pkg = t.app_name.split(":")[0];
-    exec("monkey -p " + shQuote(pkg) + " -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1").then(function (r) {
-        ksu.toast(r.errno === 0 ? "Starting " + pkg : "start failed: " + (r.stderr || r.errno));
-        setTimeout(refreshTargetStatus, 1500);
-        setTimeout(refreshConnect, (t.start_up_delay_ms || 0) + 4000);
-    });
+    exec("monkey -p " + shQuote(pkg) + " -c android.intent.category.LAUNCHER 1 </dev/null >/dev/null 2>&1 &")
+        .then(function () {
+            ksu.toast("Starting " + pkg);
+            setTimeout(refreshTargetStatus, 1500);
+            setTimeout(refreshConnect, (t.start_up_delay_ms || 0) + 4000);
+        });
 }
 
 function gadgetListenInfo() {
@@ -391,36 +522,37 @@ function scheduleConnectRefresh() {
     connectTimer = setTimeout(function () { refreshConnect(); }, 700);
 }
 
-async function refreshConnect() {
-    var body = document.getElementById("connect-body");
-    var info = gadgetListenInfo();
-
-    if (!info.listen) {
-        if (connectKey === "nolisten") return;
-        connectKey = "nolisten";
-        body.className = "";
-        body.innerHTML = "";
-        var note = document.createElement("div");
-        note.className = "warn";
-        note.textContent = "interaction.type is not \"listen\" — the gadget won't open a port.";
-        body.appendChild(note);
-        return;
-    }
-
+function connectScanCmd(info) {
     var end = Math.min(info.base + 64, 65535);
-    var cmd =
-        "for f in /proc/net/tcp /proc/net/tcp6; do awk 'NR>1 && $4==\"0A\"{print $2}' \"$f\"; done | " +
+    return "for f in /proc/net/tcp /proc/net/tcp6; do awk 'NR>1 && $4==\"0A\"{print $2}' \"$f\"; done | " +
         "while read l; do p=$((0x${l##*:})); [ $p -ge " + info.base + " ] && [ $p -le " + end +
         " ] && echo $p; done | sort -nu";
+}
 
-    var r = await exec(cmd);
+function parsePorts(lines) {
     var ports = [];
-    if (r.errno === 0) {
-        r.stdout.split("\n").forEach(function (l) {
-            var p = parseInt(l, 10);
-            if (p) ports.push(p);
-        });
-    }
+    (lines || []).forEach(function (l) {
+        var p = parseInt(l, 10);
+        if (p) ports.push(p);
+    });
+    return ports;
+}
+
+function renderConnectNote() {
+    if (connectKey === "nolisten") return;
+    connectKey = "nolisten";
+    var body = document.getElementById("connect-body");
+    body.className = "";
+    body.innerHTML = "";
+    var note = document.createElement("div");
+    note.className = "warn";
+    note.textContent = "interaction.type is not \"listen\" — the gadget won't open a port.";
+    body.appendChild(note);
+}
+
+function renderConnect(info, ports) {
+    var body = document.getElementById("connect-body");
+    var end = Math.min(info.base + 64, 65535);
 
     var key = info.base + "|" + ports.join(",");
     if (key === connectKey) return;
@@ -461,6 +593,38 @@ async function refreshConnect() {
         more.textContent = "+" + (ports.length - 4) + " more port(s)";
         body.appendChild(more);
     }
+}
+
+async function refreshConnect() {
+    var info = gadgetListenInfo();
+    if (!info.listen) { renderConnectNote(); return; }
+    var r = await exec(connectScanCmd(info));
+    renderConnect(info, parsePorts(r.stdout ? r.stdout.split("\n") : []));
+}
+
+const TARGET_MARK = "@@__KSUFRIDA_TARGET__";
+const PORTS_MARK = "@@__KSUFRIDA_PORTS__";
+
+async function poll() {
+    if (document.hidden) return;
+    var names = targetNames();
+    var info = gadgetListenInfo();
+
+    var sections = [];
+    if (names.length > 0) sections.push("echo " + TARGET_MARK + "; " + targetStatusCmd(names));
+    if (info.listen) sections.push("echo " + PORTS_MARK + "; " + connectScanCmd(info));
+
+    if (sections.length === 0) {
+        applyTargetStatus("", names);
+        renderConnectNote();
+        return;
+    }
+
+    await awaitQuietWindow();
+    var r = await exec(sections.join("\n"));
+    var parts = splitMarked(r.stdout, [TARGET_MARK, PORTS_MARK]);
+    applyTargetStatus(parts[TARGET_MARK] ? parts[TARGET_MARK].join("\n") : "", names);
+    if (info.listen) renderConnect(info, parsePorts(parts[PORTS_MARK]));
 }
 
 function readAppsCache() {
@@ -504,9 +668,10 @@ async function listPackageNames() {
     if (names === null) { await delay(250); names = nativeListPackages(); }
     if (Array.isArray(names) && names.length > 0) return names;
 
-    var r = await exec("pm list packages -3");
-    if (r.errno !== 0) return [];
-    return r.stdout.split("\n")
+    var out = "";
+    await runDetached("pm list packages -3", PKGS_FILE, function (body) { out = body; },
+        { timeout: 30000, maxStale: 4 });
+    return out.split("\n")
         .filter(function (l) { return l.indexOf("package:") === 0; })
         .map(function (l) { return l.replace("package:", "").trim(); });
 }
@@ -523,7 +688,7 @@ function applyLabels(pairs) {
     });
     if (changed) {
         sortApps();
-        writeAppsCache();
+        if (!labelsPending) writeAppsCache();
         if (touchedTarget) scheduleRenderTargets();
     }
     return changed;
@@ -559,10 +724,11 @@ async function resolveLabelsNow(pkgs, allowShell, fullSweep) {
                     });
                 }
                 applyLabels(pairs);
-                if (i + LABEL_CHUNK < missing.length) await delay(15);
+                if (i + LABEL_CHUNK < missing.length) await delay(120);
             }
         } finally {
             labelsPending = false;
+            writeAppsCache();
             updateAppHint();
             if (isAppModalOpen()) renderAppList();
         }
@@ -570,34 +736,29 @@ async function resolveLabelsNow(pkgs, allowShell, fullSweep) {
     }
 
     if (!allowShell) return;
-    if (fullSweep) labelsTried = true;
 
     labelsPending = true;
     updateAppHint();
-    for (var j = 0; j < missing.length; j += SHELL_LABEL_BATCH) {
-        var chunk = missing.slice(j, j + SHELL_LABEL_BATCH);
-        var cmd = "for p in " + chunk.map(shQuote).join(" ") + "; do " +
-            "l=$(dumpsys package \"$p\" 2>/dev/null | grep -m1 'nonLocalizedLabel=' | " +
-            "sed 's/.*nonLocalizedLabel=//;s/ .*//'); " +
-            "[ -n \"$l\" ] && [ \"$l\" != null ] && echo \"$p|$l\"; done";
-        var r = await exec(cmd);
-        var pairs2 = new Map();
-        if (r.errno === 0) {
-            r.stdout.split("\n").forEach(function (line) {
-                var i = line.indexOf("|");
-                if (i > 0) pairs2.set(line.slice(0, i), line.slice(i + 1).trim());
-            });
-        }
-        applyLabels(pairs2);
-        if (isAppModalOpen()) patchAppLabels();
-        if (j + SHELL_LABEL_BATCH < missing.length) await delay(50);
+    var script = "for p in " + missing.map(shQuote).join(" ") + "; do " +
+        "l=$(dumpsys package \"$p\" 2>/dev/null | grep -m1 'nonLocalizedLabel=' | " +
+        "sed 's/.*nonLocalizedLabel=//;s/ .*//'); " +
+        "echo \"$p|$l\"; done";
+    var completed = false;
+    try {
+        completed = await runDetached(script, LABEL_FILE, function (body) {
+            applyLabels(parseLabelLines(body));
+            if (isAppModalOpen()) patchAppLabels();
+        }, { timeout: missing.length * 500 + 30000 });
+    } finally {
+        labelsPending = false;
+        writeAppsCache();
+        updateAppHint();
+        if (isAppModalOpen()) renderAppList();
     }
-    labelsPending = false;
-    updateAppHint();
-    if (isAppModalOpen()) renderAppList();
+    if (fullSweep) labelsTried = completed;
 }
 
-async function fetchApps() {
+async function fetchApps(force) {
     if (appsLoadPromise) return appsLoadPromise;
     appsLoadPromise = (async function () {
         try {
@@ -609,10 +770,20 @@ async function fetchApps() {
                 if (isAppModalOpen()) renderAppList();
             }
 
+            var fresh = !force && lastAppsSync > 0 &&
+                Date.now() - lastAppsSync < APPS_SYNC_TTL && allApps.length > 0;
+            if (fresh) {
+                appsLoading = false;
+                updateAppHint();
+                await resolveLabels(allApps, false);
+                return;
+            }
+
             appsLoading = allApps.length === 0;
             updateAppHint();
 
             var names = await listPackageNames();
+            lastAppsSync = Date.now();
             if (names.length > 0) {
                 var known = {};
                 allApps.forEach(function (p) { known[p] = 1; });
@@ -877,7 +1048,7 @@ function removeTarget(i) {
     config.targets.splice(i, 1);
     markDirty("cfg");
     scheduleRenderTargets();
-    refreshTargetStatus();
+    scheduleTargetStatus();
     scheduleStatus();
 }
 
@@ -897,7 +1068,7 @@ function addTarget(pkg) {
     markDirty("cfg");
     scheduleRenderTargets();
     checkLibraries();
-    refreshTargetStatus();
+    scheduleTargetStatus();
     scheduleStatus();
 }
 
@@ -906,7 +1077,7 @@ function showAppList() {
     document.getElementById("app-search").value = "";
     fetchApps();
     renderAppList();
-    if (!nativeLabelsAvailable() && !labelsTried && allApps.length > 0) {
+    if (!nativeLabelsAvailable() && !labelsTried && !labelsPending && allApps.length > 0) {
         resolveLabels(allApps, true, true);
     }
 }
@@ -976,10 +1147,8 @@ function renderAppList() {
 }
 
 function reloadAll() {
-    loadConfig();
-    loadGadgetConfig();
-    fetchApps();
-    refreshConnect();
+    loadConfigs();
+    fetchApps(true);
 }
 
 window.onload = function () {
@@ -1017,18 +1186,10 @@ window.onload = function () {
         scheduleConnectRefresh();
     };
 
-    loadConfig();
-    loadGadgetConfig();
+    loadConfigs();
     fetchApps();
     scheduleStatus();
-    refreshConnect();
-    refreshTargetStatus();
 
-    var poll = function () {
-        if (document.hidden) return;
-        refreshTargetStatus();
-        refreshConnect();
-    };
     setInterval(poll, 10000);
     document.addEventListener("visibilitychange", function () {
         if (!document.hidden) poll();
