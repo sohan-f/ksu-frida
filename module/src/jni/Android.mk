@@ -23,7 +23,7 @@ XDL_FILES := $(wildcard $(LOCAL_PATH)/xdl/*.c)
 
 APP_STL=none
 LOCAL_MODULE := zygiskfrida
-LOCAL_C_INCLUDES := $(LOCAL_PATH)/xdl/include $(LOCAL_PATH)/include
+LOCAL_C_INCLUDES := $(LOCAL_PATH)/xdl/include
 LOCAL_SRC_FILES := main_zygisk.cpp dobby_shim.cpp $(XDL_FILES:$(LOCAL_PATH)/%=%)
 LOCAL_STATIC_LIBRARIES := cxx dobby ksufrida_rust
 LOCAL_LDLIBS := -llog -ldl -lm
