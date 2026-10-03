@@ -2,7 +2,7 @@ const CONFIG_PATH = "/data/local/tmp/libsec/config.json";
 const GADGET_CONFIG_PATH = "/data/local/tmp/libsec/libsecmon.config.so";
 const MODULE_PROP = "/data/adb/modules/ksufrida/module.prop";
 const GADGET_PATH = "/data/local/tmp/libsec/libsecmon.so";
-const DEFAULT_GADGET = '{"interaction":{"type":"listen","address":"0.0.0.0","port":27042,"on_port_conflict":"pick-next"}}';
+const DEFAULT_GADGET = '{"interaction":{"type":"listen","address":"127.0.0.1","port":27042,"on_port_conflict":"pick-next"}}';
 
 let config = { targets: [] };
 let allApps = [];
