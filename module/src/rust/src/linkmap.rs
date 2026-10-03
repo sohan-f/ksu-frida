@@ -87,21 +87,36 @@ mod tests {
     use super::*;
     use std::ffi::CString;
 
-    fn entry(name: &str, entries: &mut Vec<CString>) -> DlPhdrInfo {
-        entries.push(CString::new(name).unwrap());
+    fn raw_cstring(s: &str) -> *mut c_char {
+        CString::new(s).unwrap().into_raw()
+    }
+
+    fn entry(name: *const c_char) -> DlPhdrInfo {
         DlPhdrInfo {
             addr: 0,
-            name: entries.last().unwrap().as_ptr(),
+            name,
             phdr: std::ptr::null(),
             phnum: 0,
         }
     }
 
+    /// SAFETY: `ptr` came from `raw_cstring` above and is freed exactly once
+    unsafe fn free_cstring(ptr: *mut c_char, orig_len: usize) {
+        unsafe {
+            drop(Vec::from_raw_parts(
+                ptr.cast::<u8>(),
+                orig_len + 1,
+                orig_len + 1,
+            ));
+        }
+    }
+
     #[test]
     fn callback_scrubs_only_the_matching_entry() {
-        let mut owned = Vec::new();
-        let mut first = entry("/system/lib/libc.so", &mut owned);
-        let mut second = entry("/data/data/com.a.b/.cache/1234/libsecmon.so", &mut owned);
+        let first = raw_cstring("/system/lib/libc.so");
+        let second = raw_cstring("/data/data/com.a.b/.cache/1234/libsecmon.so");
+        let mut first_entry = entry(first);
+        let mut second_entry = entry(second);
 
         let mut search = ScrubSearch {
             target: b"/data/data/com.a.b/.cache/1234/libsecmon.so".to_vec(),
@@ -110,38 +125,42 @@ mod tests {
         };
         let data = (&mut search as *mut ScrubSearch).cast::<c_void>();
 
-        // SAFETY: both entries are live `CString`s; `search` outlives the calls.
+        // SAFETY: both entries are live owned strings; `search` outlives them.
         unsafe {
-            assert_eq!(scrub_callback(&mut first, 0, data), 0);
-            assert_eq!(scrub_callback(&mut second, 0, data), 1);
+            assert_eq!(scrub_callback(&mut first_entry, 0, data), 0);
+            assert_eq!(scrub_callback(&mut second_entry, 0, data), 1);
         }
 
         assert!(search.found);
-        // SAFETY: `owned` still owns both strings.
+        // SAFETY: both strings still owned; read-only checks, then freed
+        // with their original lengths.
         unsafe {
-            assert_eq!(
-                CStr::from_ptr(first.name).to_bytes(),
-                b"/system/lib/libc.so"
-            );
-            assert_eq!(CStr::from_ptr(second.name).to_bytes(), b"libnative_1234.so");
+            assert_eq!(CStr::from_ptr(first).to_bytes(), b"/system/lib/libc.so");
+            assert_eq!(CStr::from_ptr(second).to_bytes(), b"libnative_1234.so");
+            free_cstring(first, 19);
+            free_cstring(second, 43);
         }
     }
 
     #[test]
     fn overwrite_truncates_instead_of_overflowing() {
-        let owned = CString::new("/a/b.so").unwrap();
-        let ptr = owned.as_ptr() as *mut c_char;
+        let buf = raw_cstring("/a/b.so");
         // SAFETY: 7 payload bytes + NUL are ours; the replacement is longer.
         unsafe {
-            overwrite_in_place(ptr, 7, b"libnative_99999.so");
+            overwrite_in_place(buf, 7, b"libnative_99999.so");
         }
-        assert_eq!(owned.as_bytes(), b"libnati");
+        // SAFETY: read-only check of our own string, then freed by
+        // original length.
+        unsafe {
+            assert_eq!(CStr::from_ptr(buf).to_bytes(), b"libnati");
+            free_cstring(buf, 7);
+        }
     }
 
     #[test]
     fn missing_entry_reports_not_found() {
-        let mut owned = Vec::new();
-        let mut only = entry("/system/lib/libc.so", &mut owned);
+        let only = raw_cstring("/system/lib/libc.so");
+        let mut only_entry = entry(only);
         let mut search = ScrubSearch {
             target: b"/nope.so".to_vec(),
             replacement: b"libnative_1.so".to_vec(),
@@ -151,7 +170,7 @@ mod tests {
         unsafe {
             assert_eq!(
                 scrub_callback(
-                    &mut only,
+                    &mut only_entry,
                     0,
                     (&mut search as *mut ScrubSearch).cast::<c_void>()
                 ),
@@ -159,5 +178,9 @@ mod tests {
             );
         }
         assert!(!search.found);
+        // SAFETY: frees our own string (never overwritten: 19 payload bytes).
+        unsafe {
+            free_cstring(only, 19);
+        }
     }
 }

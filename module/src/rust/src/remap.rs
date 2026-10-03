@@ -575,7 +575,6 @@ mod tests {
 
     #[test]
     #[ignore]
-    #[cfg_attr(miri, ignore)]
     #[cfg(target_arch = "aarch64")]
     fn relocate_exec_segment_under_concurrent_execution() {
         use std::sync::atomic::AtomicBool;
