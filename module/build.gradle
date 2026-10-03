@@ -12,6 +12,9 @@ plugins {
 apply plugin: 'com.android.library'
 apply from: file(rootProject.file('module.gradle'))
 
+def nativeNdkVersion = "29.0.14206865"
+def rustPlatformLevel = "29"
+
 dependencies {
     implementation 'dev.rikka.ndk.thirdparty:cxx:1.2.0'
     implementation("io.github.vvb2060.ndk:dobby:1.2")
@@ -45,7 +48,7 @@ android {
     namespace = "zygisk.frida"
     compileSdk rootProject.ext.compileSdkVersion
     buildToolsVersion "37.0.0"
-    ndkVersion "29.0.14206865"
+    ndkVersion nativeNdkVersion
 
     flavorDimensions += "api"
 
@@ -82,6 +85,48 @@ android {
         create("Zygisk") {
             dimension = "api"
         }
+    }
+}
+
+// ── Rust core ────────────────────────────────────────────────────────────────
+// Builds module/src/rust as a staticlib for every module ABI (cargo-ndk); the
+// C++ shell in src/jni (Android.mk) links it into libzygiskfrida.so.
+def rustBuildLibrary = tasks.register("buildRustLibrary", Exec) {
+    group = "build"
+    description = "Builds the Rust core staticlib for all module ABIs"
+
+    workingDir = file("src/rust")
+
+    def cargoHome = System.getenv("CARGO_HOME") ?: "${System.getProperty('user.home')}/.cargo"
+    def cargoBin = file("$cargoHome/bin/cargo")
+    def cargoPath = cargoBin.exists() ? cargoBin.absolutePath : "cargo"
+
+    def sdkRoot = System.getenv("ANDROID_SDK_ROOT") ?: System.getenv("ANDROID_HOME") ?:
+            "${System.getProperty('user.home')}/Android/Sdk"
+    def pinnedNdk = "$sdkRoot/ndk/$nativeNdkVersion"
+    def ndkHome = file(pinnedNdk).isDirectory() ? pinnedNdk
+            : (System.getenv("ANDROID_NDK_HOME") ?: System.getenv("ANDROID_NDK_ROOT") ?: pinnedNdk)
+
+    doFirst {
+        if (!file(ndkHome).isDirectory()) {
+            throw new GradleException("Android NDK not found at $ndkHome (set ANDROID_NDK_HOME or install NDK $nativeNdkVersion)")
+        }
+        logger.lifecycle("cargo-ndk using NDK: $ndkHome")
+    }
+
+    environment "ANDROID_NDK_HOME", ndkHome
+    environment "ANDROID_NDK_ROOT", ndkHome
+    commandLine cargoPath, "ndk",
+            "-t", "armeabi-v7a", "-t", "arm64-v8a", "-t", "x86", "-t", "x86_64",
+            "--platform", rustPlatformLevel,
+            "build", "--release", "--lib"
+}
+
+// The Rust staticlib must exist before ndk-build checks/links it (AGP 9 runs
+// ndk-build via configureNdkBuild*/buildNdkBuild* tasks, per ABI).
+tasks.configureEach { task ->
+    if (task.name.startsWith("configureNdkBuild") || task.name.startsWith("buildNdkBuild")) {
+        task.dependsOn rustBuildLibrary
     }
 }
 

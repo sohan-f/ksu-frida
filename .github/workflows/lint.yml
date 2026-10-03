@@ -20,3 +20,20 @@ jobs:
           --exclude module/src/jni/xdl
           --exclude module/src/jni/zygisk.hpp
           --recursive .
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: rustfmt
+        run: cargo fmt --check
+        working-directory: module/src/rust
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+        working-directory: module/src/rust
+      - name: tests
+        run: cargo test
+        working-directory: module/src/rust

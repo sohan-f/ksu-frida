@@ -1,12 +1,12 @@
 #include <string>
 
-#include "inject.h"
-#include "log.h"
 #include "zygisk.hpp"
 
 using zygisk::Api;
 using zygisk::AppSpecializeArgs;
 using zygisk::ServerSpecializeArgs;
+
+extern "C" bool ksufrida_check_and_inject(const char *app_name);
 
 class MyModule : public zygisk::ModuleBase {
  public:
@@ -21,7 +21,7 @@ class MyModule : public zygisk::ModuleBase {
         std::string app_name = std::string(raw_app_name);
         this->env->ReleaseStringUTFChars(args->nice_name, raw_app_name);
 
-        if (!check_and_inject(app_name)) {
+        if (!ksufrida_check_and_inject(app_name.c_str())) {
             this->api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
         }
     }

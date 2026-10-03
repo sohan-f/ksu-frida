@@ -73,9 +73,23 @@ Example `config.json`:
 
 ## Building
 
+Prerequisites:
+
+- Android SDK with NDK
+- Rust stable toolchain with the Android targets and [cargo-ndk](https://crates.io/crates/cargo-ndk):
+
+```shell
+rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
+cargo install cargo-ndk
+```
+
 ```shell
 ./gradlew :module:assembleRelease
 ```
+
+The Gradle build compiles the Rust core (`module/src/rust`: config parsing, injection
+staging, remapping, child-gating policy) via cargo-ndk and links it into the C++
+Zygisk shell (`module/src/jni`: Zygisk ABI entry + Dobby hook shim) automatically.
 
 Output ZIP will be in the `out/` directory.
 
