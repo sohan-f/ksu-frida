@@ -19,6 +19,50 @@ let searchQuery = "";
 let connectKey = "";
 let connectTimer = null;
 
+const APPS_CACHE_KEY = "ksufrida.apps.v1";
+const GADGET_VERSION_KEY = "ksufrida.gadgetver.v1";
+const APP_BATCH = 50;
+const LABEL_CHUNK = 100;
+const SHELL_LABEL_BATCH = 8;
+let appsLoading = false;
+let labelsPending = false;
+let labelsTried = false;
+let appsLoadPromise = null;
+let appListFiltered = [];
+let appListRenderIndex = 0;
+let appListObserver = null;
+let appSearchTimer = null;
+let nativeIcons = false;
+let statusTimer = null;
+let renderScheduled = false;
+
+function delay(ms) {
+    return new Promise(function (r) { setTimeout(r, ms); });
+}
+
+function parseJson(raw, fallback) {
+    if (raw == null || raw === "") return fallback;
+    if (typeof raw !== "string") return raw;
+    try { return JSON.parse(raw); } catch (_) { return fallback; }
+}
+
+function escHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+        return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+}
+
+function scheduleStatus() {
+    if (statusTimer) return;
+    statusTimer = setTimeout(function () { statusTimer = null; loadStatus(); }, 80);
+}
+
+function scheduleRenderTargets() {
+    if (renderScheduled) return;
+    renderScheduled = true;
+    requestAnimationFrame(function () { renderScheduled = false; renderTargets(); });
+}
+
 function exec(cmd) {
     return new Promise(function (resolve) {
         var name = "_ksu_cb_" + (++callbackId);
@@ -87,6 +131,7 @@ async function loadConfig() {
     renderTargets();
     refreshTargetStatus();
     checkLibraries();
+    resolveLabels(config.targets.map(function (t) { return t.app_name; }).filter(Boolean), true, false);
 }
 
 async function saveConfig() {
@@ -118,6 +163,7 @@ async function checkLibraries() {
         collect(t.child_gating && t.child_gating.injected_libraries);
     });
 
+    var before = JSON.stringify(Object.keys(missingPaths).sort());
     missingPaths = {};
     if (paths.length > 0) {
         var r = await exec("for f in " + paths.map(shQuote).join(" ") +
@@ -128,8 +174,8 @@ async function checkLibraries() {
             });
         }
     }
-    renderTargets();
-    loadStatus();
+    if (JSON.stringify(Object.keys(missingPaths).sort()) !== before) scheduleRenderTargets();
+    scheduleStatus();
 }
 
 async function loadGadgetConfig() {
@@ -145,7 +191,7 @@ async function loadGadgetConfig() {
     validateGadget();
     dirtyGadget = false;
     updateDirtyBadge();
-    loadStatus();
+    scheduleStatus();
     refreshConnect();
 }
 
@@ -189,7 +235,7 @@ async function saveGadgetConfig() {
         dirtyGadget = false;
         updateDirtyBadge();
         validateGadget();
-        loadStatus();
+        scheduleStatus();
         refreshConnect();
     } else {
         ksu.toast("Failed: " + r.stderr);
@@ -211,14 +257,30 @@ function appendStatusRow(label, value, bad) {
     el.appendChild(row);
 }
 
+async function gadgetVersion(key) {
+    if (key) {
+        var cached = null;
+        try { cached = JSON.parse(localStorage.getItem(GADGET_VERSION_KEY) || "null"); } catch (_) {}
+        if (cached && cached.k === key && cached.v) return cached.v;
+    }
+    var r = await exec(
+        "strings -a " + GADGET_PATH + " 2>/dev/null | " +
+        "grep -E '^(1[6-9]|2[0-9])\\.[0-9]+\\.[0-9]+$' | head -1"
+    );
+    var v = (r.errno === 0 && r.stdout.trim()) || "unknown";
+    if (key) {
+        try { localStorage.setItem(GADGET_VERSION_KEY, JSON.stringify({ k: key, v: v })); } catch (_) {}
+    }
+    return v;
+}
+
 async function loadStatus() {
     var el = document.getElementById("status-rows");
     var cmd =
         "v=$(grep -m1 '^version=' " + MODULE_PROP + " 2>/dev/null | cut -d= -f2); " +
         "[ -n \"$v\" ] && echo \"MOD:$v\" || echo 'MOD:not installed'; " +
         "if [ -f " + GADGET_PATH + " ]; then " +
-        "gv=$(strings -a " + GADGET_PATH + " 2>/dev/null | grep -E '^(1[6-9]|2[0-9])\\.[0-9]+\\.[0-9]+$' | head -1); " +
-        "echo \"GADGET:${gv:-unknown}\"; " +
+        "echo \"GADGETKEY:$(stat -c '%s:%Y' " + GADGET_PATH + " 2>/dev/null)\"; " +
         "else echo 'GADGET:missing'; fi";
 
     var rows = {};
@@ -228,6 +290,10 @@ async function loadStatus() {
             var i = line.indexOf(":");
             if (i > 0) rows[line.slice(0, i)] = line.slice(i + 1).trim();
         });
+    }
+
+    if (!("GADGET" in rows)) {
+        rows.GADGET = await gadgetVersion(rows.GADGETKEY || "");
     }
 
     el.innerHTML = "";
@@ -397,40 +463,203 @@ async function refreshConnect() {
     }
 }
 
-async function fetchApps() {
-    var r = await exec(
-        "for p in $(pm list packages -3 | sed 's/package://'); do " +
-        "l=$(dumpsys package \"$p\" | grep -m1 'nonLocalizedLabel=' | sed 's/.*nonLocalizedLabel=//;s/ .*//'); " +
-        "echo \"$p|${l:-$p}\"; done"
-    );
-    if (r.errno === 0 && r.stdout.trim().length > 0) {
-        allApps = [];
-        r.stdout.split("\n").forEach(function (line) {
-            line = line.trim();
-            if (!line) return;
-            var parts = line.split("|");
-            var pkg = parts[0];
-            var label = parts[1] || pkg;
-            allApps.push(pkg);
-            appLabels[pkg] = label;
-        });
-        allApps.sort(function (a, b) {
-            return (appLabels[a] || a).localeCompare(appLabels[b] || b);
-        });
+function readAppsCache() {
+    try {
+        var data = JSON.parse(localStorage.getItem(APPS_CACHE_KEY));
+        if (!data || !Array.isArray(data.packages)) return null;
+        return data;
+    } catch (_) { return null; }
+}
+
+function writeAppsCache() {
+    try {
+        localStorage.setItem(APPS_CACHE_KEY, JSON.stringify({ packages: allApps, labels: appLabels }));
+    } catch (_) {}
+}
+
+function sortApps() {
+    allApps.sort(function (a, b) {
+        var la = (appLabels[a] || a).toLowerCase();
+        var lb = (appLabels[b] || b).toLowerCase();
+        if (la !== lb) return la < lb ? -1 : 1;
+        return a < b ? -1 : (a > b ? 1 : 0);
+    });
+}
+
+function nativeListPackages() {
+    if (typeof ksu === "undefined") return null;
+    try {
+        if (typeof ksu.listPackages === "function") return parseJson(ksu.listPackages("user"), null);
+        if (typeof ksu.listUserPackages === "function") return parseJson(ksu.listUserPackages(), null);
+    } catch (_) {}
+    return null;
+}
+
+function nativeLabelsAvailable() {
+    return typeof ksu !== "undefined" && typeof ksu.getPackagesInfo === "function";
+}
+
+async function listPackageNames() {
+    var names = nativeListPackages();
+    if (names === null) { await delay(250); names = nativeListPackages(); }
+    if (Array.isArray(names) && names.length > 0) return names;
+
+    var r = await exec("pm list packages -3");
+    if (r.errno !== 0) return [];
+    return r.stdout.split("\n")
+        .filter(function (l) { return l.indexOf("package:") === 0; })
+        .map(function (l) { return l.replace("package:", "").trim(); });
+}
+
+function applyLabels(pairs) {
+    var changed = false;
+    var touchedTarget = false;
+    pairs.forEach(function (label, pkg) {
+        if (!pkg || !label || label === "null") return;
+        if (appLabels[pkg] === label) return;
+        appLabels[pkg] = label;
+        changed = true;
+        if (config.targets.some(function (t) { return t.app_name === pkg; })) touchedTarget = true;
+    });
+    if (changed) {
+        sortApps();
+        writeAppsCache();
+        if (touchedTarget) scheduleRenderTargets();
     }
-    if (allApps.length === 0) {
-        var r2 = await exec("pm list packages -3");
-        if (r2.errno === 0 && r2.stdout.trim().length > 0) {
-            allApps = r2.stdout.split("\n")
-                .filter(function (l) { return l.indexOf("package:") === 0; })
-                .map(function (l) { return l.replace("package:", "").trim(); })
-                .sort();
+    return changed;
+}
+
+let labelsChain = Promise.resolve();
+
+function resolveLabels(pkgs, allowShell, fullSweep) {
+    var run = function () {
+        return resolveLabelsNow(pkgs, allowShell, fullSweep).catch(function () {
+            labelsPending = false;
+            updateAppHint();
+        });
+    };
+    labelsChain = labelsChain.then(run, run);
+    return labelsChain;
+}
+
+async function resolveLabelsNow(pkgs, allowShell, fullSweep) {
+    var missing = pkgs.filter(function (p) { return p && !appLabels[p]; });
+    if (missing.length === 0) return;
+
+    if (nativeLabelsAvailable()) {
+        labelsPending = true;
+        updateAppHint();
+        try {
+            for (var i = 0; i < missing.length; i += LABEL_CHUNK) {
+                var info = parseJson(ksu.getPackagesInfo(JSON.stringify(missing.slice(i, i + LABEL_CHUNK))), null);
+                var pairs = new Map();
+                if (Array.isArray(info)) {
+                    info.forEach(function (it) {
+                        if (it && it.packageName && !it.error) pairs.set(it.packageName, it.appLabel || it.packageName);
+                    });
+                }
+                applyLabels(pairs);
+                if (i + LABEL_CHUNK < missing.length) await delay(15);
+            }
+        } finally {
+            labelsPending = false;
+            updateAppHint();
+            if (isAppModalOpen()) renderAppList();
         }
+        return;
     }
+
+    if (!allowShell) return;
+    if (fullSweep) labelsTried = true;
+
+    labelsPending = true;
+    updateAppHint();
+    for (var j = 0; j < missing.length; j += SHELL_LABEL_BATCH) {
+        var chunk = missing.slice(j, j + SHELL_LABEL_BATCH);
+        var cmd = "for p in " + chunk.map(shQuote).join(" ") + "; do " +
+            "l=$(dumpsys package \"$p\" 2>/dev/null | grep -m1 'nonLocalizedLabel=' | " +
+            "sed 's/.*nonLocalizedLabel=//;s/ .*//'); " +
+            "[ -n \"$l\" ] && [ \"$l\" != null ] && echo \"$p|$l\"; done";
+        var r = await exec(cmd);
+        var pairs2 = new Map();
+        if (r.errno === 0) {
+            r.stdout.split("\n").forEach(function (line) {
+                var i = line.indexOf("|");
+                if (i > 0) pairs2.set(line.slice(0, i), line.slice(i + 1).trim());
+            });
+        }
+        applyLabels(pairs2);
+        if (isAppModalOpen()) patchAppLabels();
+        if (j + SHELL_LABEL_BATCH < missing.length) await delay(50);
+    }
+    labelsPending = false;
+    updateAppHint();
+    if (isAppModalOpen()) renderAppList();
+}
+
+async function fetchApps() {
+    if (appsLoadPromise) return appsLoadPromise;
+    appsLoadPromise = (async function () {
+        try {
+            var cached = readAppsCache();
+            if (cached) {
+                allApps = cached.packages;
+                appLabels = cached.labels || {};
+                sortApps();
+                if (isAppModalOpen()) renderAppList();
+            }
+
+            appsLoading = allApps.length === 0;
+            updateAppHint();
+
+            var names = await listPackageNames();
+            if (names.length > 0) {
+                var known = {};
+                allApps.forEach(function (p) { known[p] = 1; });
+                if (names.length !== allApps.length || names.some(function (p) { return !known[p]; })) {
+                    allApps = names;
+                    sortApps();
+                    writeAppsCache();
+                    if (isAppModalOpen()) renderAppList();
+                }
+            }
+            appsLoading = false;
+            updateAppHint();
+
+            await resolveLabels(allApps, false);
+
+            if (isAppModalOpen() && !nativeLabelsAvailable()) resolveLabels(allApps, true, true);
+        } catch (e) {
+            console.error("fetchApps failed", e);
+        } finally {
+            appsLoadPromise = null;
+        }
+    })();
+    return appsLoadPromise;
 }
 
 function getAppLabel(pkg) {
     return appLabels[pkg] || pkg;
+}
+
+function isAppModalOpen() {
+    return document.getElementById("app-modal").style.display === "flex";
+}
+
+function updateAppHint() {
+    var hint = document.getElementById("app-list-hint");
+    if (!hint) return;
+    var text = appsLoading ? "Loading packages…" : (labelsPending ? "Loading labels…" : "");
+    hint.textContent = text;
+    hint.style.display = text ? "block" : "none";
+}
+
+function patchAppLabels() {
+    var rows = document.querySelectorAll("#app-list .app-row");
+    for (var i = 0; i < rows.length; i++) {
+        var strong = rows[i].querySelector("strong");
+        if (strong) strong.textContent = getAppLabel(rows[i].getAttribute("data-pkg"));
+    }
 }
 
 function mkBtn(text, cls, onclick) {
@@ -555,7 +784,7 @@ function renderTargets() {
         libsTa.value = libsToText(t.injected_libraries);
         libsTa.onchange = function () {
             updateField(i, "libs", libsTa.value);
-            renderTargets();
+            checkLibraries();
         };
         div.appendChild(fieldBlock("Injected Libraries", libsTa));
         var note = missingNote(t.injected_libraries);
@@ -588,7 +817,7 @@ function renderTargets() {
             childTa.value = libsToText(t.child_gating.injected_libraries);
             childTa.onchange = function () {
                 updateField(i, "child_libs", childTa.value);
-                renderTargets();
+                checkLibraries();
             };
             panel.appendChild(fieldBlock("Child Libraries", childTa));
             var cnote = missingNote(t.child_gating.injected_libraries);
@@ -630,7 +859,7 @@ function updateField(i, field, value) {
             }
             t.child_gating.enabled = value;
             markDirty("cfg");
-            renderTargets();
+            scheduleRenderTargets();
             return;
         case "child_mode":
             if (t.child_gating) t.child_gating.mode = value;
@@ -647,9 +876,9 @@ function updateField(i, field, value) {
 function removeTarget(i) {
     config.targets.splice(i, 1);
     markDirty("cfg");
-    renderTargets();
+    scheduleRenderTargets();
     refreshTargetStatus();
-    loadStatus();
+    scheduleStatus();
 }
 
 function addTarget(pkg) {
@@ -666,55 +895,84 @@ function addTarget(pkg) {
         child_gating: { enabled: false, mode: "freeze", injected_libraries: [] }
     });
     markDirty("cfg");
-    renderTargets();
+    scheduleRenderTargets();
     checkLibraries();
     refreshTargetStatus();
-    loadStatus();
+    scheduleStatus();
 }
 
 function showAppList() {
     document.getElementById("app-modal").style.display = "flex";
     document.getElementById("app-search").value = "";
+    fetchApps();
     renderAppList();
+    if (!nativeLabelsAvailable() && !labelsTried && allApps.length > 0) {
+        resolveLabels(allApps, true, true);
+    }
 }
 
 function closeAppModal() {
     document.getElementById("app-modal").style.display = "none";
+    if (appListObserver) { appListObserver.disconnect(); appListObserver = null; }
+}
+
+function openAppFromRow(e) {
+    var row = e.target && e.target.closest ? e.target.closest(".app-row") : null;
+    if (!row) return;
+    var pkg = row.getAttribute("data-pkg");
+    if (!pkg) return;
+    addTarget(pkg);
+    closeAppModal();
+}
+
+function appRowHtml(pkg) {
+    var icon = nativeIcons
+        ? '<img class="app-icon" src="ksu://icon/' + escHtml(pkg) + '" alt="" loading="lazy" onerror="this.remove()">'
+        : "";
+    return '<div class="app-row" data-pkg="' + escHtml(pkg) + '">' + icon +
+        '<div class="app-row-text"><strong>' + escHtml(getAppLabel(pkg)) + '</strong>' +
+        '<div class="app-label">' + escHtml(pkg) + '</div></div></div>';
+}
+
+function renderAppBatch() {
+    var list = document.getElementById("app-list");
+    if (appListRenderIndex >= appListFiltered.length) {
+        if (appListObserver) appListObserver.disconnect();
+        return;
+    }
+    var batch = appListFiltered.slice(appListRenderIndex, appListRenderIndex + APP_BATCH);
+    appListRenderIndex += batch.length;
+    list.insertAdjacentHTML("beforeend", batch.map(appRowHtml).join(""));
+    var last = list.lastElementChild;
+    if (last && appListObserver) appListObserver.observe(last);
 }
 
 function renderAppList() {
     var list = document.getElementById("app-list");
-    var search = document.getElementById("app-search").value.toLowerCase();
+    if (appListObserver) { appListObserver.disconnect(); appListObserver = null; }
 
-    var filtered = allApps.filter(function (a) {
-        var label = (appLabels[a] || "").toLowerCase();
-        return a.toLowerCase().indexOf(search) !== -1 || label.indexOf(search) !== -1;
+    var q = document.getElementById("app-search").value.trim().toLowerCase();
+    appListFiltered = allApps.filter(function (pkg) {
+        if (!q) return true;
+        return pkg.toLowerCase().indexOf(q) !== -1 || (appLabels[pkg] || "").toLowerCase().indexOf(q) !== -1;
     });
 
-    if (filtered.length === 0) {
-        list.innerHTML = '<div class="empty">No apps found</div>';
+    list.innerHTML = "";
+    appListRenderIndex = 0;
+
+    if (appListFiltered.length === 0) {
+        list.innerHTML = '<div class="empty">' +
+            (appsLoading ? "Loading…" : "No apps found") + "</div>";
+        updateAppHint();
         return;
     }
 
-    list.innerHTML = "";
-    filtered.forEach(function (app) {
-        var row = document.createElement("div");
-        row.className = "app-row";
-        var labelEl = document.createElement("div");
-        var strong = document.createElement("strong");
-        strong.textContent = getAppLabel(app);
-        labelEl.appendChild(strong);
-        var pkgEl = document.createElement("div");
-        pkgEl.className = "app-label";
-        pkgEl.textContent = app;
-        row.appendChild(labelEl);
-        row.appendChild(pkgEl);
-        row.onclick = function () {
-            addTarget(app);
-            closeAppModal();
-        };
-        list.appendChild(row);
-    });
+    appListObserver = new IntersectionObserver(function (entries) {
+        if (entries[0] && entries[0].isIntersecting) renderAppBatch();
+    }, { root: list, rootMargin: "300px" });
+
+    renderAppBatch();
+    updateAppHint();
 }
 
 function reloadAll() {
@@ -731,17 +989,27 @@ window.onload = function () {
         return;
     }
 
+    nativeIcons = typeof ksu.listPackages === "function" ||
+        typeof ksu.listUserPackages === "function";
+
     document.getElementById("btn-add").onclick = showAppList;
     document.getElementById("btn-save").onclick = saveConfig;
     document.getElementById("btn-reload").onclick = reloadAll;
     document.getElementById("btn-save-gadget").onclick = saveGadgetConfig;
     document.getElementById("btn-close-modal").onclick = closeAppModal;
-    document.getElementById("app-search").oninput = renderAppList;
+    document.getElementById("app-list").onclick = openAppFromRow;
     document.getElementById("btn-status").onclick = loadStatus;
     document.getElementById("btn-connect").onclick = function () { refreshConnect(); };
+
+    document.getElementById("app-search").oninput = function () {
+        clearTimeout(appSearchTimer);
+        appSearchTimer = setTimeout(renderAppList, 150);
+    };
+    var targetSearchTimer = null;
     document.getElementById("target-search").oninput = function () {
         searchQuery = this.value.trim().toLowerCase();
-        renderTargets();
+        clearTimeout(targetSearchTimer);
+        targetSearchTimer = setTimeout(renderTargets, 150);
     };
     document.getElementById("gadget-editor").oninput = function () {
         markDirty("gadget");
@@ -752,11 +1020,17 @@ window.onload = function () {
     loadConfig();
     loadGadgetConfig();
     fetchApps();
-    loadStatus();
+    scheduleStatus();
     refreshConnect();
     refreshTargetStatus();
-    setInterval(function () {
+
+    var poll = function () {
+        if (document.hidden) return;
         refreshTargetStatus();
         refreshConnect();
-    }, 6000);
+    };
+    setInterval(poll, 10000);
+    document.addEventListener("visibilitychange", function () {
+        if (!document.hidden) poll();
+    });
 };

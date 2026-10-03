@@ -165,19 +165,36 @@
 
         .modal-body {
             overflow-y: auto;
+            overscroll-behavior: contain;
             flex: 1;
             margin-top: 10px;
+            -webkit-overflow-scrolling: touch;
         }
 
         .app-row {
-            padding: 10px 8px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 9px 8px;
             border-bottom: 1px solid var(--border);
             cursor: pointer;
             font-size: 13px;
         }
 
         .app-row:hover { background: var(--surface2); }
-        .app-row .app-label { font-size: 12px; color: var(--text2); }
+        .app-row .app-label { font-size: 12px; color: var(--text2); word-break: break-all; }
+        .app-row-text { min-width: 0; }
+        .app-row-text strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+        .app-icon {
+            width: 28px;
+            height: 28px;
+            flex: 0 0 28px;
+            border-radius: 6px;
+            background: var(--surface2);
+        }
+
+        #app-list-hint { display: none; margin-top: 8px; }
 
         .empty { color: var(--text2); text-align: center; padding: 12px 0; font-size: 13px; }
 
@@ -288,6 +305,7 @@
                 <button class="btn btn-sm" id="btn-close-modal">Close</button>
             </div>
             <input type="text" id="app-search" placeholder="Search packages...">
+            <div id="app-list-hint" class="sub"></div>
             <div class="modal-body" id="app-list"></div>
         </div>
     </div>
