@@ -135,6 +135,7 @@ fn copy_file(src: &str, dst: &str) -> bool {
         .create(true)
         .truncate(true)
         .mode(0o700)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(dst)
     {
         Ok(file) => file,
@@ -143,6 +144,29 @@ fn copy_file(src: &str, dst: &str) -> bool {
             return false;
         }
     };
+
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: `zeroed` stat as an output slot; no invariants yet.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `fstat` on our own open fd writes only into `st` above.
+        if unsafe { libc::fstat(output.as_raw_fd(), &mut st) } != 0 {
+            loge(format!(
+                "stage: fstat dst failed: {dst}: {}",
+                io::Error::last_os_error()
+            ));
+            return false;
+        }
+        #[allow(clippy::unnecessary_cast)]
+        let (ifmt, ifreg) = (libc::S_IFMT as u32, libc::S_IFREG as u32);
+        let fmt = st.st_mode & ifmt;
+        // SAFETY: `geteuid(2)` takes no arguments and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        if fmt != ifreg || st.st_uid != euid {
+            loge(format!("stage: refusing non-file dst {dst}"));
+            return false;
+        }
+    }
 
     match copy_file_range_all(&input, &output, src, dst, src_len) {
         RangeOutcome::Done => true,
@@ -261,16 +285,41 @@ fn ensure_dir(path: &str, mode: libc::mode_t) -> bool {
         return false;
     };
     // SAFETY: `c_path` is NUL-terminated and the return value is checked below.
-    if unsafe { libc::mkdir(c_path.as_ptr(), mode) } == 0 {
-        return true;
+    let mkdir_ok = unsafe { libc::mkdir(c_path.as_ptr(), mode) } == 0;
+    if !mkdir_ok {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EEXIST) {
+            loge(format!("stage: mkdir {path} failed: {err}"));
+            return false;
+        }
     }
 
-    let err = io::Error::last_os_error();
-    if err.raw_os_error() == Some(libc::EEXIST) {
-        return true;
+    // SAFETY: `zeroed` stat as an output slot; no invariants yet.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `lstat` on our NUL-terminated path writes only into `st` above.
+    if unsafe { libc::lstat(c_path.as_ptr(), &mut st) } != 0 {
+        loge(format!(
+            "stage: stat {path} failed: {}",
+            io::Error::last_os_error()
+        ));
+        return false;
     }
-    loge(format!("stage: mkdir {path} failed: {err}"));
-    false
+    #[allow(clippy::unnecessary_cast)]
+    let (ifmt, iflnk, ifdir) = (
+        libc::S_IFMT as u32,
+        libc::S_IFLNK as u32,
+        libc::S_IFDIR as u32,
+    );
+    let fmt = st.st_mode & ifmt;
+    if fmt == iflnk {
+        loge(format!("stage: refusing symlinked dir {path}"));
+        return false;
+    }
+    if fmt != ifdir {
+        loge(format!("stage: not a directory: {path}"));
+        return false;
+    }
+    true
 }
 
 fn remove_file(path: &str) -> bool {
@@ -713,6 +762,53 @@ mod tests {
         assert!(remove_file(dir.join("never-existed").to_str().unwrap()));
         assert!(remove_dir(dir.to_str().unwrap()));
         assert!(!dir.exists());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn ensure_dir_refuses_symlink_plant() {
+        let dir = scratch("mkdir-link");
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("real");
+        fs::create_dir_all(&target).unwrap();
+
+        let link = dir.join("planted");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(!ensure_dir(link.to_str().unwrap(), 0o700));
+
+        let dangling = dir.join("dangling");
+        std::os::unix::fs::symlink(dir.join("no-such-target"), &dangling).unwrap();
+        assert!(!ensure_dir(dangling.to_str().unwrap(), 0o700));
+
+        assert!(ensure_dir(target.to_str().unwrap(), 0o700));
+        assert!(ensure_dir(dir.join("fresh").to_str().unwrap(), 0o700));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn copy_file_refuses_symlink_and_special_files() {
+        let dir = scratch("copy-plant");
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.bin");
+        fs::write(&src, b"payload").unwrap();
+
+        let elsewhere = dir.join("elsewhere.bin");
+        std::os::unix::fs::symlink(&elsewhere, dir.join("link.bin")).unwrap();
+        assert!(!copy_file(
+            src.to_str().unwrap(),
+            dir.join("link.bin").to_str().unwrap()
+        ));
+        assert!(!elsewhere.exists());
+
+        let fifo = dir.join("fifo.bin");
+        let c_fifo = CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: `c_fifo` is NUL-terminated; creates a test-owned node.
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+        assert!(!copy_file(src.to_str().unwrap(), fifo.to_str().unwrap()));
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
