@@ -5,7 +5,6 @@ let config = { targets: [] };
 let allApps = [];
 let callbackId = 0;
 
-// ── KSU exec wrapper using string-based callback registration ────────────────
 function exec(cmd) {
     return new Promise(function (resolve) {
         var name = "_ksu_cb_" + (++callbackId);
@@ -17,7 +16,6 @@ function exec(cmd) {
     });
 }
 
-// ── Config I/O ───────────────────────────────────────────────────────────────
 async function loadConfig() {
     var r = await exec("cat " + CONFIG_PATH);
     if (r.errno === 0 && r.stdout.trim().length > 0) {
@@ -39,7 +37,7 @@ async function loadConfig() {
 async function saveConfig() {
     var json = JSON.stringify(config, null, 4);
     var escaped = json.replace(/'/g, "'\\''");
-    var r = await exec("echo '" + escaped + "' > " + CONFIG_PATH + " && chmod 644 " + CONFIG_PATH);
+    var r = await exec("printf '%s\\n' '" + escaped + "' > " + CONFIG_PATH + " && chmod 644 " + CONFIG_PATH);
     if (r.errno === 0) {
         ksu.toast("Config saved");
     } else {
@@ -58,14 +56,14 @@ async function loadGadgetConfig() {
     } else {
         status.className = "status-err";
         status.textContent = "Not found";
-        editor.value = '{"interaction":{"type":"listen","address":"0.0.0.0","port":27042}}';
+        editor.value = '{"interaction":{"type":"listen","address":"0.0.0.0","port":27042,"on_port_conflict":"pick-next"}}';
     }
 }
 
 async function saveGadgetConfig() {
     var content = document.getElementById("gadget-editor").value;
     var escaped = content.replace(/'/g, "'\\''");
-    var r = await exec("echo '" + escaped + "' > " + GADGET_CONFIG_PATH + " && chmod 644 " + GADGET_CONFIG_PATH);
+    var r = await exec("printf '%s\\n' '" + escaped + "' > " + GADGET_CONFIG_PATH + " && chmod 644 " + GADGET_CONFIG_PATH);
     if (r.errno === 0) {
         ksu.toast("Gadget config saved");
         loadGadgetConfig();
@@ -74,11 +72,9 @@ async function saveGadgetConfig() {
     }
 }
 
-// ── App list ─────────────────────────────────────────────────────────────────
 var appLabels = {};
 
 async function fetchApps() {
-    // Get 3rd party packages with labels in one shot
     var r = await exec(
         "for p in $(pm list packages -3 | sed 's/package://'); do " +
         "l=$(dumpsys package \"$p\" | grep -m1 'nonLocalizedLabel=' | sed 's/.*nonLocalizedLabel=//;s/ .*//'); " +
@@ -99,7 +95,6 @@ async function fetchApps() {
             return (appLabels[a] || a).localeCompare(appLabels[b] || b);
         });
     }
-    // Fallback: just package names
     if (allApps.length === 0) {
         var r2 = await exec("pm list packages -3");
         if (r2.errno === 0 && r2.stdout.trim().length > 0) {
@@ -115,7 +110,6 @@ function getAppLabel(pkg) {
     return appLabels[pkg] || pkg;
 }
 
-// ── Render ───────────────────────────────────────────────────────────────────
 function renderTargets() {
     var container = document.getElementById("targets");
     container.innerHTML = "";
@@ -178,7 +172,6 @@ function renderTargets() {
     });
 }
 
-// ── Data updates ─────────────────────────────────────────────────────────────
 function updateField(i, field, value) {
     var t = config.targets[i];
     switch (field) {
@@ -235,7 +228,6 @@ function addTarget(pkg) {
     renderTargets();
 }
 
-// ── Modal ────────────────────────────────────────────────────────────────────
 function showAppList() {
     document.getElementById("app-modal").style.display = "flex";
     document.getElementById("app-search").value = "";
@@ -275,7 +267,6 @@ function renderAppList() {
     });
 }
 
-// ── Init ─────────────────────────────────────────────────────────────────────
 window.onload = function () {
     if (typeof ksu === "undefined") {
         document.body.innerHTML = '<div style="text-align:center;padding:40px;color:#f44336;">' +

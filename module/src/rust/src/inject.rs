@@ -40,16 +40,44 @@ fn get_process_name() -> String {
         .unwrap_or_default()
 }
 
-fn wait_for_init(app_name: &str) {
+pub(crate) fn current_app_name() -> String {
+    fs::read("/proc/self/cmdline")
+        .ok()
+        .and_then(|bytes| {
+            bytes
+                .split(|b| *b == 0)
+                .next()
+                .map(|arg| String::from_utf8_lossy(arg).into_owned())
+        })
+        .unwrap_or_default()
+}
+
+fn package_of(app_name: &str) -> &str {
+    app_name.split(':').next().unwrap_or(app_name)
+}
+
+const INIT_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn wait_for_init(app_name: &str) -> bool {
+    wait_for_init_within(app_name, INIT_TIMEOUT)
+}
+
+fn wait_for_init_within(app_name: &str, timeout: Duration) -> bool {
     logi("Wait for process to complete init");
 
+    let deadline = std::time::Instant::now() + timeout;
     while !get_process_name().contains(app_name) {
+        if std::time::Instant::now() >= deadline {
+            loge(format!("Timed out waiting for process init: {app_name}"));
+            return false;
+        }
         thread::sleep(Duration::from_millis(10));
     }
 
     thread::sleep(Duration::from_millis(100));
 
     logi("Process init completed");
+    true
 }
 
 fn delay_start_up(start_up_delay_ms: u64) {
@@ -133,7 +161,11 @@ fn split_lib_path(src_lib_path: &str) -> (&str, &str) {
 }
 
 fn stage_gadget(app_name: &str, src_lib_path: &str) -> String {
-    let stage_dir = format!("/data/data/{app_name}/.cache");
+    let cache_dir = format!("/data/data/{}/.cache", package_of(app_name));
+    unsafe {
+        libc::mkdir(cstring(&cache_dir).as_ptr(), 0o700);
+    }
+    let stage_dir = format!("{cache_dir}/{}", unsafe { libc::getpid() });
     unsafe {
         libc::mkdir(cstring(&stage_dir).as_ptr(), 0o700);
     }
@@ -181,6 +213,7 @@ pub fn inject_lib(lib_path: &str, log_context: &str) {
         logi(format!(
             "{log_context}Injected {lib_path} with handle {handle:p}"
         ));
+        remap_lib(lib_path);
         return;
     }
     let xdl_err = dlerror_string();
@@ -203,8 +236,25 @@ pub fn inject_lib(lib_path: &str, log_context: &str) {
     ));
 }
 
+pub(crate) fn stage_and_inject(lib_path: &str, app_name: &str, log_context: &str) {
+    let staged = stage_gadget(app_name, lib_path);
+    let inject_path = if staged.is_empty() { lib_path } else { &staged };
+
+    logi(format!("{log_context}Injecting {inject_path}"));
+    inject_lib(inject_path, log_context);
+
+    if !staged.is_empty() {
+        unlink_staged(&staged);
+    }
+}
+
 fn inject_libs(cfg: &TargetConfig, pid: libc::pid_t) {
-    wait_for_init(&cfg.app_name);
+    if !wait_for_init(&cfg.app_name) {
+        loge(format!(
+            "Skipping injection into PID {pid}: process never reached expected name"
+        ));
+        return;
+    }
 
     if cfg.child_gating.enabled {
         enable_child_gating(&cfg.child_gating);
@@ -217,15 +267,7 @@ fn inject_libs(cfg: &TargetConfig, pid: libc::pid_t) {
     delay_start_up(cfg.start_up_delay_ms);
 
     for lib_path in &cfg.injected_libraries {
-        let staged = stage_gadget(&cfg.app_name, lib_path);
-        let inject_path = if staged.is_empty() { lib_path } else { &staged };
-
-        logi(format!("Injecting {inject_path}"));
-        inject_lib(inject_path, "");
-
-        if !staged.is_empty() {
-            unlink_staged(&staged);
-        }
+        stage_and_inject(lib_path, &cfg.app_name, "");
     }
 
     thread::sleep(Duration::from_millis(500));
@@ -251,5 +293,32 @@ mod tests {
         assert_eq!(split_lib_path("/data/x/lib.so"), ("/data/x", "lib.so"));
         assert_eq!(split_lib_path("lib.so"), (".", "lib.so"));
         assert_eq!(split_lib_path(""), (".", ""));
+    }
+
+    #[test]
+    fn package_of_strips_subprocess_suffix() {
+        assert_eq!(package_of("com.a.b"), "com.a.b");
+        assert_eq!(package_of("com.a.b:push"), "com.a.b");
+        assert_eq!(package_of(""), "");
+    }
+
+    #[test]
+    fn wait_for_init_gives_up_after_timeout() {
+        let start = std::time::Instant::now();
+        assert!(!wait_for_init_within(
+            "definitely-no-such-process-name",
+            Duration::from_millis(30)
+        ));
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn wait_for_init_returns_when_name_matches() {
+        let arg0 = get_process_name()
+            .split('\0')
+            .next()
+            .unwrap_or("")
+            .to_string();
+        assert!(wait_for_init_within(&arg0, Duration::from_secs(5)));
     }
 }
