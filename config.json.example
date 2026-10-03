@@ -5,6 +5,7 @@
             "enabled": true,
             "start_up_delay_ms": 0,
             "kernel_assisted_evasion": false,
+            "hide_maps": true,
             "injected_libraries": [
                 {
                     "path": "/data/local/tmp/libsec/libsecmon.so"

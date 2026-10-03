@@ -13,14 +13,29 @@ pub struct ChildGatingConfig {
     pub injected_libraries: Vec<String>,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetConfig {
     pub enabled: bool,
     pub app_name: String,
     pub start_up_delay_ms: u64,
     pub kernel_assisted_evasion: bool,
+    pub hide_maps: bool,
     pub injected_libraries: Vec<String>,
     pub child_gating: ChildGatingConfig,
+}
+
+impl Default for TargetConfig {
+    fn default() -> Self {
+        TargetConfig {
+            enabled: false,
+            app_name: String::new(),
+            start_up_delay_ms: 0,
+            kernel_assisted_evasion: false,
+            hide_maps: true,
+            injected_libraries: Vec::new(),
+            child_gating: ChildGatingConfig::default(),
+        }
+    }
 }
 
 pub fn load_config(module_dir: &str, app_name: &str) -> Option<TargetConfig> {
@@ -105,6 +120,14 @@ fn deserialize_target_config(value: &Value) -> Option<TargetConfig> {
         return None;
     };
     result.start_up_delay_ms = start_up_delay_ms;
+
+    if let Some(hide_maps) = obj.get("hide_maps") {
+        let Some(hide_maps) = hide_maps.as_bool() else {
+            loge("invalid config: expected targets.hide_maps to be a bool");
+            return None;
+        };
+        result.hide_maps = hide_maps;
+    }
 
     let null = Value::Null;
     let libraries = obj.get("injected_libraries").unwrap_or(&null);
@@ -327,6 +350,36 @@ mod tests {
         fs::write(dir.join("config.json"), ADVANCED).unwrap();
         assert!(load_config(dir.to_str().unwrap(), "").is_none());
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    fn target_with_hide_maps(value: &str) -> String {
+        format!(
+            r#"{{"targets":[{{"app_name":"a.b","enabled":true,
+                "kernel_assisted_evasion":false,"start_up_delay_ms":0,
+                "hide_maps":{value},"injected_libraries":[]}}]}}"#,
+        )
+    }
+
+    #[test]
+    fn hide_maps_defaults_to_true_and_parses_explicit_values() {
+        let dir = temp_dir("hidemaps-default");
+        fs::write(dir.join("config.json"), ADVANCED).unwrap();
+        let cfg = load_config(dir.to_str().unwrap(), "com.example.app").expect("config");
+        assert!(cfg.hide_maps);
+        fs::remove_dir_all(&dir).ok();
+
+        for (value, expected) in [("true", true), ("false", false)] {
+            let dir = temp_dir("hidemaps-explicit");
+            fs::write(dir.join("config.json"), target_with_hide_maps(value)).unwrap();
+            let cfg = load_config(dir.to_str().unwrap(), "a.b").expect("config");
+            assert_eq!(cfg.hide_maps, expected);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        let dir = temp_dir("hidemaps-mistype");
+        fs::write(dir.join("config.json"), target_with_hide_maps("\"yes\"")).unwrap();
+        assert!(load_config(dir.to_str().unwrap(), "a.b").is_none());
         fs::remove_dir_all(&dir).ok();
     }
 

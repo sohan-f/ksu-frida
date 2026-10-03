@@ -22,6 +22,7 @@ Example config
             "app_name": "com.example.package",
             "enabled": true,
             "kernel_assisted_evasion": false,
+            "hide_maps": true,
             "start_up_delay_ms": 0,
             "injected_libraries": [
                 {
@@ -58,6 +59,13 @@ This is useful if you want to temporarily disable a target while maintaining the
 
 ### kernel_assisted_evasion
 Enables kernel-assisted evasion for the target process (KSIE). Requires KernelSU with compatible kernel patches.
+
+### hide_maps
+Whether injected libraries are remapped out of `/proc/self/maps` after
+loading (default `true`). Turning it off skips copying every segment, so the
+whole gadget is never faulted resident at startup — at the price of leaving
+the library paths visible to the target while it runs. Only disable this if
+you do not need maps-hiding for the target.
 
 ### start_up_delay_ms
 Injection of libraries is delayed by this amount in milliseconds.
