@@ -25,6 +25,20 @@ unsafe extern "C" {
     ) -> *mut c_void;
 }
 
+#[repr(C)]
+pub struct DlPhdrInfo {
+    pub addr: usize,
+    pub name: *const c_char,
+    pub phdr: *const c_void,
+    pub phnum: u16,
+}
+
+pub type DlIterateCb = unsafe extern "C" fn(*mut DlPhdrInfo, usize, *mut c_void) -> c_int;
+
+unsafe extern "C" {
+    pub fn dl_iterate_phdr(cb: DlIterateCb, data: *mut c_void) -> c_int;
+}
+
 #[cfg(target_os = "android")]
 #[link(name = "log")]
 unsafe extern "C" {
