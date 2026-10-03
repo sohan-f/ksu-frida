@@ -16,7 +16,16 @@ class MyModule : public zygisk::ModuleBase {
     }
 
     void postAppSpecialize(const AppSpecializeArgs *args) override {
+        if (args->nice_name == nullptr) {
+            this->api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+            return;
+        }
+
         const char *raw_app_name = env->GetStringUTFChars(args->nice_name, nullptr);
+        if (raw_app_name == nullptr) {
+            this->api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+            return;
+        }
 
         std::string app_name = std::string(raw_app_name);
         this->env->ReleaseStringUTFChars(args->nice_name, raw_app_name);
