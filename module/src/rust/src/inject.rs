@@ -1,6 +1,6 @@
 
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::thread;
 use std::time::Duration;
@@ -111,8 +111,16 @@ fn delay_start_up(start_up_delay_ms: u64) {
 fn copy_file(src: &str, dst: &str) -> bool {
     let mut input = match File::open(src) {
         Ok(file) => file,
-        Err(_) => {
-            loge(format!("stage: open src failed: {src}"));
+        Err(err) => {
+            loge(format!("stage: open src failed: {src}: {err}"));
+            return false;
+        }
+    };
+
+    let src_len = match input.metadata() {
+        Ok(meta) => meta.len(),
+        Err(err) => {
+            loge(format!("stage: stat src failed: {src}: {err}"));
             return false;
         }
     };
@@ -125,24 +133,79 @@ fn copy_file(src: &str, dst: &str) -> bool {
         .open(dst)
     {
         Ok(file) => file,
-        Err(_) => {
-            loge(format!("stage: open dst failed: {dst}"));
+        Err(err) => {
+            loge(format!("stage: open dst failed: {dst}: {err}"));
             return false;
         }
     };
 
     let mut buf = [0u8; 65536];
-    while let Ok(n) = input.read(&mut buf) {
-        if n == 0 {
-            break;
-        }
-        if output.write_all(&buf[..n]).is_err() {
-            loge(format!("stage: write failed for {dst}"));
+    let mut copied: u64 = 0;
+    loop {
+        let n = match input.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err) => {
+                loge(format!("stage: read failed for {src}: {err}"));
+                return false;
+            }
+        };
+
+        if let Err(err) = output.write_all(&buf[..n]) {
+            loge(format!("stage: write failed for {dst}: {err}"));
             return false;
         }
+        copied += n as u64;
+    }
+
+    if copied != src_len {
+        loge(format!(
+            "stage: short copy of {src}: {copied} of {src_len} bytes"
+        ));
+        return false;
     }
 
     true
+}
+
+fn ensure_dir(path: &str, mode: libc::mode_t) -> bool {
+    if unsafe { libc::mkdir(cstring(path).as_ptr(), mode) } == 0 {
+        return true;
+    }
+
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EEXIST) {
+        return true;
+    }
+    loge(format!("stage: mkdir {path} failed: {err}"));
+    false
+}
+
+fn remove_file(path: &str) -> bool {
+    if unsafe { libc::unlink(cstring(path).as_ptr()) } == 0 {
+        return true;
+    }
+
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ENOENT) {
+        return true;
+    }
+    loge(format!("stage: unlink {path} failed: {err}"));
+    false
+}
+
+fn remove_dir(path: &str) -> bool {
+    if unsafe { libc::rmdir(cstring(path).as_ptr()) } == 0 {
+        return true;
+    }
+
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ENOENT) {
+        return true;
+    }
+    loge(format!("stage: rmdir {path} failed: {err}"));
+    false
 }
 
 fn with_config_suffix(path: &str) -> String {
@@ -162,12 +225,12 @@ fn split_lib_path(src_lib_path: &str) -> (&str, &str) {
 
 fn stage_gadget(app_name: &str, src_lib_path: &str) -> String {
     let cache_dir = format!("/data/data/{}/.cache", package_of(app_name));
-    unsafe {
-        libc::mkdir(cstring(&cache_dir).as_ptr(), 0o700);
+    if !ensure_dir(&cache_dir, 0o700) {
+        return String::new();
     }
     let stage_dir = format!("{cache_dir}/{}", unsafe { libc::getpid() });
-    unsafe {
-        libc::mkdir(cstring(&stage_dir).as_ptr(), 0o700);
+    if !ensure_dir(&stage_dir, 0o700) {
+        return String::new();
     }
 
     let (src_dir, lib_name) = split_lib_path(src_lib_path);
@@ -179,30 +242,30 @@ fn stage_gadget(app_name: &str, src_lib_path: &str) -> String {
     logi(format!("Staging gadget: {src_lib_path} -> {dst_lib}"));
 
     if !copy_file(src_lib_path, &dst_lib) {
+        remove_file(&dst_lib);
+        remove_file(&dst_cfg);
+        remove_dir(&stage_dir);
         return String::new();
     }
 
-    copy_file(&src_cfg, &dst_cfg);
+    if !copy_file(&src_cfg, &dst_cfg) {
+        remove_file(&dst_cfg);
+    }
     dst_lib
 }
 
 fn unlink_staged(staged_lib_path: &str) {
-    unsafe {
-        libc::unlink(cstring(staged_lib_path).as_ptr());
-    }
+    let lib_ok = remove_file(staged_lib_path);
+    let cfg_ok = remove_file(&with_config_suffix(staged_lib_path));
 
-    let cfg = with_config_suffix(staged_lib_path);
-    unsafe {
-        libc::unlink(cstring(&cfg).as_ptr());
-    }
+    let dir_ok = match staged_lib_path.rfind('/') {
+        Some(slash) => remove_dir(&staged_lib_path[..slash]),
+        None => true,
+    };
 
-    if let Some(slash) = staged_lib_path.rfind('/') {
-        unsafe {
-            libc::rmdir(cstring(&staged_lib_path[..slash]).as_ptr());
-        }
+    if lib_ok && cfg_ok && dir_ok {
+        logi("Staged files removed");
     }
-
-    logi("Staged files removed");
 }
 
 pub fn inject_lib(lib_path: &str, log_context: &str) {
@@ -320,5 +383,72 @@ mod tests {
             .unwrap_or("")
             .to_string();
         assert!(wait_for_init_within(&arg0, Duration::from_secs(5)));
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("ksufrida-{}-{name}", std::process::id()))
+    }
+
+    #[test]
+    fn copy_file_copies_every_byte() {
+        let dir = scratch("copy-ok");
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.bin");
+        let dst = dir.join("dst.bin");
+
+        let payload: Vec<u8> = (0..200_000).map(|i| (i % 251) as u8).collect();
+        fs::write(&src, &payload).unwrap();
+
+        assert!(copy_file(src.to_str().unwrap(), dst.to_str().unwrap()));
+        assert_eq!(fs::read(&dst).unwrap(), payload);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn copy_file_rejects_a_missing_source() {
+        let dir = scratch("copy-missing");
+        fs::create_dir_all(&dir).unwrap();
+        let dst = dir.join("dst.bin");
+
+        assert!(!copy_file(
+            dir.join("no-such-file").to_str().unwrap(),
+            dst.to_str().unwrap()
+        ));
+        assert!(!dst.exists());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn copy_file_fails_on_a_directory_source() {
+        let dir = scratch("copy-dir");
+        fs::create_dir_all(&dir).unwrap();
+        let dst = dir.join("dst.bin");
+
+        assert!(!copy_file(dir.to_str().unwrap(), dst.to_str().unwrap()));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remove_helpers_treat_missing_entries_as_clean() {
+        let dir = scratch("remove-clean");
+        fs::create_dir_all(&dir).unwrap();
+
+        assert!(remove_file(dir.join("never-existed").to_str().unwrap()));
+        assert!(remove_dir(dir.to_str().unwrap()));
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn remove_dir_reports_a_leftover_stage() {
+        let dir = scratch("remove-nonempty");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("leftover.bin"), b"x").unwrap();
+
+        assert!(!remove_dir(dir.to_str().unwrap()));
+
+        fs::remove_dir_all(&dir).ok();
     }
 }

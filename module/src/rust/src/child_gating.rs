@@ -49,6 +49,8 @@ unsafe extern "C" fn fork_replacement() -> libc::pid_t {
         return child_pid;
     }
 
+    crate::remap::after_fork();
+
     let child_pid = unsafe { libc::getpid() };
     let context = format!("[child_gating][pid {child_pid}] ");
 
