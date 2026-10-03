@@ -257,11 +257,57 @@ fn split_lib_path(src_lib_path: &str) -> (&str, &str) {
     }
 }
 
+fn remove_stage_dir_contents(dir: &str) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.map_while(Result::ok) {
+        if entry
+            .file_type()
+            .map(|t| t.is_file() || t.is_symlink())
+            .unwrap_or(false)
+        {
+            remove_file(&entry.path().to_string_lossy());
+        }
+    }
+}
+
+fn sweep_stale_stage_dirs(cache_dir: &str) {
+    let Ok(entries) = fs::read_dir(cache_dir) else {
+        return;
+    };
+    // SAFETY: `getpid(2)` cannot fail.
+    let own_pid = unsafe { libc::getpid() };
+    for entry in entries.map_while(Result::ok) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Ok(pid) = name.parse::<libc::pid_t>() else {
+            continue;
+        };
+        if pid == own_pid {
+            continue;
+        }
+        // SAFETY: signal 0 sends nothing; the return value is purely the
+        // existence check below.
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            continue;
+        }
+        if io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+            continue;
+        }
+        let dir = format!("{cache_dir}/{name}");
+        remove_stage_dir_contents(&dir);
+        if remove_dir(&dir) {
+            logi(format!("Swept stale stage dir {dir}"));
+        }
+    }
+}
+
 fn stage_gadget(app_name: &str, src_lib_path: &str) -> String {
     let cache_dir = format!("/data/data/{}/.cache", package_of(app_name));
     if !ensure_dir(&cache_dir, 0o700) {
         return String::new();
     }
+    sweep_stale_stage_dirs(&cache_dir);
     // SAFETY: `getpid(2)` cannot fail.
     let stage_dir = format!("{cache_dir}/{}", unsafe { libc::getpid() });
     if !ensure_dir(&stage_dir, 0o700) {
@@ -384,8 +430,6 @@ fn inject_libs(cfg: &TargetConfig, pid: libc::pid_t) {
     for lib_path in &cfg.injected_libraries {
         stage_and_inject(lib_path, &cfg.app_name, "");
     }
-
-    thread::sleep(Duration::from_millis(500));
 }
 
 #[cfg(test)]
@@ -542,5 +586,92 @@ mod tests {
         assert!(!remove_dir(dir.to_str().unwrap()));
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg_attr(miri, ignore)]
+    fn dead_pid() -> libc::pid_t {
+        // SAFETY: the child exits immediately; the parent reaps it below.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork(2)");
+        if pid == 0 {
+            // SAFETY: child-only path, never returns.
+            unsafe { libc::_exit(0) };
+        }
+        let mut status = 0;
+        // SAFETY: `pid` is our child; blocking reap of exactly it.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        pid
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn sweep_removes_only_dead_pid_dirs() {
+        let cache = scratch("sweep");
+        fs::create_dir_all(&cache).unwrap();
+        let cache = cache.to_str().unwrap().to_string();
+
+        // SAFETY: `getpid(2)` cannot fail.
+        let live = unsafe { libc::getpid() }.to_string();
+        let dead = dead_pid().to_string();
+
+        fs::create_dir_all(format!("{cache}/{dead}")).unwrap();
+        fs::write(format!("{cache}/{dead}/libsecmon.so"), b"x").unwrap();
+        fs::write(format!("{cache}/{dead}/libsecmon.config.so"), b"y").unwrap();
+        fs::create_dir_all(format!("{cache}/{live}")).unwrap();
+        fs::write(format!("{cache}/{live}/libsecmon.so"), b"x").unwrap();
+        fs::create_dir_all(format!("{cache}/not-a-pid")).unwrap();
+        fs::write(format!("{cache}/mydata.bin"), b"app file").unwrap();
+
+        sweep_stale_stage_dirs(&cache);
+
+        assert!(
+            !std::path::Path::new(&format!("{cache}/{dead}")).exists(),
+            "stale stage dir must go"
+        );
+        assert!(
+            std::path::Path::new(&format!("{cache}/{live}/libsecmon.so")).exists(),
+            "live pid dir must stay"
+        );
+        assert!(
+            std::path::Path::new(&format!("{cache}/not-a-pid")).exists(),
+            "foreign dir must stay"
+        );
+        assert!(
+            std::path::Path::new(&format!("{cache}/mydata.bin")).exists(),
+            "app file must stay"
+        );
+
+        fs::remove_dir_all(&cache).ok();
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn sweep_leaves_unexpected_subdirs_alone() {
+        let cache = scratch("sweep-subdir");
+        fs::create_dir_all(&cache).unwrap();
+        let cache = cache.to_str().unwrap().to_string();
+
+        let dead = dead_pid().to_string();
+        fs::create_dir_all(format!("{cache}/{dead}")).unwrap();
+        fs::write(format!("{cache}/{dead}/libsecmon.so"), b"x").unwrap();
+        fs::create_dir_all(format!("{cache}/{dead}/weird")).unwrap();
+        fs::write(format!("{cache}/{dead}/weird/nested.bin"), b"y").unwrap();
+
+        sweep_stale_stage_dirs(&cache);
+
+        assert!(
+            !std::path::Path::new(&format!("{cache}/{dead}/libsecmon.so")).exists(),
+            "top-level staged file must go"
+        );
+        assert!(
+            std::path::Path::new(&format!("{cache}/{dead}/weird/nested.bin")).exists(),
+            "nested contents must stay"
+        );
+        assert!(
+            std::path::Path::new(&format!("{cache}/{dead}")).exists(),
+            "non-empty dir must stay for remove_dir to report"
+        );
+
+        fs::remove_dir_all(&cache).ok();
     }
 }
