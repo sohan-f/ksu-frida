@@ -24,7 +24,26 @@ unsafe extern "C" {
     ) -> *mut c_void;
 }
 
+#[cfg(target_os = "android")]
+#[link(name = "log")]
+unsafe extern "C" {
+    fn __android_log_print(prio: c_int, tag: *const c_char, fmt: *const c_char, ...) -> c_int;
+}
+
+#[cfg(target_os = "android")]
+pub fn android_log(prio: c_int, msg: &str) {
+    // SAFETY: `tag` and `fmt` are static `c"..."` literals; `msg` is copied into
+    // a `CString`, so no interior NUL can reach the varargs (a NUL-containing
+    // message logs as an empty line, matching the old behaviour), and the
+    // return value is a status nobody reads — same contract as the C++ LOG_*.
+    unsafe {
+        let c_msg = CString::new(msg).unwrap_or_default();
+        __android_log_print(prio, c"KsuFrida".as_ptr(), c"%s".as_ptr(), c_msg.as_ptr());
+    }
+}
+
 pub fn dlerror_string() -> String {
+    // SAFETY: `dlerror()` returns null or a valid NUL-terminated string owned by libc; it is copied before any later dl call.
     unsafe {
         let err = dlerror();
         if err.is_null() {
