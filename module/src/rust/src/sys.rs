@@ -1,5 +1,5 @@
 
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::ffi::{CStr, CString, NulError, c_char, c_int, c_void};
 
 pub const RTLD_NOW: c_int = 2;
 
@@ -53,9 +53,25 @@ pub fn dlerror_string() -> String {
     }
 }
 
-pub fn cstring(s: &str) -> CString {
-    CString::new(s).unwrap_or_else(|e| {
-        let before = e.into_vec();
-        CString::new(before).unwrap_or_default()
-    })
+pub fn cstring(s: &str) -> Result<CString, NulError> {
+    CString::new(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cstring_accepts_ordinary_paths() {
+        assert_eq!(
+            cstring("/data/local/tmp/libsec/a.so").unwrap(),
+            c"/data/local/tmp/libsec/a.so".to_owned()
+        );
+    }
+
+    #[test]
+    fn cstring_rejects_an_interior_nul() {
+        assert!(cstring("a\0b").is_err());
+        assert!(cstring("\0").is_err());
+    }
 }

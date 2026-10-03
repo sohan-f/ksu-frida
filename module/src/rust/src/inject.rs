@@ -1,4 +1,5 @@
 
+use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -30,15 +31,18 @@ pub fn check_and_inject(app_name: &str) -> bool {
         return false;
     }
 
+    if !needs_injection_thread(&cfg) {
+        logi(format!("Nothing to inject for {app_name}"));
+        return false;
+    }
+
     thread::spawn(move || inject_libs(&cfg, pid));
 
     true
 }
 
-fn get_process_name() -> String {
-    fs::read("/proc/self/cmdline")
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .unwrap_or_default()
+fn needs_injection_thread(cfg: &TargetConfig) -> bool {
+    !cfg.injected_libraries.is_empty() || cfg.child_gating.enabled
 }
 
 pub(crate) fn current_app_name() -> String {
@@ -67,7 +71,7 @@ fn wait_for_init_within(app_name: &str, timeout: Duration) -> bool {
     logi("Wait for process to complete init");
 
     let deadline = std::time::Instant::now() + timeout;
-    while !get_process_name().contains(app_name) {
+    while current_app_name() != app_name {
         if std::time::Instant::now() >= deadline {
             loge(format!("Timed out waiting for process init: {app_name}"));
             return false;
@@ -170,9 +174,22 @@ fn copy_file(src: &str, dst: &str) -> bool {
     true
 }
 
+fn stage_cpath(path: &str) -> Option<CString> {
+    cstring(path)
+        .inspect_err(|err| {
+            loge(format!(
+                "stage: refusing path with interior NUL {path:?}: {err}"
+            ))
+        })
+        .ok()
+}
+
 fn ensure_dir(path: &str, mode: libc::mode_t) -> bool {
-    // SAFETY: `cstring(path)` is NUL-terminated and the return value is checked below.
-    if unsafe { libc::mkdir(cstring(path).as_ptr(), mode) } == 0 {
+    let Some(c_path) = stage_cpath(path) else {
+        return false;
+    };
+    // SAFETY: `c_path` is NUL-terminated and the return value is checked below.
+    if unsafe { libc::mkdir(c_path.as_ptr(), mode) } == 0 {
         return true;
     }
 
@@ -185,8 +202,11 @@ fn ensure_dir(path: &str, mode: libc::mode_t) -> bool {
 }
 
 fn remove_file(path: &str) -> bool {
-    // SAFETY: `cstring(path)` is NUL-terminated and the return value is checked below.
-    if unsafe { libc::unlink(cstring(path).as_ptr()) } == 0 {
+    let Some(c_path) = stage_cpath(path) else {
+        return false;
+    };
+    // SAFETY: `c_path` is NUL-terminated and the return value is checked below.
+    if unsafe { libc::unlink(c_path.as_ptr()) } == 0 {
         return true;
     }
 
@@ -199,8 +219,11 @@ fn remove_file(path: &str) -> bool {
 }
 
 fn remove_dir(path: &str) -> bool {
-    // SAFETY: `cstring(path)` is NUL-terminated and the return value is checked below.
-    if unsafe { libc::rmdir(cstring(path).as_ptr()) } == 0 {
+    let Some(c_path) = stage_cpath(path) else {
+        return false;
+    };
+    // SAFETY: `c_path` is NUL-terminated and the return value is checked below.
+    if unsafe { libc::rmdir(c_path.as_ptr()) } == 0 {
         return true;
     }
 
@@ -213,10 +236,17 @@ fn remove_dir(path: &str) -> bool {
 }
 
 fn with_config_suffix(path: &str) -> String {
-    let mut result = path.to_string();
-    if let Some(dot) = result.rfind(".so") {
-        result.insert_str(dot, ".config");
-    }
+    let boundary = path.rfind('/').map_or(0, |slash| slash + 1);
+    let base = &path[boundary..];
+    let Some(dot) = base.rfind(".so") else {
+        return path.to_string();
+    };
+
+    let insert_at = boundary + dot;
+    let mut result = String::with_capacity(path.len() + ".config".len());
+    result.push_str(&path[..insert_at]);
+    result.push_str(".config");
+    result.push_str(&path[insert_at..]);
     result
 }
 
@@ -274,7 +304,15 @@ fn unlink_staged(staged_lib_path: &str) {
 }
 
 pub fn inject_lib(lib_path: &str, log_context: &str) {
-    let c_path = cstring(lib_path);
+    let c_path = match cstring(lib_path) {
+        Ok(c_path) => c_path,
+        Err(err) => {
+            loge(format!(
+                "{log_context}refusing library path with interior NUL {lib_path:?}: {err}"
+            ));
+            return;
+        }
+    };
 
     // SAFETY: `c_path` is a live `CString`; the returned handle is checked for null below.
     let handle = unsafe { xdl_open(c_path.as_ptr(), XDL_TRY_FORCE_LOAD) };
@@ -353,16 +391,46 @@ fn inject_libs(cfg: &TargetConfig, pid: libc::pid_t) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ChildGatingConfig;
 
     #[test]
-    fn config_suffix_matches_original() {
+    fn config_suffix_is_anchored_to_the_basename() {
         assert_eq!(with_config_suffix("libsecmon.so"), "libsecmon.config.so");
         assert_eq!(
             with_config_suffix("/a/b/libgadget-arm64.so"),
             "/a/b/libgadget-arm64.config.so"
         );
         assert_eq!(with_config_suffix("no_suffix"), "no_suffix");
-        assert_eq!(with_config_suffix("/dir.so/file"), "/dir.config.so/file");
+        assert_eq!(with_config_suffix("/dir.so/file"), "/dir.so/file");
+        assert_eq!(
+            with_config_suffix("/dir.so/libx.so"),
+            "/dir.so/libx.config.so"
+        );
+        assert_eq!(with_config_suffix("./libx.so"), "./libx.config.so");
+    }
+
+    #[test]
+    fn empty_targets_need_no_injection_thread() {
+        let base = || TargetConfig {
+            enabled: true,
+            app_name: "com.a.b".to_string(),
+            child_gating: ChildGatingConfig {
+                enabled: false,
+                mode: "kill".to_string(),
+                injected_libraries: Vec::new(),
+            },
+            ..TargetConfig::default()
+        };
+
+        assert!(!needs_injection_thread(&base()));
+
+        let mut with_library = base();
+        with_library.injected_libraries = vec!["/a.so".to_string()];
+        assert!(needs_injection_thread(&with_library));
+
+        let mut gated = base();
+        gated.child_gating.enabled = true;
+        assert!(needs_injection_thread(&gated));
     }
 
     #[test]
@@ -391,12 +459,22 @@ mod tests {
 
     #[test]
     fn wait_for_init_returns_when_name_matches() {
-        let arg0 = get_process_name()
-            .split('\0')
-            .next()
-            .unwrap_or("")
-            .to_string();
+        let arg0 = current_app_name();
         assert!(wait_for_init_within(&arg0, Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn wait_for_init_does_not_match_a_prefix_of_the_process_name() {
+        let arg0 = current_app_name();
+        let mut prefix = arg0.clone();
+        prefix.pop();
+        if prefix.is_empty() {
+            return;
+        }
+
+        let start = std::time::Instant::now();
+        assert!(!wait_for_init_within(&prefix, Duration::from_millis(50)));
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 
     fn scratch(name: &str) -> std::path::PathBuf {
