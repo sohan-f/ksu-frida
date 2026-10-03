@@ -301,7 +301,14 @@ pub fn inject_lib(lib_path: &str, log_context: &str) {
 
 pub(crate) fn stage_and_inject(lib_path: &str, app_name: &str, log_context: &str) {
     let staged = stage_gadget(app_name, lib_path);
-    let inject_path = if staged.is_empty() { lib_path } else { &staged };
+    let inject_path = if staged.is_empty() {
+        loge(format!(
+            "{log_context}Staging {lib_path} failed; falling back to the raw path"
+        ));
+        lib_path
+    } else {
+        &staged
+    };
 
     logi(format!("{log_context}Injecting {inject_path}"));
     inject_lib(inject_path, log_context);
