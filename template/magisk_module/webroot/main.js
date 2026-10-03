@@ -86,15 +86,111 @@ function scheduleTargetStatus(ms) {
     }, ms == null ? 150 : ms);
 }
 
+const EXEC_TIMEOUT_MS = 15000;
+const PROBE_TIMEOUT_MS = 4000;
+const SAVE_MARK = "__KSU_FRIDA_SAVED__";
+let execMode = "auto";
+let probePromise = null;
+
+function probeExec() {
+    if (execMode !== "auto") return Promise.resolve(execMode);
+    if (probePromise) return probePromise;
+
+    probePromise = new Promise(function (resolve) {
+        var name = "_ksu_probe_" + (++callbackId);
+        var settled = false;
+        var timer = null;
+
+        function finish(mode) {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            delete window[name];
+            execMode = mode;
+            resolve(mode);
+        }
+
+        timer = setTimeout(function () {
+            var mode = syncProbe();
+            finish(mode === "none" ? "async" : mode);
+        }, PROBE_TIMEOUT_MS);
+
+        window[name] = function (errno, stdout) {
+            var text = stdout == null ? "" : String(stdout);
+            finish(text.indexOf("__KSU_PROBE__") !== -1 ? "async" : syncProbe());
+        };
+        try {
+            ksu.exec("echo __KSU_PROBE__", "{}", name);
+        } catch (_) {
+            finish(syncProbe());
+        }
+    });
+    return probePromise;
+}
+
+function syncProbe() {
+    try {
+        var out = ksu.exec("echo __KSU_PROBE__");
+        if (out != null && String(out).indexOf("__KSU_PROBE__") !== -1) return "sync";
+    } catch (_) {}
+    return "none";
+}
+
 function exec(cmd) {
+    return probeExec().then(function (mode) {
+        if (mode === "async") return asyncExec(cmd);
+        if (mode === "sync") return syncExec(cmd);
+        return { errno: -1, stdout: "", stderr: "KernelSU exec API unavailable" };
+    });
+}
+
+function asyncExec(cmd) {
     return new Promise(function (resolve) {
         var name = "_ksu_cb_" + (++callbackId);
-        window[name] = function (errno, stdout, stderr) {
+        var settled = false;
+
+        var timer = setTimeout(function () {
+            if (settled) return;
+            settled = true;
             delete window[name];
-            resolve({ errno: errno, stdout: stdout, stderr: stderr });
+            execMode = "sync";
+            resolve(syncExec(cmd));
+        }, EXEC_TIMEOUT_MS);
+
+        window[name] = function (errno, stdout, stderr) {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            delete window[name];
+            var code = Number(errno);
+            resolve({
+                errno: isNaN(code) ? -1 : code,
+                stdout: stdout == null ? "" : String(stdout),
+                stderr: stderr == null ? "" : String(stderr)
+            });
         };
-        ksu.exec(cmd, "{}", name);
+
+        try {
+            ksu.exec(cmd, "{}", name);
+        } catch (_) {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            delete window[name];
+            execMode = "sync";
+            resolve(syncExec(cmd));
+        }
     });
+}
+
+function syncExec(cmd) {
+    try {
+        var out = ksu.exec(cmd);
+        return { errno: 0, stdout: out == null ? "" : String(out), stderr: "" };
+    } catch (e) {
+        execMode = "none";
+        return { errno: -1, stdout: "", stderr: String((e && e.message) || e) };
+    }
 }
 
 function shQuote(s) {
@@ -109,6 +205,7 @@ const POLL_INTERVAL_MS = 1000;
 
 async function runDetached(script, path, onBody, opts) {
     opts = opts || {};
+    if (execMode === "none") return false;
     await exec("{ " + script + "; echo \"" + DONE_MARK + "\"; } > " + path +
         " </dev/null 2>/dev/null &");
     var deadline = Date.now() + (opts.timeout || 120000);
@@ -231,14 +328,15 @@ function applyConfigText(text) {
 
 async function saveConfig() {
     var json = JSON.stringify(config, null, 4);
-    var r = await exec("printf '%s\\n' " + shQuote(json) + " > " + CONFIG_PATH + " && chmod 644 " + CONFIG_PATH);
-    if (r.errno === 0) {
+    var r = await exec("{ printf '%s\\n' " + shQuote(json) + " > " + CONFIG_PATH +
+        " && chmod 644 " + CONFIG_PATH + " && echo " + SAVE_MARK + "; } 2>&1");
+    if (String(r.stdout).indexOf(SAVE_MARK) !== -1) {
         ksu.toast("Config saved");
         dirtyConfig = false;
         updateDirtyBadge();
         checkLibraries();
     } else {
-        ksu.toast("Save failed: " + r.stderr);
+        ksu.toast("Save failed: " + (r.stderr || r.stdout || r.errno));
     }
 }
 
@@ -322,8 +420,9 @@ async function saveGadgetConfig() {
         return;
     }
     var content = document.getElementById("gadget-editor").value;
-    var r = await exec("printf '%s\\n' " + shQuote(content) + " > " + GADGET_CONFIG_PATH + " && chmod 644 " + GADGET_CONFIG_PATH);
-    if (r.errno === 0) {
+    var r = await exec("{ printf '%s\\n' " + shQuote(content) + " > " + GADGET_CONFIG_PATH +
+        " && chmod 644 " + GADGET_CONFIG_PATH + " && echo " + SAVE_MARK + "; } 2>&1");
+    if (String(r.stdout).indexOf(SAVE_MARK) !== -1) {
         ksu.toast("Gadget config saved");
         gadgetFileOk = true;
         dirtyGadget = false;
@@ -332,7 +431,7 @@ async function saveGadgetConfig() {
         scheduleStatus();
         refreshConnect();
     } else {
-        ksu.toast("Failed: " + r.stderr);
+        ksu.toast("Failed: " + (r.stderr || r.stdout || r.errno));
     }
 }
 
@@ -399,6 +498,13 @@ async function loadStatus() {
 
     var rows = {};
     var r = await exec(cmd);
+    if (execMode === "none") {
+        el.innerHTML = "";
+        el.className = "";
+        appendStatusRow("Shell access", "unavailable (ksu.exec missing)", true);
+        appendStatusRow("Targets", config.targets.length + " total", false);
+        return;
+    }
     if (r.errno === 0) {
         r.stdout.split("\n").forEach(function (line) {
             var i = line.indexOf(":");
