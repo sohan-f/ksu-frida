@@ -337,6 +337,8 @@ unsafe fn relocate_segment(
             None
         };
 
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
         end_rebuild();
 
         if let Some(err) = restore_error {
@@ -567,6 +569,82 @@ mod tests {
                 reader.join().expect("reader thread died"),
                 "reader never resumed against the rebuilt segment"
             );
+            assert_eq!(libc::munmap(address, SIZE), 0);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    #[cfg_attr(miri, ignore)]
+    #[cfg(target_arch = "aarch64")]
+    fn relocate_exec_segment_under_concurrent_execution() {
+        use std::sync::atomic::AtomicBool;
+
+        let _state = lock_state();
+        let _retry = install_fault_retry();
+
+        unsafe extern "C" {
+            fn __clear_cache(begin: *mut c_void, end: *mut c_void);
+        }
+
+        const SIZE: usize = 4096;
+        // SAFETY: fresh anonymous mapping owned by this test.
+        let address = unsafe {
+            let address = libc::mmap(
+                std::ptr::null_mut(),
+                SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                -1,
+                0,
+            );
+            assert_ne!(address, libc::MAP_FAILED, "{}", io::Error::last_os_error());
+            let code: [u32; 2] = [0x52800540, 0xD65F03C0];
+            std::ptr::copy_nonoverlapping(code.as_ptr().cast::<u8>(), address.cast::<u8>(), 8);
+            assert_eq!(
+                libc::mprotect(address, SIZE, libc::PROT_READ | libc::PROT_EXEC),
+                0
+            );
+            __clear_cache(address, address.cast::<u8>().add(8).cast());
+            address
+        };
+        // SAFETY: `address` holds the stub above for the whole test.
+        let func: unsafe extern "C" fn() -> u32 = unsafe { std::mem::transmute(address) };
+        // SAFETY: the stub returns 42 by construction.
+        assert_eq!(unsafe { func() }, 42);
+
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        // SAFETY: `address` stays mapped and executable for the
+                        // whole scope; relocation preserves contents and perms.
+                        let ret = unsafe { func() };
+                        assert_eq!(ret, 42);
+                    }
+                });
+            }
+
+            for _ in 0..100 {
+                // SAFETY: `address`/`SIZE` describe the live mapping above and
+                // the rebuild lock is held via `install_fault_retry`.
+                unsafe {
+                    relocate_segment(
+                        address,
+                        SIZE,
+                        libc::PROT_READ | libc::PROT_EXEC,
+                        "/test/libexec.so",
+                    )
+                    .expect("relocate_segment failed");
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+
+        // SAFETY: the mapping is still ours; relocation keeps the address.
+        unsafe {
+            assert_eq!(perms_at(address as usize), "r-xp");
             assert_eq!(libc::munmap(address, SIZE), 0);
         }
     }
