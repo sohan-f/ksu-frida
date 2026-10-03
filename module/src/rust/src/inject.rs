@@ -421,7 +421,7 @@ fn unlink_staged(staged_lib_path: &str) {
     }
 }
 
-pub fn inject_lib(lib_path: &str, log_context: &str) {
+pub fn inject_lib(lib_path: &str, log_context: &str, hide_maps: bool) {
     let c_path = match cstring(lib_path) {
         Ok(c_path) => c_path,
         Err(err) => {
@@ -438,7 +438,7 @@ pub fn inject_lib(lib_path: &str, log_context: &str) {
         logi(format!(
             "{log_context}Injected {lib_path} with handle {handle:p}"
         ));
-        remap_lib(lib_path);
+        hide_or_show(lib_path, log_context, hide_maps);
         return;
     }
     let xdl_err = dlerror_string();
@@ -449,7 +449,7 @@ pub fn inject_lib(lib_path: &str, log_context: &str) {
         logi(format!(
             "{log_context}Injected {lib_path} with handle {handle:p} (dlopen fallback)"
         ));
-        remap_lib(lib_path);
+        hide_or_show(lib_path, log_context, hide_maps);
         return;
     }
     let dlopen_err = dlerror_string();
@@ -462,7 +462,15 @@ pub fn inject_lib(lib_path: &str, log_context: &str) {
     ));
 }
 
-pub(crate) fn stage_and_inject(lib_path: &str, app_name: &str, log_context: &str) {
+fn hide_or_show(lib_path: &str, log_context: &str, hide_maps: bool) {
+    if hide_maps {
+        remap_lib(lib_path);
+    } else {
+        logi(format!("{log_context}Map hiding disabled for {lib_path}"));
+    }
+}
+
+pub(crate) fn stage_and_inject(lib_path: &str, app_name: &str, log_context: &str, hide_maps: bool) {
     let staged = stage_gadget(app_name, lib_path);
     let inject_path = if staged.is_empty() {
         loge(format!(
@@ -474,7 +482,7 @@ pub(crate) fn stage_and_inject(lib_path: &str, app_name: &str, log_context: &str
     };
 
     logi(format!("{log_context}Injecting {inject_path}"));
-    inject_lib(inject_path, log_context);
+    inject_lib(inject_path, log_context, hide_maps);
 
     if !staged.is_empty() {
         unlink_staged(&staged);
@@ -500,7 +508,7 @@ fn inject_libs(cfg: &TargetConfig, pid: libc::pid_t) {
     delay_start_up(cfg.start_up_delay_ms);
 
     for lib_path in &cfg.injected_libraries {
-        stage_and_inject(lib_path, &cfg.app_name, "");
+        stage_and_inject(lib_path, &cfg.app_name, "", cfg.hide_maps);
     }
 }
 

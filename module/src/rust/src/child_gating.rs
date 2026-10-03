@@ -69,7 +69,7 @@ fn run_child_action(action: ChildAction, libraries: &[String]) -> libc::pid_t {
             let context = format!("[child_gating][pid {child_pid}] ");
             let app_name = current_app_name();
             for lib_path in libraries {
-                stage_and_inject(lib_path, &app_name, &context);
+                stage_and_inject(lib_path, &app_name, &context, true);
             }
             0
         }
