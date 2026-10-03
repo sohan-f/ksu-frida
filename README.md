@@ -1,6 +1,6 @@
 # KsuFrida
 
-Frida gadget injection module for KernelSU/Magisk via Zygisk.
+Frida gadget injection module for KernelSU via Zygisk (API v5).
 
 - Gadget is not embedded into the APK — APK integrity/signature checks still pass
 - No ptrace — avoids ptrace-based detection
@@ -10,13 +10,13 @@ Frida gadget injection module for KernelSU/Magisk via Zygisk.
 
 ## Prerequisites
 
-- Rooted device with KernelSU or Magisk
-- Zygisk enabled
+- KernelSU (KernelSU-Next supported; Magisk/APatch are not targeted)
+- A Zygisk provider implementing **Zygisk API v5**: [ReZygisk](https://github.com/PerformanC/ReZygisk) or a recent Zygisk Next
 
 ## Quick Start
 
-1. Download the latest release from the [Releases](https://github.com/gorkemgun/ksu-frida/releases) page
-2. Install the ZIP via KernelSU/Magisk Manager
+1. Download the latest release from the [Releases](https://github.com/sohan-f/ksu-frida/releases) page
+2. Install the ZIP via KernelSU Manager
 3. Reboot
 
 ### Option A: WebUI (KernelSU only)

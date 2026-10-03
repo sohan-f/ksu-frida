@@ -2,7 +2,7 @@
 
 #include "inject.h"
 #include "log.h"
-#include "zygisk.h"
+#include "zygisk.hpp"
 
 using zygisk::Api;
 using zygisk::AppSpecializeArgs;

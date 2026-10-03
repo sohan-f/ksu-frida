@@ -1,3 +1,8 @@
+# v1.9.36
+- Updated Zygisk API from v2 to v5 (requires a provider with API v5 support: ReZygisk or a recent Zygisk Next)
+- KernelSU is now the only supported root solution
+- Module libraries are now 16 KB page-size aligned
+
 # v1.9.20
 - Fixed WebUI-saved config file permissions so the target app can read them (thanks @limbang, #7)
 

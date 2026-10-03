@@ -18,5 +18,5 @@ jobs:
           --filter=-build/c++11,-build/header_guard,-legal/copyright,-build/include_subdir
           --exclude module/src/jni/include/rapidjson
           --exclude module/src/jni/xdl
-          --exclude module/src/jni/zygisk.h
+          --exclude module/src/jni/zygisk.hpp
           --recursive .

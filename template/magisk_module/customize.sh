@@ -32,18 +32,10 @@ LIB32_NAME="armeabi-v7a.so"
 LIB64_NAME="arm64-v8a.so"
 LIB32_DEST="$MODPATH/zygisk"
 LIB64_DEST="$MODPATH/zygisk"
-BUSYBOX_BIN=/data/adb/magisk/busybox
+BUSYBOX_BIN=/data/adb/ksu/bin/busybox
 
 if [ ! -f $BUSYBOX_BIN ]; then
-  BUSYBOX_BIN=/data/adb/ksu/bin/busybox
-fi
-
-if [ ! -f $BUSYBOX_BIN ]; then
-  BUSYBOX_BIN=/data/adb/ap/bin/busybox
-fi
-
-if [ ! -f $BUSYBOX_BIN ]; then
-  abort "! unable to locate busybox"
+  abort "! unable to locate KernelSU busybox ($BUSYBOX_BIN)"
 fi
 
 ui_print "- Using busybox: $BUSYBOX_BIN"

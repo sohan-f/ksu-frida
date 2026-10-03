@@ -31,7 +31,7 @@ jobs:
               -H "X-GitHub-Api-Version: 2022-11-28" \
               -o response.json \
               -w "%{http_code}" \
-              https://api.github.com/repos/gorkemgun/knox-frida-patcher/releases/latest
+              https://api.github.com/repos/sohan-f/knox-frida-patcher/releases/latest
           )
 
           if [ "$http_code" != "200" ]; then

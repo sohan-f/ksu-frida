@@ -2,11 +2,11 @@ ext {
     // Magisk Module
     magiskModuleId = "ksufrida"
     moduleName = "ksufrida"
-    moduleAuthor = "gorkemgun"
+    moduleAuthor = "sohan-f"
     moduleDescription = "Frida gadget injection module for KernelSU via Zygisk"
-    moduleVersion = "v1.9.34"
-    moduleVersionCode = 44
+    moduleVersion = "v1.9.36"
+    moduleVersionCode = 46
 
     // Frida
-    fridaVersion = "17.20.0"
+    fridaVersion = "17.21.0"
 }
