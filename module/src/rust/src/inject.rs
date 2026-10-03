@@ -521,8 +521,19 @@ fn hide_or_show(lib_path: &str, log_context: &str, hide_maps: bool) {
     scrub_dlpi_name(lib_path);
 }
 
-pub(crate) fn stage_and_inject(lib_path: &str, app_name: &str, log_context: &str, hide_maps: bool) {
-    let staged = stage_gadget(app_name, lib_path);
+pub(crate) fn stage_and_inject(
+    lib_path: &str,
+    app_name: &str,
+    log_context: &str,
+    hide_maps: bool,
+    stage: bool,
+) {
+    let staged = if stage {
+        stage_gadget(app_name, lib_path)
+    } else {
+        logi(format!("{log_context}Staging skipped for {lib_path}"));
+        String::new()
+    };
     let inject_path = if staged.is_empty() {
         loge(format!(
             "{log_context}Staging {lib_path} failed; falling back to the raw path"
@@ -559,7 +570,7 @@ fn inject_libs(cfg: &TargetConfig, pid: libc::pid_t) {
     delay_start_up(cfg.start_up_delay_ms);
 
     for lib_path in &cfg.injected_libraries {
-        stage_and_inject(lib_path, &cfg.app_name, "", cfg.hide_maps);
+        stage_and_inject(lib_path, &cfg.app_name, "", cfg.hide_maps, false);
     }
 }
 
@@ -909,5 +920,23 @@ mod tests {
         );
 
         fs::remove_dir_all(&cache).ok();
+    }
+
+    #[test]
+    fn no_stage_injects_without_touching_the_filesystem() {
+        let dir = scratch("no-stage");
+        fs::create_dir_all(&dir).unwrap();
+
+        stage_and_inject(
+            dir.join("missing.so").to_str().unwrap(),
+            "com.example.app",
+            "[test] ",
+            true,
+            false,
+        );
+
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+
+        fs::remove_dir_all(&dir).ok();
     }
 }
