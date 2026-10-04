@@ -1,0 +1,5 @@
+# Generated fuzzer state: never commit.
+corpus/
+artifacts/
+coverage/
+target/

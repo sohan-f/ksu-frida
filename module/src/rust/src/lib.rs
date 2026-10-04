@@ -13,6 +13,11 @@ mod xdl;
 
 use std::ffi::{CStr, c_char};
 
+#[cfg(fuzzing)]
+pub fn fuzz_parse_config(module_dir: &str, app_name: &str) -> Option<String> {
+    config::load_config(module_dir, app_name).map(|cfg| cfg.app_name)
+}
+
 /// # Safety
 /// `app_name` must be null or a valid NUL-terminated C string (JNI
 /// `GetStringUTFChars` output). It must not be mutated while this runs.
