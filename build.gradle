@@ -14,7 +14,7 @@ buildscript {
 
 ext {
     // KernelSU supports Android 10+; NDK r29 libc++ also needs API >= 26 for towctrans/wctrans
-    minSdkVersion = 29
+    minSdkVersion = 30
     compileSdkVersion = 36
 
     outDir = file("$rootDir/out")
