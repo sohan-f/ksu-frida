@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2023 HexHacking Team
+// Copyright (c) 2020-2025 HexHacking Team
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -43,6 +43,16 @@
 #endif
 #define XDL_UTIL_VDSO_BASENAME "[vdso]"
 
+#if defined(__arm__)
+#define XDL_UTIL_ABI_STR "armeabi-v7a"
+#elif defined(__aarch64__)
+#define XDL_UTIL_ABI_STR "arm64-v8a"
+#elif defined(__i386__)
+#define XDL_UTIL_ABI_STR "x86"
+#elif defined(__x86_64__)
+#define XDL_UTIL_ABI_STR "x86_64"
+#endif
+
 #define XDL_UTIL_TEMP_FAILURE_RETRY(exp)   \
   ({                                       \
     __typeof__(exp) _rc;                   \
@@ -63,6 +73,8 @@ bool xdl_util_ends_with(const char *str, const char *ending);
 size_t xdl_util_trim_ending(char *start);
 
 int xdl_util_get_api_level(void);
+
+size_t xdl_util_get_pagesize(void);
 
 #ifdef __cplusplus
 }
