@@ -2,6 +2,7 @@ const CONFIG_PATH = "/data/local/tmp/libsec/config.json";
 const GADGET_CONFIG_PATH = "/data/local/tmp/libsec/libsecmon.config.so";
 const MODULE_PROP = "/data/adb/modules/ksufrida/module.prop";
 const GADGET_PATH = "/data/local/tmp/libsec/libsecmon.so";
+const VERBOSE_PATH = "/data/local/tmp/libsec/verbose";
 const DEFAULT_GADGET = '{"interaction":{"type":"listen","address":"127.0.0.1","port":27042,"on_port_conflict":"pick-next"}}';
 
 let config = { targets: [] };
@@ -455,6 +456,38 @@ function setStatusValue(id, value, bad) {
     v.style.color = bad ? "var(--danger)" : "";
 }
 
+function appendVerboseRow(on) {
+    var el = document.getElementById("status-rows");
+    var row = document.createElement("div");
+    row.className = "status-row";
+    var k = document.createElement("span");
+    k.className = "kv";
+    k.textContent = "Verbose logging";
+    var label = document.createElement("label");
+    label.className = "switch";
+    var input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = !!on;
+    input.title = "Off: silent in logcat. On: KsuFrida lines for troubleshooting (applies to newly started processes).";
+    input.onchange = function () { setVerbose(input.checked); };
+    var span = document.createElement("span");
+    span.className = "slider";
+    label.appendChild(input);
+    label.appendChild(span);
+    row.appendChild(k);
+    row.appendChild(label);
+    el.appendChild(row);
+}
+
+async function setVerbose(on) {
+    if (on) {
+        await exec("touch " + VERBOSE_PATH + " && chmod 644 " + VERBOSE_PATH);
+    } else {
+        await exec("rm -f " + VERBOSE_PATH);
+    }
+    loadStatus();
+}
+
 function readVersionCache(key) {
     if (!key) return null;
     try {
@@ -491,7 +524,8 @@ async function loadStatus() {
         "[ -n \"$v\" ] && echo \"MOD:$v\" || echo 'MOD:not installed'; " +
         "if [ -f " + GADGET_PATH + " ]; then " +
         "echo \"GADGETKEY:$(stat -c '%s:%Y' " + GADGET_PATH + " 2>/dev/null)\"; " +
-        "else echo 'GADGET:missing'; fi";
+        "else echo 'GADGET:missing'; fi; " +
+        "if [ -f " + VERBOSE_PATH + " ]; then echo 'VERBOSE:on'; else echo 'VERBOSE:off'; fi;";
 
     var rows = {};
     var r = await exec(cmd);
@@ -524,6 +558,7 @@ async function loadStatus() {
     appendStatusRow("Gadget", gad, gad === "missing" || gad === "unknown", "status-gadget");
 
     appendStatusRow("Gadget config", gadgetFileOk ? "saved" : "not found", !gadgetFileOk);
+    appendVerboseRow(rows.VERBOSE === "on");
     var total = config.targets.length;
     var enabled = config.targets.filter(function (t) { return !!t.enabled; }).length;
     appendStatusRow("Targets", total + " total · " + enabled + " enabled", false);
