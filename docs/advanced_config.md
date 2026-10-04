@@ -44,7 +44,8 @@ Example config
 ```
 
 The config contains an array of targets. A target contains the configuration for one application
-you want to inject with frida.
+you want to inject with frida. Entries that fail to parse are skipped (an error is logged)
+without disabling the remaining targets.
 
 In case things are not working as expected, enable Verbose logging in the
 WebUI (off by default: the module stays silent in logcat otherwise — the

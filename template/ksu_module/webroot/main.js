@@ -30,6 +30,8 @@ let gadgetUpdateUrls = {};
 let gadgetUpdating = false;
 let dirtyConfig = false;
 let dirtyGadget = false;
+let reloadArmed = false;
+let reloadArmTimer = null;
 let searchQuery = "";
 let connectKey = "";
 let connectTimer = null;
@@ -225,7 +227,7 @@ const POLL_INTERVAL_MS = 1000;
 async function runDetached(script, path, onBody, opts) {
     opts = opts || {};
     if (execMode === "none") return false;
-    await exec("{ " + script + "; echo \"" + DONE_MARK + "\"; } > " + path +
+    await exec("{ " + script + "; echo \"" + DONE_MARK + "\"; } > " + shQuote(path) +
         " </dev/null 2>/dev/null &");
     var deadline = Date.now() + (opts.timeout || 120000);
     var maxStale = opts.maxStale == null ? 8 : opts.maxStale;
@@ -235,7 +237,7 @@ async function runDetached(script, path, onBody, opts) {
     while (Date.now() < deadline) {
         await delay(POLL_INTERVAL_MS);
         await awaitQuietWindow();
-        var r = await exec("cat " + path + " 2>/dev/null");
+        var r = await exec("cat " + shQuote(path) + " 2>/dev/null");
         var text = (r.errno === 0 && r.stdout) || "";
         done = text.indexOf(DONE_MARK) !== -1;
         var body = done ? text : text.slice(0, text.lastIndexOf("\n") + 1);
@@ -248,7 +250,7 @@ async function runDetached(script, path, onBody, opts) {
             lastLen = text.length;
         }
     }
-    exec("rm -f " + path);
+    exec("rm -f " + shQuote(path));
     return done;
 }
 
@@ -415,15 +417,19 @@ function validateGadget() {
     }
     gadgetConfig = obj;
     var hasInteraction = !!obj.interaction && typeof obj.interaction === "object";
+    var itype = hasInteraction ? obj.interaction.type : null;
     if (!gadgetFileOk) {
         status.className = "status-warn";
         status.textContent = "Not found (default shown)";
-    } else if (hasInteraction) {
-        status.className = "status-ok";
-        status.textContent = "Valid";
-    } else {
+    } else if (!hasInteraction) {
         status.className = "status-warn";
         status.textContent = "No interaction";
+    } else if (itype !== "listen" && itype !== "script" && itype !== "connect") {
+        status.className = "status-warn";
+        status.textContent = "Unknown interaction type";
+    } else {
+        status.className = "status-ok";
+        status.textContent = "Valid";
     }
     return obj;
 }
@@ -448,6 +454,13 @@ async function saveGadgetConfig() {
     } else {
         ksu.toast("Failed: " + (r.stderr || r.stdout || r.errno));
     }
+}
+
+function resetGadgetConfig() {
+    document.getElementById("gadget-editor").value = DEFAULT_GADGET;
+    markDirty("gadget");
+    validateGadget();
+    scheduleConnectRefresh();
 }
 
 async function refreshGadget() {
@@ -793,11 +806,21 @@ function applyTargetStatus(stdout, names) {
     updateStatusPills();
 }
 
+const STATUS_CHUNK = 100;
+
+async function execTargetStatus(names) {
+    var out = [];
+    for (var i = 0; i < names.length; i += STATUS_CHUNK) {
+        var r = await exec(targetStatusCmd(names.slice(i, i + STATUS_CHUNK)));
+        if (r.errno === 0 && r.stdout) out.push(r.stdout);
+    }
+    return out.join("\n");
+}
+
 async function refreshTargetStatus() {
     var names = targetNames();
     if (names.length === 0) { applyTargetStatus("", names); return; }
-    var r = await exec(targetStatusCmd(names));
-    applyTargetStatus(r.stdout, names);
+    applyTargetStatus(await execTargetStatus(names), names);
 }
 
 function updateStatusPills() {
@@ -831,7 +854,12 @@ function startApp(i) {
     var t = config.targets[i];
     if (!t) return;
     var pkg = t.app_name.split(":")[0];
-    exec("monkey -p " + shQuote(pkg) + " -c android.intent.category.LAUNCHER 1 </dev/null >/dev/null 2>&1 &")
+    // monkey(1) enables auto-rotate; resolve the launcher activity and use am instead.
+    var script =
+        "pkg=" + shQuote(pkg) + "; " +
+        "act=$(cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.LAUNCHER \"$pkg\" 2>/dev/null | grep '/' | tail -n 1 | tr -d '\\r'); " +
+        "if [ -n \"$act\" ]; then am start -n \"$act\"; fi </dev/null >/dev/null 2>&1 &";
+    exec(script)
         .then(function () {
             ksu.toast("Starting " + pkg);
             setTimeout(refreshTargetStatus, 1500);
@@ -937,29 +965,18 @@ async function refreshConnect() {
     renderConnect(info, parsePorts(r.stdout ? r.stdout.split("\n") : []));
 }
 
-const TARGET_MARK = "@@__KSUFRIDA_TARGET__";
-const PORTS_MARK = "@@__KSUFRIDA_PORTS__";
-
 async function poll() {
     if (document.hidden) return;
     var names = targetNames();
     var info = gadgetListenInfo();
 
-    var sections = [];
-    if (names.length > 0) sections.push("echo " + TARGET_MARK + "; " + targetStatusCmd(names));
-    if (info.listen) sections.push("echo " + PORTS_MARK + "; " + connectScanCmd(info));
-
-    if (sections.length === 0) {
-        applyTargetStatus("", names);
-        renderConnectNote();
-        return;
-    }
-
     await awaitQuietWindow();
-    var r = await exec(sections.join("\n"));
-    var parts = splitMarked(r.stdout, [TARGET_MARK, PORTS_MARK]);
-    applyTargetStatus(parts[TARGET_MARK] ? parts[TARGET_MARK].join("\n") : "", names);
-    if (info.listen) renderConnect(info, parsePorts(parts[PORTS_MARK]));
+    var targetOut = names.length > 0 ? await execTargetStatus(names) : "";
+    applyTargetStatus(targetOut, names);
+
+    if (!info.listen) { renderConnectNote(); return; }
+    var r = await exec(connectScanCmd(info));
+    renderConnect(info, parsePorts(r.stdout ? r.stdout.split("\n") : []));
 }
 
 function readAppsCache() {
@@ -1278,6 +1295,11 @@ function renderTargets() {
         ksieLabel.textContent = "Kernel Evasion";
         bar.appendChild(ksieLabel);
         bar.appendChild(makeSwitch(t.kernel_assisted_evasion, "ksie", i));
+        var hideLabel = document.createElement("span");
+        hideLabel.className = "sub";
+        hideLabel.textContent = "Hide maps";
+        bar.appendChild(hideLabel);
+        bar.appendChild(makeSwitch(t.hide_maps !== false, "hidemaps", i));
         div.appendChild(bar);
 
         var delayInput = document.createElement("input");
@@ -1354,6 +1376,9 @@ function updateField(i, field, value) {
         case "ksie":
             t.kernel_assisted_evasion = value;
             break;
+        case "hidemaps":
+            t.hide_maps = value;
+            break;
         case "delay":
             // Rust requires u64; a negative would disable every target.
             t.start_up_delay_ms = Math.max(0, parseInt(value, 10) || 0);
@@ -1398,6 +1423,7 @@ function addTarget(pkg) {
         app_name: pkg,
         enabled: true,
         kernel_assisted_evasion: false,
+        hide_maps: true,
         start_up_delay_ms: 0,
         injected_libraries: [{ path: "/data/local/tmp/libsec/libsecmon.so" }],
         child_gating: { enabled: false, mode: "freeze", injected_libraries: [] }
@@ -1435,7 +1461,7 @@ function openAppFromRow(e) {
 
 function appRowHtml(pkg) {
     var icon = nativeIcons
-        ? '<img class="app-icon" src="ksu://icon/' + escHtml(pkg) + '" alt="" loading="lazy" onerror="this.remove()">'
+        ? '<img class="app-icon" src="ksu://icon/' + escHtml(pkg) + '" alt="" loading="lazy">'
         : "";
     return '<div class="app-row" data-pkg="' + escHtml(pkg) + '">' + icon +
         '<div class="app-row-text"><strong>' + escHtml(getAppLabel(pkg)) + '</strong>' +
@@ -1484,6 +1510,15 @@ function renderAppList() {
 }
 
 function reloadAll() {
+    if ((dirtyConfig || dirtyGadget) && !reloadArmed) {
+        reloadArmed = true;
+        ksu.toast("Unsaved changes — tap Reload again to discard");
+        clearTimeout(reloadArmTimer);
+        reloadArmTimer = setTimeout(function () { reloadArmed = false; }, 5000);
+        return;
+    }
+    reloadArmed = false;
+    clearTimeout(reloadArmTimer);
     loadConfigs();
     fetchApps(true);
 }
@@ -1502,11 +1537,15 @@ window.onload = function () {
     document.getElementById("btn-save").onclick = saveConfig;
     document.getElementById("btn-reload").onclick = reloadAll;
     document.getElementById("btn-save-gadget").onclick = saveGadgetConfig;
+    document.getElementById("btn-reset-gadget").onclick = resetGadgetConfig;
     document.getElementById("btn-check-gadget").onclick = checkGadgetUpdate;
     document.getElementById("btn-download-gadget").onclick = downloadGadgetUpdate;
     document.getElementById("btn-refresh-gadget").onclick = refreshGadget;
     document.getElementById("btn-close-modal").onclick = closeAppModal;
     document.getElementById("app-list").onclick = openAppFromRow;
+    document.getElementById("app-list").addEventListener("error", function (e) {
+        if (e.target && e.target.tagName === "IMG") e.target.remove();
+    }, true);
     document.getElementById("btn-status").onclick = loadStatus;
     document.getElementById("btn-connect").onclick = function () { refreshConnect(); };
 
