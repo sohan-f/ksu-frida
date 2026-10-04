@@ -1,4 +1,3 @@
-
 use std::ffi::{c_int, c_void};
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::thread;
@@ -11,6 +10,7 @@ use crate::sys::{RTLD_DEFAULT, dlsym, set_errno};
 
 type ForkFn = unsafe extern "C" fn() -> libc::pid_t;
 
+// Null until the Release store in `enable_child_gating` publishes the trampoline.
 static ORIG_FORK: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 static CHILD_GATING_MODE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -51,6 +51,7 @@ fn child_action(mode: &str) -> ChildAction {
     }
 }
 
+// Kill/Freeze/Pass must not allocate or log: the child inherits every lock held at fork time.
 fn run_child_action(action: ChildAction, libraries: &[String]) -> libc::pid_t {
     match action {
         ChildAction::Kill => {
@@ -84,9 +85,7 @@ unsafe extern "C" fn fork_replacement() -> libc::pid_t {
         set_errno(libc::EAGAIN);
         return -1;
     }
-    // SAFETY: `orig_ptr` is the non-null fork trampoline published by
-    // `enable_child_gating`; `transmute` between two pointer-sized types is
-    // rejected at compile time on any target where the sizes differ.
+    // SAFETY: non-null trampoline published by `enable_child_gating`.
     let orig: ForkFn = unsafe { std::mem::transmute(orig_ptr) };
 
     let mode = CHILD_GATING_MODE
@@ -100,6 +99,7 @@ unsafe extern "C" fn fork_replacement() -> libc::pid_t {
         "[child_gating][pid {parent_pid}] detected fork/vfork (child_gating_mode {mode})"
     ));
 
+    // The vfork hook resumes via the fork trampoline, turning vfork into fork.
     // SAFETY: `orig` is the published trampoline and behaves as `fork(2)`.
     let child_pid = unsafe { orig() };
     if child_pid != 0 {
@@ -140,9 +140,9 @@ pub fn enable_child_gating(cfg: &ChildGatingConfig) {
 
     let replacement = fork_replacement as *const () as *mut c_void;
 
+    // Stack local: only this thread observes it, so the publish cannot race hooks on other threads.
     let mut fork_trampoline: *mut c_void = std::ptr::null_mut();
-    // SAFETY: `fork_addr` comes from the `dlsym` call above, `fork_trampoline`
-    // lives in this frame, and the shim only writes through `orig`.
+    // SAFETY: `fork_addr` comes from `dlsym` above, `fork_trampoline` lives in this frame.
     let rc = unsafe { ksufrida_dobby_hook(fork_addr, replacement, &raw mut fork_trampoline) };
     ORIG_FORK.store(fork_trampoline, Ordering::Release);
     if rc == 0 {
@@ -153,6 +153,7 @@ pub fn enable_child_gating(cfg: &ChildGatingConfig) {
         ));
     }
 
+    // Discarded: the vfork hook resumes through the fork trampoline above.
     let mut vfork_trampoline: *mut c_void = std::ptr::null_mut();
     // SAFETY: as above, for the vfork slot; nothing ever reads the value.
     let rc = unsafe { ksufrida_dobby_hook(vfork_addr, replacement, &raw mut vfork_trampoline) };
@@ -187,14 +188,13 @@ mod tests {
             return;
         }
         let byte = [1u8];
-        // SAFETY: `fd` is a test-owned pipe write end; a one-byte write
-        // either lands or fails, and the reader below accounts for both.
+        // SAFETY: test-owned pipe write end; a one-byte write either lands or fails.
         unsafe { libc::write(fd, byte.as_ptr().cast(), 1) };
     }
 
     fn pipe_pair() -> (i32, i32) {
         let mut fds = [0; 2];
-        // SAFETY: `fds` is a valid two-element output buffer for `pipe(2)`.
+        // SAFETY: valid two-element output buffer for `pipe(2)`.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe(2)");
         (fds[0], fds[1])
     }
@@ -211,7 +211,7 @@ mod tests {
     fn hook_shim_is_callable() {
         let mut orig: *mut c_void = std::ptr::null_mut();
         assert_eq!(
-            // SAFETY: the host stub accepts null arguments; on device the shim handles them.
+            // SAFETY: the host stub accepts null arguments.
             unsafe {
                 ksufrida_dobby_hook(std::ptr::null_mut(), std::ptr::null_mut(), &raw mut orig)
             },
@@ -256,9 +256,7 @@ mod tests {
         let _guard = lock_origin();
         ORIG_FORK.store(std::ptr::null_mut(), Ordering::Release);
 
-        // SAFETY: with no origin published the hook must fail without
-        // dereferencing anything — the same call the Dobby shim intercepts
-        // on device.
+        // SAFETY: with no origin published the hook must fail without dereferencing anything.
         let pid = unsafe { fork_replacement() };
 
         assert_eq!(pid, -1);
@@ -292,8 +290,7 @@ mod tests {
             for _ in 0..4 {
                 scope.spawn(|| {
                     for _ in 0..iterations {
-                        // SAFETY: both outcomes of the published origin are
-                        // valid: call the trampoline or fail the fork.
+                        // SAFETY: both outcomes of the published origin are valid.
                         match unsafe { fork_replacement() } {
                             -1 | 4242 => {}
                             other => panic!("fork_replacement returned {other}"),
@@ -321,10 +318,7 @@ mod tests {
         static REGISTER: std::sync::Once = std::sync::Once::new();
         let (read_fd, write_fd) = pipe_pair();
         REGISTER.call_once(|| {
-            // SAFETY: `atexit_probe` has the required `extern "C" fn()`
-            // signature and lives as long as the process, and `Once`
-            // registers it exactly once; the return code is irrelevant — a
-            // failed registration only weakens the probe, never the logic.
+            // SAFETY: `extern "C" fn()` with process lifetime, registered exactly once.
             let _ = unsafe { libc::atexit(atexit_probe) };
         });
         ATEXIT_PROBE_FD.store(write_fd, Ordering::Relaxed);
@@ -337,14 +331,12 @@ mod tests {
         assert!(child > 0, "the parent branch must return the child pid");
 
         let mut status = 0;
-        // SAFETY: `child` is a live child of this process and `status` is a
-        // valid output slot.
+        // SAFETY: `child` is a live child of this process and `status` is a valid output slot.
         assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
 
         ATEXIT_PROBE_FD.store(-1, Ordering::Relaxed);
         ORIG_FORK.store(std::ptr::null_mut(), Ordering::Release);
-        // SAFETY: both ends are test-owned. Closing the write end before the
-        // read makes an empty pipe report 0 instead of blocking.
+        // SAFETY: both ends are test-owned; closing the write end first makes an empty pipe report 0.
         unsafe {
             libc::close(write_fd);
             let mut byte = [0u8; 1];

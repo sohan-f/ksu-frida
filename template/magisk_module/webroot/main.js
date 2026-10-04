@@ -41,6 +41,7 @@ let lastAppsSync = 0;
 let lastInteraction = 0;
 const APPS_SYNC_TTL = 60000;
 
+// Bridge calls freeze JS; polls yield briefly after user input.
 if (typeof document !== "undefined") {
     document.addEventListener("pointerdown", function () {
         lastInteraction = Date.now();
@@ -93,6 +94,7 @@ const SAVE_MARK = "__KSU_FRIDA_SAVED__";
 let execMode = "auto";
 let probePromise = null;
 
+// Managers differ in exec overloads; probe once and fall back rather than hang.
 function probeExec() {
     if (execMode !== "auto") return Promise.resolve(execMode);
     if (probePromise) return probePromise;
@@ -194,6 +196,7 @@ function syncExec(cmd) {
     }
 }
 
+// Single-quoted literals only; never let package names expand as globs or subshells.
 function shQuote(s) {
     return "'" + String(s).replace(/'/g, "'\\''") + "'";
 }
@@ -204,6 +207,7 @@ const SCAN_FILE = "/data/local/tmp/libsec/.webui-scan.tmp";
 const PKGS_FILE = "/data/local/tmp/libsec/.webui-packages.tmp";
 const POLL_INTERVAL_MS = 1000;
 
+// Each exec spawns a fresh root shell; slow work runs detached and is polled.
 async function runDetached(script, path, onBody, opts) {
     opts = opts || {};
     if (execMode === "none") return false;
@@ -253,7 +257,6 @@ function splitMarked(text, marks) {
     });
     return parts;
 }
-
 
 function markDirty(which) {
     if (which === "cfg") dirtyConfig = true;
@@ -574,6 +577,7 @@ function targetNames() {
         .filter(function (n) { return !!n; });
 }
 
+// One grep for candidates; forking tr per process costs seconds on every poll.
 function targetStatusCmd(names) {
     return "for c in $(grep -a -l -F " +
         names.map(function (n) { return "-e " + shQuote(n); }).join(" ") +
@@ -1158,6 +1162,7 @@ function updateField(i, field, value) {
             t.kernel_assisted_evasion = value;
             break;
         case "delay":
+            // Rust requires u64; a negative would disable every target.
             t.start_up_delay_ms = Math.max(0, parseInt(value, 10) || 0);
             break;
         case "libs":

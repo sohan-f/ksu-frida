@@ -16,6 +16,7 @@ class MyModule : public zygisk::ModuleBase {
     }
 
     void postAppSpecialize(const AppSpecializeArgs *args) override {
+        // Both pointers can be null (OOM); std::string(nullptr) is UB.
         if (args->nice_name == nullptr) {
             this->api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
             return;

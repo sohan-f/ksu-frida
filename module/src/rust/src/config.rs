@@ -197,6 +197,7 @@ fn load_advanced_config(module_dir: &str, app_name: &str) -> Option<TargetConfig
     }
     let bytes = fs::read(format!("{module_dir}/config.json")).ok()?;
 
+    // Byte precheck skips the parse for non-targets; package names are never JSON-escaped.
     if !bytes
         .windows(app_name.len())
         .any(|window| window == app_name.as_bytes())

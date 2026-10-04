@@ -1,4 +1,3 @@
-
 use std::ffi::{CStr, CString, NulError, c_char, c_int, c_void};
 use std::io;
 
@@ -40,8 +39,7 @@ unsafe extern "C" {
 
 #[cfg(any(target_os = "android", test))]
 pub fn memfd_create(name: *const c_char, flags: c_int) -> c_int {
-    // SAFETY: plain syscall with a static name; the return (fd or -1) is
-    // checked by the caller.
+    // SAFETY: plain syscall with a valid name; the fd (or -1) is checked by the caller.
     unsafe { libc::syscall(libc::SYS_memfd_create, name, flags) as c_int }
 }
 
@@ -83,10 +81,7 @@ unsafe extern "C" {
 
 #[cfg(target_os = "android")]
 pub fn android_log(prio: c_int, msg: &str) {
-    // SAFETY: `tag` and `fmt` are static `c"..."` literals; `msg` is copied into
-    // a `CString`, so no interior NUL can reach the varargs (a NUL-containing
-    // message logs as an empty line, matching the old behaviour), and the
-    // return value is a status nobody reads — same contract as the C++ LOG_*.
+    // SAFETY: static tag/format literals; `msg` is copied into a `CString` so no interior NUL reaches the varargs.
     unsafe {
         let c_msg = CString::new(msg).unwrap_or_default();
         __android_log_print(prio, c"KsuFrida".as_ptr(), c"%s".as_ptr(), c_msg.as_ptr());
@@ -100,8 +95,7 @@ unsafe extern "C" {
 
 #[cfg(not(target_os = "android"))]
 pub fn set_errno(value: c_int) {
-    // SAFETY: glibc/musl document `__errno_location()` as returning a valid
-    // writable pointer to the calling thread's errno slot; it is never null.
+    // SAFETY: returns a valid writable pointer to the calling thread's errno slot.
     unsafe {
         *__errno_location() = value;
     }
@@ -109,19 +103,16 @@ pub fn set_errno(value: c_int) {
 
 #[cfg(target_os = "android")]
 pub fn set_errno(value: c_int) {
-    // SAFETY: bionic documents `__errno()` with the same contract.
+    // SAFETY: returns a valid writable pointer to the calling thread's errno slot.
     unsafe {
         *libc::__errno() = value;
     }
 }
 
 /// # Safety
-/// `fd_in`/`fd_out` must be open files (readable/writable respectively);
-/// `len` bounds the transfer.
+/// `fd_in`/`fd_out` must be open files; `len` bounds the transfer.
 pub fn copy_file_range(fd_in: c_int, fd_out: c_int, len: usize) -> Result<u64, io::Error> {
-    // SAFETY: plain syscall with two live fds, NULL offsets (the documented
-    // file-offset form), and a bounded length; the return/errno contract is
-    // read immediately below.
+    // SAFETY: two live fds with NULL offsets (file-offset form); return/errno is read immediately.
     let n = unsafe {
         libc::syscall(
             libc::SYS_copy_file_range,
@@ -141,7 +132,7 @@ pub fn copy_file_range(fd_in: c_int, fd_out: c_int, len: usize) -> Result<u64, i
 }
 
 pub fn dlerror_string() -> String {
-    // SAFETY: `dlerror()` returns null or a valid NUL-terminated string owned by libc; it is copied before any later dl call.
+    // SAFETY: `dlerror()` returns null or a libc-owned NUL-terminated string, copied before any later dl call.
     unsafe {
         let err = dlerror();
         if err.is_null() {

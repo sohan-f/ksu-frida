@@ -1,4 +1,3 @@
-
 use std::ffi::c_void;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
@@ -14,8 +13,10 @@ static PREVIOUS_HANDLER: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::n
 static PREVIOUS_FLAGS: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
 
 static IN_FLIGHT_START: AtomicUsize = AtomicUsize::new(0);
+// END is stored while START is zero, so non-zero START implies a stable END.
 static IN_FLIGHT_END: AtomicUsize = AtomicUsize::new(0);
 
+// The rebuilding thread must never park on its own fault.
 static REBUILDER_TID: AtomicUsize = AtomicUsize::new(0);
 
 static REBUILD_LOCK: AtomicBool = AtomicBool::new(false);
@@ -337,6 +338,7 @@ unsafe fn relocate_segment(
             None
         };
 
+        // Grace with the range still published: late-delivered faults must still observe it.
         std::thread::sleep(std::time::Duration::from_millis(5));
 
         end_rebuild();
