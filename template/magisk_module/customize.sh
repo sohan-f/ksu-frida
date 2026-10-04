@@ -75,5 +75,5 @@ extract "$ZIPFILE" "config.json.example" "$TMP_MODULE_DIR" true
 ui_print "- Writing default gadget config (listen mode)"
 echo '{"interaction":{"type":"listen","address":"127.0.0.1","port":27042,"on_port_conflict":"pick-next"}}' > "$TMP_MODULE_DIR/libsecmon.config.so"
 
-set_perm_recursive "$TMP_MODULE_DIR" 0 0 0755 0644
+set_perm_recursive "$TMP_MODULE_DIR" 0 0 0711 0644
 set_perm_recursive "$MODPATH" 0 0 0755 0644
