@@ -102,6 +102,17 @@ To build, install and reboot directly:
 ./gradlew :module:flashAndRebootZygiskRelease
 ```
 
+### Gadget pins
+
+The Frida gadget is fetched from the [knox-frida-patcher](https://github.com/sohan-f/knox-frida-patcher)
+releases, but builds never follow "latest" silently: `gadget-pins.json` at the repo root pins the
+exact version plus the SHA-256 of each arch asset. `fetchGadget` cross-checks the release metadata
+against the pins and verifies every downloaded byte; any mismatch fails the build. The WebUI updater
+on-device enforces the same hashes before installing.
+
+To adopt a new gadget version, copy the version and digests from the release `gadget.json`
+(or `SHA256SUMS` asset) into `gadget-pins.json` and rebuild.
+
 ## Credits
 
 - [lico-n](https://github.com/lico-n) — Original author of [ZygiskFrida](https://github.com/lico-n/ZygiskFrida)

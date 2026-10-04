@@ -27,6 +27,7 @@ let gadgetBundled = null;
 let gadgetScanned = null;
 let gadgetLatest = null;
 let gadgetUpdateUrls = {};
+let gadgetUpdateVerified = false;
 let gadgetUpdating = false;
 let dirtyConfig = false;
 let dirtyGadget = false;
@@ -496,18 +497,43 @@ function cmpVersions(a, b) {
     return 0;
 }
 
+function blockField(text, block, field) {
+    var b = new RegExp('"' + block + '"\\s*:\\s*\\{([^}]*)\\}').exec(text || "");
+    if (!b) return null;
+    var f = new RegExp('"' + field + '"\\s*:\\s*"([^"]+)"').exec(b[1]);
+    return f && f[1];
+}
+
 function parseGadgetMeta(text) {
     var v = /"version"\s*:\s*"([^"]+)"/.exec(text || "");
-    var arm = /"arm"\s*:\s*"([^"]+)"/.exec(text || "");
-    var arm64 = /"arm64"\s*:\s*"([^"]+)"/.exec(text || "");
     if (!v) return null;
-    return { version: v[1], arm: arm && arm[1], arm64: arm64 && arm64[1] };
+    return {
+        version: v[1],
+        arm: blockField(text, "assets", "arm"),
+        arm64: blockField(text, "assets", "arm64"),
+        sha256: {
+            arm: blockField(text, "sha256", "arm"),
+            arm64: blockField(text, "sha256", "arm64")
+        }
+    };
 }
 
 function gadgetUrlsForAbi(abi, meta) {
     if (!meta) return null;
-    if (abi === "arm64-v8a" && meta.arm64) return { primary: meta.arm64, companion: meta.arm || null };
-    if (abi === "armeabi-v7a" && meta.arm) return { primary: meta.arm, companion: null };
+    function entry(url, hash) {
+        if (!url) return null;
+        var e = { url: url, sha256: null };
+        if (hash && validSha256(hash)) e.sha256 = hash.toLowerCase();
+        return e;
+    }
+    if (abi === "arm64-v8a" && meta.arm64) return {
+        primary: entry(meta.arm64, meta.sha256 && meta.sha256.arm64),
+        companion: meta.arm ? entry(meta.arm, meta.sha256 && meta.sha256.arm) : null
+    };
+    if (abi === "armeabi-v7a" && meta.arm) return {
+        primary: entry(meta.arm, meta.sha256 && meta.sha256.arm),
+        companion: null
+    };
     return null;
 }
 
@@ -517,6 +543,10 @@ function validReleaseUrl(u) {
 
 function validVersion(v) {
     return /^[0-9]+\.[0-9]+\.[0-9]+$/.test(v || "");
+}
+
+function validSha256(h) {
+    return /^[0-9a-fA-F]{64}$/.test(h || "");
 }
 
 function setGadgetUpdateLine(text) {
@@ -540,6 +570,9 @@ const META_MARK = "@@__KSUFRIDA_META__";
 async function checkGadgetUpdate() {
     setGadgetUpdateLine("Checking…");
     document.getElementById("btn-download-gadget").style.display = "none";
+    gadgetLatest = null;
+    gadgetUpdateUrls = {};
+    gadgetUpdateVerified = false;
     var r = await exec(
         "echo " + GVER_MARK + "; cat " + GADGET_VERSION_FILE + " 2>/dev/null; echo; " +
         "echo " + ABI_MARK + "; getprop ro.product.cpu.abi; " +
@@ -557,7 +590,8 @@ async function checkGadgetUpdate() {
             meta = {
                 version: t[1],
                 arm: "https://github.com/sohan-f/knox-frida-patcher/releases/download/" + t[1] + "/frida-gadget-" + t[1] + "-android-arm.so.xz",
-                arm64: "https://github.com/sohan-f/knox-frida-patcher/releases/download/" + t[1] + "/frida-gadget-" + t[1] + "-android-arm64.so.xz"
+                arm64: "https://github.com/sohan-f/knox-frida-patcher/releases/download/" + t[1] + "/frida-gadget-" + t[1] + "-android-arm64.so.xz",
+                sha256: { arm: null, arm64: null }
             };
         }
     }
@@ -565,23 +599,45 @@ async function checkGadgetUpdate() {
         setGadgetUpdateLine("Update check failed — no network?");
         return;
     }
+    // A published sha256 block with malformed digests is treated as
+    // tampering, not as a legacy release: refuse rather than install blind.
+    var metaHashes = meta.sha256 || {};
+    if ((metaHashes.arm || metaHashes.arm64)
+        && (!validSha256(metaHashes.arm || "") || !validSha256(metaHashes.arm64 || ""))) {
+        setGadgetUpdateLine("Update metadata invalid — refusing to update");
+        return;
+    }
     gadgetLatest = meta.version;
     var urls = gadgetUrlsForAbi(abi, meta);
-    if (!urls || !validReleaseUrl(urls.primary) || (urls.companion && !validReleaseUrl(urls.companion))) {
+    if (!urls || !urls.primary || !validReleaseUrl(urls.primary.url)
+        || (urls.companion && !validReleaseUrl(urls.companion.url))) {
         setGadgetUpdateLine("No build for this device (" + (abi || "unknown ABI") + ")");
         return;
     }
     gadgetUpdateUrls = urls;
+    gadgetUpdateVerified = !!urls.primary.sha256
+        && (!urls.companion || !!urls.companion.sha256);
+    var suffix = gadgetUpdateVerified ? "" : " (unverified — no hash in metadata)";
     var cur = currentGadgetVersion();
     if (!cur) {
-        setGadgetUpdateLine(meta.version + " available (installed version unknown)");
+        setGadgetUpdateLine(meta.version + " available (installed version unknown)" + suffix);
         showDownloadButton(meta.version);
     } else if (cmpVersions(cur, meta.version) < 0) {
-        setGadgetUpdateLine(cur + " installed · " + meta.version + " available");
+        setGadgetUpdateLine(cur + " installed · " + meta.version + " available" + suffix);
         showDownloadButton(meta.version);
     } else {
         setGadgetUpdateLine("Gadget " + cur + " is up to date");
     }
+}
+
+// Builds a shell fragment that fails (||) unless the file at path hashes
+// to the expected sha256. `sha256sum` may live in PATH or only as a
+// busybox applet; the digest itself is hex-validated before embedding.
+function hashCheckSnippet(path, hash) {
+    return "{ H=$(sha256sum " + shQuote(path) + " 2>/dev/null | cut -d' ' -f1); " +
+        "[ -n \"$H\" ] || H=$(" + BUSYBOX_BIN + " sha256sum " + shQuote(path) +
+        " 2>/dev/null | cut -d' ' -f1); " +
+        "[ \"$H\" = " + shQuote(hash.toLowerCase()) + " ]; }";
 }
 
 async function downloadGadgetUpdate() {
@@ -589,8 +645,10 @@ async function downloadGadgetUpdate() {
     gadgetUpdating = true;
     document.getElementById("btn-download-gadget").style.display = "none";
     var v = gadgetLatest;
-    var u1 = gadgetUpdateUrls.primary;
-    var u2 = gadgetUpdateUrls.companion;
+    var u1 = gadgetUpdateUrls.primary.url;
+    var h1 = gadgetUpdateUrls.primary.sha256;
+    var u2 = gadgetUpdateUrls.companion ? gadgetUpdateUrls.companion.url : null;
+    var h2 = gadgetUpdateUrls.companion ? gadgetUpdateUrls.companion.sha256 : null;
     var script =
         "M=" + MODDIR + "/gadget; D=/data/local/tmp/libsec; S=" + GADGET_DL_DIR + "; B=" + BUSYBOX_BIN + "; V=" + shQuote(v) + "; " +
         "rm -rf \"$S\"; mkdir -p \"$S\" \"$D\" \"$M\"; " +
@@ -598,14 +656,17 @@ async function downloadGadgetUpdate() {
         "echo STAGE:download; OK=1; " +
         "$GET \"$S/libsecmon.so.xz\" " + shQuote(u1) + " || OK=0; " +
         (u2 ? "$GET \"$S/libsecmon32.so.xz\" " + shQuote(u2) + " || OK=0; " : "") +
-        "if [ \"$OK\" = 1 ]; then echo STAGE:verify; " +
-        "if \"$B\" unxz -t \"$S/libsecmon.so.xz\"" + (u2 ? " && \"$B\" unxz -t \"$S/libsecmon32.so.xz\"" : "") + "; then echo STAGE:install; " +
+        "if [ \"$OK\" = 1 ]; then echo STAGE:verify; HOK=1; " +
+        (h1 ? hashCheckSnippet("$S/libsecmon.so.xz", h1) + " || HOK=0; " : "") +
+        ((u2 && h2) ? hashCheckSnippet("$S/libsecmon32.so.xz", h2) + " || HOK=0; " : "") +
+        "if [ \"$HOK\" = 1 ] && \"$B\" unxz -t \"$S/libsecmon.so.xz\"" + (u2 ? " && \"$B\" unxz -t \"$S/libsecmon32.so.xz\"" : "") + "; then echo STAGE:install; " +
         "cp -f \"$S/libsecmon.so.xz\" \"$M/libsecmon.so.xz\"; " +
         "cp -f \"$S/libsecmon.so.xz\" \"$D/libsecmon.so.xz\"; " +
         "$B unxz -f \"$D/libsecmon.so.xz\"; chmod 644 \"$D/libsecmon.so\"; " +
         (u2 ? "cp -f \"$S/libsecmon32.so.xz\" \"$M/libsecmon32.so.xz\"; cp -f \"$S/libsecmon32.so.xz\" \"$D/libsecmon32.so.xz\"; $B unxz -f \"$D/libsecmon32.so.xz\"; chmod 644 \"$D/libsecmon32.so\"; " : "") +
         "echo \"$V\" > \"$M/gadget.version\"; chmod 644 \"$M/gadget.version\"; echo RESULT:ok; " +
-        "else echo RESULT:verify-fail; fi; " +
+        "elif [ \"$HOK\" = 1 ]; then echo RESULT:verify-fail; " +
+        "else echo RESULT:hash-fail; fi; " +
         "else echo RESULT:dl-fail; fi; " +
         "rm -rf \"$S\"";
     var result = null;
@@ -623,13 +684,18 @@ async function downloadGadgetUpdate() {
     gadgetUpdating = false;
     if (result === "ok") {
         gadgetBundled = v;
-        ksu.toast("Gadget updated to " + v);
-        setGadgetUpdateLine("Gadget " + v + " installed");
+        ksu.toast(gadgetUpdateVerified ? "Gadget updated to " + v + " (verified)"
+            : "Gadget updated to " + v + " (unverified)");
+        setGadgetUpdateLine("Gadget " + v + " installed"
+            + (gadgetUpdateVerified ? "" : " (unverified)"));
         loadStatus();
     } else {
         if (result === "dl-fail") {
             ksu.toast("Download failed — check network and retry");
             setGadgetUpdateLine("Download failed");
+        } else if (result === "hash-fail") {
+            ksu.toast("Hash mismatch — update aborted, nothing installed");
+            setGadgetUpdateLine("Hash mismatch — nothing installed");
         } else if (result === "verify-fail") {
             ksu.toast("Downloaded file failed verification");
             setGadgetUpdateLine("Verification failed");

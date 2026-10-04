@@ -21,52 +21,124 @@ def gadgetArchs = ["arm", "arm64"]
 
 task fetchGadget {
     group = "build"
-    description = "Fetches the latest patched gadget from knox-frida-patcher releases"
+    description = "Fetches the pinned patched gadget from knox-frida-patcher releases (sha256-verified)"
     doLast {
         file("$rootDir/gadget").mkdirs()
         def marker = file("$rootDir/gadget/gadget.version")
-        def version = null
-        def urls = [:]
+        def pinsFile = file("$rootDir/gadget-pins.json")
+
+        def fail = { msg -> throw new GradleException(msg) }
+
+        // gadget-pins.json is authoritative: builds never follow "latest"
+        // silently. To adopt a new gadget, copy version + sha256 from the
+        // release gadget.json (or SHA256SUMS) into gadget-pins.json.
+        def pins = null
+        try {
+            pins = new groovy.json.JsonSlurper().parse(pinsFile)
+        } catch (Exception e) {
+            fail("cannot read gadget pins at $pinsFile: ${e.message}")
+        }
+        def pinnedVersion = pins?.version
+        def pinnedHashes = pins?.sha256
+        if (!(pinnedVersion ==~ /\d+\.\d+\.\d+/)
+                || !(pinnedHashes?.get("arm") ==~ /[0-9a-fA-F]{64}/)
+                || !(pinnedHashes?.get("arm64") ==~ /[0-9a-fA-F]{64}/)) {
+            fail("invalid gadget pins in $pinsFile: need {version: X.Y.Z, sha256: {arm, arm64}} with 64-hex digests")
+        }
+
+        def sha256Of = { File f ->
+            def md = MessageDigest.getInstance("SHA-256")
+            f.eachByte(65536) { bytes, size -> md.update(bytes, 0, size) }
+            md.digest().encodeHex().toString()
+        }
+
+        def outputs = gadgetArchs.collectEntries { arch ->
+            [(arch): file("$rootDir/gadget/libgadget-${arch}.so.xz")]
+        }
+        def verifyOutputs = {
+            outputs.every { arch, f ->
+                f.exists() && sha256Of(f).equalsIgnoreCase(pinnedHashes.get(arch).toString())
+            }
+        }
+
+        // Freshness signal only: metadata is cross-checked against pins and
+        // never trusted on its own. Absent metadata falls back to verified cache.
+        def meta = null
         try {
             def conn = new URL(gadgetMetaUrl).openConnection()
             conn.connectTimeout = 15000
             conn.readTimeout = 30000
-            def meta = new groovy.json.JsonSlurper().parse(conn.inputStream)
-            if (meta?.version ==~ /\d+\.\d+\.\d+/) {
-                version = meta.version
-                gadgetArchs.each { arch ->
-                    def u = meta?.assets?.get(arch)
-                    if (u ==~ /https:\/\/github\.com\/sohan-f\/knox-frida-patcher\/releases\/download\/\d+\.\d+\.\d+\/frida-gadget-\d+\.\d+\.\d+-android-(arm|arm64)\.so\.xz/) {
-                        urls[arch] = u
-                    }
-                }
-            }
+            meta = new groovy.json.JsonSlurper().parse(conn.inputStream)
         } catch (Exception e) {
-            logger.lifecycle("gadget metadata unreachable, using local build: ${e.message}")
+            logger.lifecycle("gadget metadata unreachable, using verified cache: ${e.message}")
         }
-        if (version == null || urls.size() != gadgetArchs.size()) {
-            def local = marker.exists() ? marker.text.trim() : null
-            if (!(local ==~ /\d+\.\d+\.\d+/)) {
-                throw new GradleException("gadget metadata unreachable and no cached gadget; connect to the network and retry")
+
+        def urls = [:]
+        if (meta != null) {
+            def metaVersion = meta?.version
+            if (!(metaVersion ==~ /\d+\.\d+\.\d+/)) {
+                fail("gadget metadata has invalid version: ${metaVersion}")
             }
-            version = local
-            urls = gadgetArchs.collectEntries { arch ->
-                [(arch): "https://github.com/sohan-f/knox-frida-patcher/releases/download/${version}/frida-gadget-${version}-android-${arch}.so.xz"]
+            if (metaVersion != pinnedVersion) {
+                fail("gadget ${metaVersion} is published but pins require ${pinnedVersion};"
+                        + " update gadget-pins.json to adopt it")
             }
+            gadgetArchs.each { arch ->
+                def u = meta?.assets?.get(arch)
+                if (!(u ==~ /https:\/\/github\.com\/sohan-f\/knox-frida-patcher\/releases\/download\/\d+\.\d+\.\d+\/frida-gadget-\d+\.\d+\.\d+-android-(arm|arm64)\.so\.xz/)) {
+                    fail("gadget metadata has invalid URL for ${arch}: ${u}")
+                }
+                def h = meta?.sha256?.get(arch)
+                if (!(h ==~ /[0-9a-fA-F]{64}/)
+                        || !h.toString().equalsIgnoreCase(pinnedHashes.get(arch).toString())) {
+                    fail("gadget metadata sha256 for ${arch} does not match gadget-pins.json;"
+                            + " refusing to download (possible metadata tampering)")
+                }
+                urls[arch] = u
+            }
+        } else {
+            if (marker.exists() && marker.text.trim() == pinnedVersion && verifyOutputs()) {
+                logger.lifecycle("gadget ${pinnedVersion} already fetched and verified")
+                return
+            }
+            if (!marker.exists() || marker.text.trim() != pinnedVersion) {
+                fail("gadget metadata unreachable and no cached gadget for pinned version"
+                        + " ${pinnedVersion}; connect to the network and retry")
+            }
+            fail("cached gadget for ${pinnedVersion} failed sha256 verification;"
+                    + " delete gadget/libgadget-*.so.xz and retry")
         }
-        def outputs = gadgetArchs.collect { arch -> file("$rootDir/gadget/libgadget-${arch}.so.xz") }
-        if (marker.exists() && marker.text.trim() == version && outputs.every { it.exists() }) {
-            logger.lifecycle("gadget ${version} already fetched")
+
+        if (marker.exists() && marker.text.trim() == pinnedVersion && verifyOutputs()) {
+            logger.lifecycle("gadget ${pinnedVersion} already fetched and verified")
             return
         }
         urls.each { arch, u ->
-            def dl = new URL(u).openConnection()
-            dl.connectTimeout = 15000
-            dl.readTimeout = 600000
-            file("$rootDir/gadget/libgadget-${arch}.so.xz").withOutputStream { it << dl.inputStream }
+            def tmp = file("$rootDir/gadget/libgadget-${arch}.so.xz.tmp")
+            try {
+                def dl = new URL(u).openConnection()
+                dl.connectTimeout = 15000
+                dl.readTimeout = 600000
+                tmp.withOutputStream { it << dl.inputStream }
+                def got = sha256Of(tmp)
+                if (!got.equalsIgnoreCase(pinnedHashes.get(arch).toString())) {
+                    tmp.delete()
+                    fail("sha256 mismatch for gadget ${pinnedVersion} arch ${arch}:"
+                            + " expected ${pinnedHashes.get(arch)}, got ${got}")
+                }
+                if (!tmp.renameTo(outputs[arch])) {
+                    outputs[arch].bytes = tmp.bytes
+                    tmp.delete()
+                }
+            } catch (GradleException e) {
+                throw e
+            } catch (Exception e) {
+                tmp.delete()
+                fail("failed to fetch gadget ${arch}: ${e.message}")
+            }
         }
-        marker.text = version
-        logger.lifecycle("fetched gadget ${version}")
+        marker.text = pinnedVersion
+        logger.lifecycle("fetched and verified gadget ${pinnedVersion}")
     }
 }
 
