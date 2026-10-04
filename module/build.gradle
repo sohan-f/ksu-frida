@@ -22,13 +22,13 @@ dependencies {
 
 task downloadFrida(type: Download) {
     def downloadArchs = ["arm", "arm64"]
-    def magiskArchs = ["arm", "arm64"]
+    def gadgetArchs = ["arm", "arm64"]
 
     def sources = downloadArchs.collect{
         arch -> "https://github.com/sohan-f/knox-frida-patcher/releases/download/${fridaVersion}/frida-gadget-${fridaVersion}-android-${arch}.so.xz".toString()
     }
 
-    def outputs = magiskArchs.collect{
+    def outputs = gadgetArchs.collect{
         arch ->  "libgadget-${arch}.so.xz".toString()
     }
 
@@ -88,9 +88,6 @@ android {
     }
 }
 
-// ── Rust core ────────────────────────────────────────────────────────────────
-// Builds module/src/rust as a staticlib for every module ABI (cargo-ndk); the
-// C++ shell in src/jni (Android.mk) links it into libzygiskfrida.so.
 def rustBuildLibrary = tasks.register("buildRustLibrary", Exec) {
     group = "build"
     description = "Builds the Rust core staticlib for all module ABIs"
@@ -122,8 +119,7 @@ def rustBuildLibrary = tasks.register("buildRustLibrary", Exec) {
             "build", "--release", "--lib"
 }
 
-// The Rust staticlib must exist before ndk-build checks/links it (AGP 9 runs
-// ndk-build via configureNdkBuild*/buildNdkBuild* tasks, per ABI).
+// The Rust staticlib must exist before ndk-build links it.
 tasks.configureEach { task ->
     if (task.name.startsWith("configureNdkBuild") || task.name.startsWith("buildNdkBuild")) {
         task.dependsOn rustBuildLibrary
@@ -139,16 +135,16 @@ androidComponents {
         def flavorLowered = flavorName.toLowerCase()
 
         def zipName = "${moduleName}-${moduleVersion}-${flavorLowered}-${buildTypeLowered}.zip"
-        def magiskDir = file("${outDir}/magisk_module_${flavorLowered}_${buildTypeLowered}")
+        def moduleDir = file("${outDir}/ksu_module_${flavorLowered}_${buildTypeLowered}")
 
-        def prepare = tasks.register("prepareMagiskFiles${variantCapped}", Sync) {
+        def prepare = tasks.register("prepareModuleFiles${variantCapped}", Sync) {
             dependsOn("assemble$variantCapped")
             dependsOn downloadFrida
             duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 
-            def templatePath = "$rootDir/template/magisk_module"
+            def templatePath = "$rootDir/template/ksu_module"
 
-            into magiskDir
+            into moduleDir
             from(rootDir) {
                 include 'config.json.example'
             }
@@ -160,7 +156,7 @@ androidComponents {
             from(templatePath) {
                 include 'module.prop'
                 expand([
-                        id         : magiskModuleId,
+                        id         : moduleId,
                         name       : moduleName,
                         version    : moduleVersion,
                         versionCode: moduleVersionCode.toString(),
@@ -174,7 +170,7 @@ androidComponents {
                 include("verify.sh")
                 def tokens = [
                         "FLAVOR" : flavorLowered,
-                        "MODULE_ID": magiskModuleId,
+                        "MODULE_ID": moduleId,
                 ]
                 filter(ReplaceTokens.class, tokens: tokens)
                 filter(FixCrLfFilter.class, eol: FixCrLfFilter.CrLf.newInstance("lf"))
@@ -195,15 +191,15 @@ androidComponents {
                 into 'gadget'
             }
             doLast {
-                fileTree("$magiskDir/lib").visit { f ->
+                fileTree("$moduleDir/lib").visit { f ->
                     if (!f.directory) return
                     def srcPath = Paths.get("${f.file.absolutePath}/libzygiskfrida.so")
-                    def dstPath = Paths.get("$magiskDir/lib/${f.path}.so")
+                    def dstPath = Paths.get("$moduleDir/lib/${f.path}.so")
                     Files.move(srcPath, dstPath)
-                    new File("$magiskDir/lib/${f.path}").deleteDir()
+                    new File("$moduleDir/lib/${f.path}").deleteDir()
                 }
 
-                fileTree("$magiskDir").visit { f ->
+                fileTree("$moduleDir").visit { f ->
                     if (f.directory) return
 
                     def md = MessageDigest.getInstance("SHA-256")
@@ -217,7 +213,7 @@ androidComponents {
 
         def zip = tasks.register("zip${variantCapped}", Zip) {
             dependsOn(prepare)
-            from magiskDir
+            from moduleDir
             archiveFileName.set(zipName)
             destinationDirectory.set(outDir)
         }
@@ -231,7 +227,7 @@ androidComponents {
         tasks.register("flash${variantCapped}", Exec) {
             dependsOn("push${variantCapped}")
             commandLine "adb", "shell", "su", "-c",
-                    "magisk --install-module /data/local/tmp/${zipName}"
+                    "ksud module install /data/local/tmp/${zipName}"
         }
 
         tasks.register("flashAndReboot${variantCapped}", Exec) {
@@ -239,7 +235,6 @@ androidComponents {
             commandLine "adb", "shell", "reboot"
         }
 
-        // assemble<Variant> finalizes with the module zip (matches old assembleProvider hook)
         tasks.matching { it.name == "assemble${variantCapped}" }.configureEach {
             finalizedBy(zip)
         }

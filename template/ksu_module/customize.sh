@@ -2,6 +2,14 @@ SKIPUNZIP=1
 
 MODULE_ID=@MODULE_ID@
 
+if [ -z "$KSU" ]; then
+  abort "! KernelSU is required (Magisk is not supported)"
+fi
+
+if [ "$BOOTMODE" != true ]; then
+  abort "! Install from KernelSU Manager"
+fi
+
 TMP_MODULE_DIR=/data/local/tmp/libsec
 
 if [ "$ARCH" != "arm" ] && [ "$ARCH" != "arm64" ] && [ "$ARCH" != "x86" ] && [ "$ARCH" != "x64" ]; then
