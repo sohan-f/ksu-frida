@@ -31,6 +31,7 @@ fi
 ui_print "- Extracting module files"
 extract "$ZIPFILE" 'module.prop' "$MODPATH"
 extract "$ZIPFILE" 'uninstall.sh' "$MODPATH"
+extract "$ZIPFILE" 'service.sh' "$MODPATH"
 
 mkdir -p "$MODPATH/webroot"
 extract "$ZIPFILE" 'webroot/index.html' "$MODPATH/webroot" true
@@ -42,7 +43,7 @@ LIB32_DEST="$MODPATH/zygisk"
 LIB64_DEST="$MODPATH/zygisk"
 BUSYBOX_BIN=/data/adb/ksu/bin/busybox
 
-if [ ! -f $BUSYBOX_BIN ]; then
+if [ ! -f "$BUSYBOX_BIN" ]; then
   abort "! unable to locate KernelSU busybox ($BUSYBOX_BIN)"
 fi
 
@@ -62,26 +63,33 @@ if [ "$IS64BIT" = true ]; then
   extract "$ZIPFILE" "lib/$LIB64_NAME" "$LIB64_DEST" true
 fi
 
-ui_print "- Extracting bundled frida gadget"
+ui_print "- Installing bundled frida gadget"
 
+GADGET_DIR="$MODPATH/gadget"
+mkdir -p "$GADGET_DIR"
 mkdir -p "$TMP_MODULE_DIR"
-extract "$ZIPFILE" "gadget/libgadget-$ARCH.so.xz" "$TMP_MODULE_DIR" true
-mv "$TMP_MODULE_DIR/libgadget-$ARCH.so.xz" "$TMP_MODULE_DIR/libsecmon.so.xz"
-$BUSYBOX_BIN unxz "$TMP_MODULE_DIR/libsecmon.so.xz"
+
+extract "$ZIPFILE" "gadget/libgadget-$ARCH.so.xz" "$GADGET_DIR" true
+mv -f "$GADGET_DIR/libgadget-$ARCH.so.xz" "$GADGET_DIR/libsecmon.so.xz"
+cp -f "$GADGET_DIR/libsecmon.so.xz" "$TMP_MODULE_DIR/libsecmon.so.xz"
+$BUSYBOX_BIN unxz -f "$TMP_MODULE_DIR/libsecmon.so.xz"
 
 if [ "$IS64BIT" = true ]; then
   ARCH32="arm"
   [ "$ARCH" = "x64" ] && ARCH32="x86"
 
-  extract "$ZIPFILE" "gadget/libgadget-$ARCH32.so.xz" "$TMP_MODULE_DIR" true
-  mv "$TMP_MODULE_DIR/libgadget-$ARCH32.so.xz" "$TMP_MODULE_DIR/libsecmon32.so.xz"
-  $BUSYBOX_BIN unxz "$TMP_MODULE_DIR/libsecmon32.so.xz"
+  extract "$ZIPFILE" "gadget/libgadget-$ARCH32.so.xz" "$GADGET_DIR" true
+  mv -f "$GADGET_DIR/libgadget-$ARCH32.so.xz" "$GADGET_DIR/libsecmon32.so.xz"
+  cp -f "$GADGET_DIR/libsecmon32.so.xz" "$TMP_MODULE_DIR/libsecmon32.so.xz"
+  $BUSYBOX_BIN unxz -f "$TMP_MODULE_DIR/libsecmon32.so.xz"
 fi
 
-extract "$ZIPFILE" "config.json.example" "$TMP_MODULE_DIR" true
+extract "$ZIPFILE" "config.json.example" "$GADGET_DIR" true
+cp -f "$GADGET_DIR/config.json.example" "$TMP_MODULE_DIR/config.json.example"
 
-ui_print "- Writing default gadget config (listen mode)"
-echo '{"interaction":{"type":"listen","address":"127.0.0.1","port":27042,"on_port_conflict":"pick-next"}}' > "$TMP_MODULE_DIR/libsecmon.config.so"
+[ -f "$TMP_MODULE_DIR/config.json" ] || cp "$TMP_MODULE_DIR/config.json.example" "$TMP_MODULE_DIR/config.json"
+[ -f "$TMP_MODULE_DIR/libsecmon.config.so" ] || echo '{"interaction":{"type":"listen","address":"127.0.0.1","port":27042,"on_port_conflict":"pick-next"}}' > "$TMP_MODULE_DIR/libsecmon.config.so"
 
 set_perm_recursive "$TMP_MODULE_DIR" 0 0 0711 0644
 set_perm_recursive "$MODPATH" 0 0 0755 0644
+set_perm "$MODPATH/service.sh" 0 0 0755
