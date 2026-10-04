@@ -45,6 +45,106 @@ pub fn memfd_create(name: *const c_char, flags: c_int) -> c_int {
 
 #[cfg(any(target_os = "android", test))]
 pub const MFD_CLOEXEC: c_int = 0x0001;
+#[cfg(any(target_os = "android", test))]
+pub const MFD_ALLOW_SEALING: c_int = 0x0002;
+
+/// memfd name used for stealth staging. Shows as `/memfd:<name>` in maps.
+/// `dalvik-jit-cache` blends with ART `dalvik-jit-code-cache` but stays
+/// distinct so `contains` matching never hits the legit mapping.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub const MEMFD_NAME: &str = "dalvik-jit-cache";
+
+// pidfd_open(2): race-free liveness check. Bionic exposes it since API 31;
+// GKI 6.6 always has syscall 434. No safe libc wrapper on all targets,
+// so raw syscall with immediate error capture.
+#[cfg(any(target_os = "android", target_os = "linux", test))]
+pub fn pidfd_open(pid: libc::pid_t, flags: libc::c_uint) -> c_int {
+    // SAFETY: plain syscall with a pid + flags; fd (or -1) checked by caller.
+    unsafe { libc::syscall(libc::SYS_pidfd_open, pid, flags) as c_int }
+}
+
+// Seals for memfd staging: fixed size + no further seals change.
+// Deliberately omits SEAL_WRITE/SEAL_EXEC so dlopen with exec segments keeps working.
+#[cfg(any(target_os = "android", test))]
+pub fn seal_memfd_fixed(fd: c_int) -> Result<(), io::Error> {
+    let seals = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
+    // SAFETY: fcntl on our own open fd; return/errno read immediately.
+    let rc = unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals) };
+    if rc == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(any(target_os = "android", target_os = "linux", test))]
+pub const PR_SET_VMA: c_int = 0x53564d41;
+#[cfg(any(target_os = "android", target_os = "linux", test))]
+pub const PR_SET_VMA_ANON_NAME: c_int = 0;
+
+// openat2 resolve flags from linux/openat2.h (NDK 29). Only NO_SYMLINKS +
+// NO_MAGICLINKS are used for staging: BENEATH/IN_ROOT break absolute paths.
+#[cfg(any(target_os = "android", target_os = "linux", test))]
+pub const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+#[cfg(any(target_os = "android", target_os = "linux", test))]
+pub const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+
+#[cfg(any(target_os = "android", target_os = "linux", test))]
+#[repr(C)]
+pub struct OpenHow {
+    pub flags: u64,
+    pub mode: u64,
+    pub resolve: u64,
+}
+
+/// Best-effort openat2. Returns fd or -1 with errno (ENOSYS/EINVAL → fallback).
+///
+/// # Safety
+/// `path` must be a valid NUL-terminated string; `how` must be a valid pointer.
+#[cfg(any(target_os = "android", target_os = "linux", test))]
+pub unsafe fn openat2(dirfd: c_int, path: *const c_char, how: *const OpenHow) -> c_int {
+    // SAFETY: plain syscall; fd (or -1) checked by caller.
+    unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            dirfd as libc::c_long,
+            path,
+            how,
+            size_of::<OpenHow>(),
+        ) as c_int
+    }
+}
+
+/// Rename an anonymous VMA shown in /proc/self/maps. Best-effort: EINVAL/ENOSYS
+/// means the kernel does not support it; caller decides whether to log.
+///
+/// # Safety
+/// `addr..addr+len` must be a live anonymous mapping; `name` must be a valid
+/// NUL-terminated string.
+#[cfg(any(target_os = "android", target_os = "linux", test))]
+pub unsafe fn set_vma_anon_name(
+    addr: *mut c_void,
+    len: usize,
+    name: *const c_char,
+) -> Result<(), io::Error> {
+    // SAFETY: plain prctl with fully specified args; no pointers dereferenced
+    // by the wrapper itself beyond passing them through.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_prctl,
+            PR_SET_VMA as libc::c_long,
+            PR_SET_VMA_ANON_NAME as libc::c_long,
+            addr,
+            len,
+            name,
+        )
+    };
+    if rc != 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
 
 pub const MREMAP_MAYMOVE: c_int = 1;
 pub const MREMAP_FIXED: c_int = 2;
@@ -162,5 +262,94 @@ mod tests {
     fn cstring_rejects_an_interior_nul() {
         assert!(cstring("a\0b").is_err());
         assert!(cstring("\0").is_err());
+    }
+
+    #[test]
+    fn pidfd_opens_self() {
+        // SAFETY: getpid cannot fail.
+        let pid = unsafe { libc::getpid() };
+        let fd = pidfd_open(pid, 0);
+        if fd < 0 {
+            let err = std::io::Error::last_os_error();
+            assert!(
+                err.raw_os_error() == Some(libc::ENOSYS)
+                    || err.raw_os_error() == Some(libc::EINVAL),
+                "unexpected pidfd error: {err}"
+            );
+            return;
+        }
+        // SAFETY: fd is ours from above.
+        unsafe { libc::close(fd) };
+    }
+
+    #[test]
+    fn pidfd_rejects_dead_pid() {
+        // SAFETY: fork child exits immediately; parent reaps it.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            // SAFETY: child-only path, never returns.
+            unsafe { libc::_exit(0) };
+        }
+        let mut status = 0;
+        // SAFETY: `pid` is our child; blocking reap of exactly it.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        let fd = pidfd_open(pid, 0);
+        if fd >= 0 {
+            // SAFETY: fd is ours from above.
+            unsafe { libc::close(fd) };
+            // PID recycled between wait and open; alive is valid.
+        } else {
+            let err = std::io::Error::last_os_error();
+            assert!(
+                err.raw_os_error() == Some(libc::ESRCH)
+                    || err.raw_os_error() == Some(libc::ENOSYS)
+                    || err.raw_os_error() == Some(libc::EINVAL)
+            );
+        }
+    }
+
+    #[test]
+    fn memfd_seals_fix_size() {
+        let name = cstring("jit-cache").unwrap();
+        // SAFETY: static name; fd checked below.
+        let fd = memfd_create(name.as_ptr(), MFD_CLOEXEC | MFD_ALLOW_SEALING);
+        assert!(fd >= 0);
+        let res = seal_memfd_fixed(fd);
+        // SAFETY: fd is ours from above.
+        unsafe { libc::close(fd) };
+        if let Err(e) = res {
+            assert!(
+                e.raw_os_error() == Some(libc::ENOSYS) || e.raw_os_error() == Some(libc::EINVAL),
+                "unexpected seal error: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn vma_rename_is_best_effort() {
+        const SIZE: usize = 4096;
+        // SAFETY: fresh anon mapping owned by this test.
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(addr, libc::MAP_FAILED);
+        // SAFETY: addr/size is our live anon mapping; name is a static literal.
+        let r = unsafe { set_vma_anon_name(addr, SIZE, c"[anon:dalvik-jit]".as_ptr()) };
+        // SAFETY: cleanup our mapping.
+        unsafe { libc::munmap(addr, SIZE) };
+        if let Err(e) = r {
+            assert!(
+                e.raw_os_error() == Some(libc::EINVAL) || e.raw_os_error() == Some(libc::ENOSYS),
+                "unexpected vma error: {e}"
+            );
+        }
     }
 }

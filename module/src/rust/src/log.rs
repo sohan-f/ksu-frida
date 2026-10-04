@@ -36,6 +36,22 @@ pub fn loge(msg: impl AsRef<str>) {
     }
 }
 
+/// Lazy formatting: `format_args!` is only rendered when verbose is on,
+/// avoiding allocation for disabled logs.
+pub fn logi_fmt(args: std::fmt::Arguments<'_>) {
+    if verbose() {
+        log(ANDROID_LOG_INFO, &args.to_string());
+    }
+}
+
+/// Lazy formatting: `format_args!` is only rendered when verbose is on,
+/// avoiding allocation for disabled logs.
+pub fn loge_fmt(args: std::fmt::Arguments<'_>) {
+    if verbose() {
+        log(ANDROID_LOG_ERROR, &args.to_string());
+    }
+}
+
 fn log(prio: c_int, msg: &str) {
     #[cfg(target_os = "android")]
     crate::sys::android_log(prio, msg);

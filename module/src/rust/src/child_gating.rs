@@ -4,8 +4,8 @@ use std::thread;
 use std::time::Duration;
 
 use crate::config::ChildGatingConfig;
-use crate::inject::{current_app_name, stage_and_inject};
-use crate::log::{loge, logi};
+use crate::inject::stage_and_inject;
+use crate::log::{loge, loge_fmt, logi, logi_fmt};
 use crate::sys::{RTLD_DEFAULT, dlsym, set_errno};
 
 type ForkFn = unsafe extern "C" fn() -> libc::pid_t;
@@ -15,6 +15,8 @@ static ORIG_FORK: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 static CHILD_GATING_MODE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static INJECTED_LIBRARIES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+// Parent cmdline at enable time, COW-visible in fork child: avoids /proc re-read post-fork.
+static GATING_APP_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 #[cfg(target_os = "android")]
 unsafe extern "C" {
@@ -32,6 +34,29 @@ unsafe fn ksufrida_dobby_hook(
     _orig: *mut *mut c_void,
 ) -> c_int {
     0
+}
+
+unsafe extern "C" {
+    fn pthread_atfork(
+        prepare: Option<unsafe extern "C" fn()>,
+        parent: Option<unsafe extern "C" fn()>,
+        child: Option<unsafe extern "C" fn()>,
+    ) -> c_int;
+}
+
+// Child-only reset: atomics only, no alloc/log/locks — safe post-fork.
+unsafe extern "C" fn atfork_child() {
+    crate::remap::after_fork();
+}
+
+fn enable_atfork_reset() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: handlers are plain fns; child only stores atomics.
+        unsafe {
+            pthread_atfork(None, None, Some(atfork_child));
+        }
+    });
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -52,7 +77,8 @@ fn child_action(mode: &str) -> ChildAction {
 }
 
 // Kill/Freeze/Pass must not allocate or log: the child inherits every lock held at fork time.
-fn run_child_action(action: ChildAction, libraries: &[String]) -> libc::pid_t {
+// Inject reuses parent-prepared strings, empty context, no logging; dlopen itself is best-effort.
+fn run_child_action(action: ChildAction, libraries: &[String], app_name: &str) -> libc::pid_t {
     match action {
         ChildAction::Kill => {
             // SAFETY: `_exit(2)` takes a plain status and never returns.
@@ -65,12 +91,8 @@ fn run_child_action(action: ChildAction, libraries: &[String]) -> libc::pid_t {
             if libraries.is_empty() {
                 return 0;
             }
-            // SAFETY: `getpid(2)` cannot fail.
-            let child_pid = unsafe { libc::getpid() };
-            let context = format!("[child_gating][pid {child_pid}] ");
-            let app_name = current_app_name();
             for lib_path in libraries {
-                stage_and_inject(lib_path, &app_name, &context, true, true);
+                stage_and_inject(lib_path, app_name, "", true, true);
             }
             0
         }
@@ -95,7 +117,7 @@ unsafe extern "C" fn fork_replacement() -> libc::pid_t {
 
     // SAFETY: `getpid(2)` cannot fail.
     let parent_pid = unsafe { libc::getpid() };
-    logi(format!(
+    logi_fmt(format_args!(
         "[child_gating][pid {parent_pid}] detected fork/vfork (child_gating_mode {mode})"
     ));
 
@@ -103,7 +125,7 @@ unsafe extern "C" fn fork_replacement() -> libc::pid_t {
     // SAFETY: `orig` is the published trampoline and behaves as `fork(2)`.
     let child_pid = unsafe { orig() };
     if child_pid != 0 {
-        logi(format!(
+        logi_fmt(format_args!(
             "[child_gating][pid {parent_pid}] returning from forking {child_pid}"
         ));
         return child_pid;
@@ -115,54 +137,68 @@ unsafe extern "C" fn fork_replacement() -> libc::pid_t {
         .get()
         .map(Vec::as_slice)
         .unwrap_or_default();
-    run_child_action(child_action(mode), libraries)
+    let app_name = GATING_APP_NAME
+        .get()
+        .map(String::as_str)
+        .unwrap_or_default();
+    run_child_action(child_action(mode), libraries, app_name)
 }
 
-pub fn enable_child_gating(cfg: &ChildGatingConfig) {
+pub fn enable_child_gating(cfg: &ChildGatingConfig, app_name: &str) {
     let _ = CHILD_GATING_MODE.set(cfg.mode.clone());
     let _ = INJECTED_LIBRARIES.set(cfg.injected_libraries.clone());
+    let _ = GATING_APP_NAME.set(app_name.to_string());
 
     if child_action(&cfg.mode) == ChildAction::Pass {
-        loge(format!(
+        loge_fmt(format_args!(
             "unknown child_gating_mode {:?}; children will run ungated",
             cfg.mode
         ));
     }
 
     logi("[child_gating] enabling child gating");
+    enable_atfork_reset();
 
     // SAFETY: `RTLD_DEFAULT` is the documented sentinel handle and `c"fork"` is a valid NUL-terminated literal.
     let fork_addr = unsafe { dlsym(RTLD_DEFAULT, c"fork".as_ptr()) };
-    logi(format!("[child_gating] fork address {fork_addr:p}"));
+    logi_fmt(format_args!("[child_gating] fork address {fork_addr:p}"));
     // SAFETY: as above, with `c"vfork"`.
     let vfork_addr = unsafe { dlsym(RTLD_DEFAULT, c"vfork".as_ptr()) };
-    logi(format!("[child_gating] vfork address {vfork_addr:p}"));
+    logi_fmt(format_args!("[child_gating] vfork address {vfork_addr:p}"));
 
     let replacement = fork_replacement as *const () as *mut c_void;
 
-    // Stack local: only this thread observes it, so the publish cannot race hooks on other threads.
-    let mut fork_trampoline: *mut c_void = std::ptr::null_mut();
-    // SAFETY: `fork_addr` comes from `dlsym` above, `fork_trampoline` lives in this frame.
-    let rc = unsafe { ksufrida_dobby_hook(fork_addr, replacement, &raw mut fork_trampoline) };
-    ORIG_FORK.store(fork_trampoline, Ordering::Release);
-    if rc == 0 {
-        logi("[child_gating] fork hook installed");
+    if fork_addr.is_null() {
+        loge("[child_gating] fork address null; skipping fork hook");
     } else {
-        loge(format!(
-            "[child_gating] fork hook installation failed: {rc}"
-        ));
+        // Stack local: only this thread observes it, so the publish cannot race hooks on other threads.
+        let mut fork_trampoline: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `fork_addr` non-null from `dlsym` above, `fork_trampoline` lives in this frame.
+        let rc = unsafe { ksufrida_dobby_hook(fork_addr, replacement, &raw mut fork_trampoline) };
+        ORIG_FORK.store(fork_trampoline, Ordering::Release);
+        if rc == 0 {
+            logi("[child_gating] fork hook installed");
+        } else {
+            loge_fmt(format_args!(
+                "[child_gating] fork hook installation failed: {rc}"
+            ));
+        }
     }
 
     // Discarded: the vfork hook resumes through the fork trampoline above.
-    let mut vfork_trampoline: *mut c_void = std::ptr::null_mut();
-    // SAFETY: as above, for the vfork slot; nothing ever reads the value.
-    let rc = unsafe { ksufrida_dobby_hook(vfork_addr, replacement, &raw mut vfork_trampoline) };
-    if rc == 0 {
-        logi("[child_gating] vfork hook installed");
+    if vfork_addr.is_null() {
+        loge("[child_gating] vfork address null; skipping vfork hook");
     } else {
-        loge(format!(
-            "[child_gating] vfork hook installation failed: {rc}"
-        ));
+        let mut vfork_trampoline: *mut c_void = std::ptr::null_mut();
+        // SAFETY: as above, for the vfork slot; nothing ever reads the value.
+        let rc = unsafe { ksufrida_dobby_hook(vfork_addr, replacement, &raw mut vfork_trampoline) };
+        if rc == 0 {
+            logi("[child_gating] vfork hook installed");
+        } else {
+            loge_fmt(format_args!(
+                "[child_gating] vfork hook installation failed: {rc}"
+            ));
+        }
     }
 
     logi("[child_gating] child gating enabled");
@@ -243,12 +279,15 @@ mod tests {
 
     #[test]
     fn inject_without_libraries_stages_nothing() {
-        assert_eq!(run_child_action(ChildAction::Inject, &[]), 0);
+        assert_eq!(run_child_action(ChildAction::Inject, &[], "com.a.b"), 0);
     }
 
     #[test]
     fn pass_mode_ignores_the_library_list() {
-        assert_eq!(run_child_action(ChildAction::Pass, &["/a.so".into()]), 0);
+        assert_eq!(
+            run_child_action(ChildAction::Pass, &["/a.so".into()], "com.a.b"),
+            0
+        );
     }
 
     #[test]
@@ -359,7 +398,7 @@ mod tests {
         let child = unsafe { libc::fork() };
         assert!(child >= 0, "fork(2)");
         if child == 0 {
-            run_child_action(ChildAction::Freeze, &[]);
+            run_child_action(ChildAction::Freeze, &[], "");
             // SAFETY: child-only path; never returns in a correct build.
             unsafe { libc::_exit(99) };
         }
