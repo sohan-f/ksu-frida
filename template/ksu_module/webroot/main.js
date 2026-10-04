@@ -1,6 +1,10 @@
 const CONFIG_PATH = "/data/local/tmp/libsec/config.json";
 const GADGET_CONFIG_PATH = "/data/local/tmp/libsec/libsecmon.config.so";
 const MODULE_PROP = "/data/adb/modules/ksufrida/module.prop";
+const MODDIR = "/data/adb/modules/ksufrida";
+const GADGET_SRC = MODDIR + "/gadget/libsecmon.so.xz";
+const GADGET32_SRC = MODDIR + "/gadget/libsecmon32.so.xz";
+const BUSYBOX_BIN = "/data/adb/ksu/bin/busybox";
 const GADGET_PATH = "/data/local/tmp/libsec/libsecmon.so";
 const VERBOSE_PATH = "/data/local/tmp/libsec/verbose";
 const DEFAULT_GADGET = '{"interaction":{"type":"listen","address":"127.0.0.1","port":27042,"on_port_conflict":"pick-next"}}';
@@ -433,6 +437,28 @@ async function saveGadgetConfig() {
         refreshConnect();
     } else {
         ksu.toast("Failed: " + (r.stderr || r.stdout || r.errno));
+    }
+}
+
+async function refreshGadget() {
+    var dst = "/data/local/tmp/libsec";
+    var r = await exec("mkdir -p " + dst + "; " +
+        "if [ -f " + GADGET_SRC + " ]; then " +
+        "cp -f " + GADGET_SRC + " " + dst + "/libsecmon.so.xz && " +
+        BUSYBOX_BIN + " unxz -f " + dst + "/libsecmon.so.xz && chmod 644 " + dst + "/libsecmon.so && echo GADGET_OK || echo GADGET_FAIL; " +
+        "else echo GADGET_SRC_MISSING; fi; " +
+        "if [ -f " + GADGET32_SRC + " ]; then " +
+        "cp -f " + GADGET32_SRC + " " + dst + "/libsecmon32.so.xz && " +
+        BUSYBOX_BIN + " unxz -f " + dst + "/libsecmon32.so.xz && chmod 644 " + dst + "/libsecmon32.so && echo GADGET32_OK || echo GADGET32_FAIL; fi; " +
+        "echo " + SAVE_MARK);
+    var out = String(r.stdout || "");
+    if (out.indexOf("GADGET_SRC_MISSING") !== -1) {
+        ksu.toast("Bundled gadget missing — reinstall the module");
+    } else if (out.indexOf("GADGET_OK") !== -1) {
+        ksu.toast("Gadget updated");
+        loadStatus();
+    } else {
+        ksu.toast("Update failed: " + (r.stderr || r.stdout || r.errno));
     }
 }
 
@@ -1309,6 +1335,7 @@ window.onload = function () {
     document.getElementById("btn-save").onclick = saveConfig;
     document.getElementById("btn-reload").onclick = reloadAll;
     document.getElementById("btn-save-gadget").onclick = saveGadgetConfig;
+    document.getElementById("btn-refresh-gadget").onclick = refreshGadget;
     document.getElementById("btn-close-modal").onclick = closeAppModal;
     document.getElementById("app-list").onclick = openAppFromRow;
     document.getElementById("btn-status").onclick = loadStatus;
