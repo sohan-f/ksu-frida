@@ -1,6 +1,6 @@
 ext {
-    // Magisk Module
-    magiskModuleId = "ksufrida"
+    // KernelSU Module
+    moduleId = "ksufrida"
     moduleName = "ksufrida"
     moduleAuthor = "sohan-f"
     moduleDescription = "Frida gadget injection module for KernelSU via Zygisk"
