@@ -1,4 +1,3 @@
-
 use std::ffi::CString;
 #[cfg(any(target_os = "android", test))]
 use std::ffi::c_int;
@@ -74,6 +73,7 @@ fn wait_for_init_within(app_name: &str, timeout: Duration) -> bool {
     logi("Wait for process to complete init");
 
     let deadline = std::time::Instant::now() + timeout;
+    // Exact match; a substring test confuses com.foo with com.foobar.
     while current_app_name() != app_name {
         if std::time::Instant::now() >= deadline {
             loge(format!("Timed out waiting for process init: {app_name}"));
@@ -138,6 +138,7 @@ fn copy_file(src: &str, dst: &str) -> bool {
         .create(true)
         .truncate(true)
         .mode(0o700)
+        // Refuses symlink plants and keeps fifo plants from hanging the open.
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(dst)
     {
@@ -197,10 +198,12 @@ fn copy_file_range_all(
     let mut remaining = src_len;
     let mut first = true;
     while remaining > 0 {
+        // 1 GiB chunks: len is 32-bit size_t on 32-bit ABIs.
         let chunk = remaining.min(1 << 30) as usize;
         match crate::sys::copy_file_range(input.as_raw_fd(), output.as_raw_fd(), chunk) {
             Err(err) if err.kind() == ErrorKind::Interrupted => continue,
             Err(err) => {
+                // Only the first call may report Unsupported; support cannot change mid-file.
                 if first
                     && matches!(
                         err.raw_os_error(),
@@ -307,6 +310,7 @@ fn ensure_dir(path: &str, mode: libc::mode_t) -> bool {
         ));
         return false;
     }
+    // lstat, not stat: mkdir reports EEXIST for a symlink final component.
     #[allow(clippy::unnecessary_cast)]
     let (ifmt, iflnk, ifdir) = (
         libc::S_IFMT as u32,
@@ -415,6 +419,7 @@ fn sweep_stale_stage_dirs(cache_dir: &str) {
         if unsafe { libc::kill(pid, 0) } == 0 {
             continue;
         }
+        // ESRCH means dead; any other error leaves the dir alone.
         if io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
             continue;
         }
@@ -628,6 +633,7 @@ fn try_memfd_inject(_src_lib_path: &str, _log_context: &str, _hide_maps: bool) -
     false
 }
 
+// stage=false injects the source directly; only gated children stage.
 pub(crate) fn stage_and_inject(
     lib_path: &str,
     app_name: &str,
@@ -892,7 +898,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
+    #[cfg_attr(miri, ignore)] // real symlinks are outside miri's filesystem
     fn ensure_dir_refuses_symlink_plant() {
         let dir = scratch("mkdir-link");
         fs::create_dir_all(&dir).unwrap();
@@ -914,7 +920,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
+    #[cfg_attr(miri, ignore)] // symlinks/fifos are outside miri's filesystem
     fn copy_file_refuses_symlink_and_special_files() {
         let dir = scratch("copy-plant");
         fs::create_dir_all(&dir).unwrap();
@@ -949,7 +955,7 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    #[cfg_attr(miri, ignore)]
+    #[cfg_attr(miri, ignore)] // fork(2) is not interpretable
     fn dead_pid() -> libc::pid_t {
         // SAFETY: the child exits immediately; the parent reaps it below.
         let pid = unsafe { libc::fork() };
@@ -965,7 +971,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
+    #[cfg_attr(miri, ignore)] // uses fork(2) via dead_pid()
     fn sweep_removes_only_dead_pid_dirs() {
         let cache = scratch("sweep");
         fs::create_dir_all(&cache).unwrap();
@@ -1006,7 +1012,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
+    #[cfg_attr(miri, ignore)] // uses fork(2) via dead_pid()
     fn sweep_leaves_unexpected_subdirs_alone() {
         let cache = scratch("sweep-subdir");
         fs::create_dir_all(&cache).unwrap();

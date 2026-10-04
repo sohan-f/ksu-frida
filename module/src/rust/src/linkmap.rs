@@ -1,4 +1,3 @@
-
 use std::ffi::{CStr, c_char, c_int, c_void};
 
 use crate::log::{loge, logi};
@@ -88,6 +87,7 @@ struct Phdr64 {
 
 #[cfg(target_pointer_width = "32")]
 #[repr(C)]
+// Field order differs from 64-bit.
 struct Phdr32 {
     p_type: u32,
     p_offset: u32,
@@ -126,6 +126,7 @@ struct Sym64 {
 
 #[cfg(target_pointer_width = "32")]
 #[repr(C)]
+// Field order differs from 64-bit.
 struct Sym32 {
     st_name: u32,
     st_value: u32,
@@ -602,7 +603,6 @@ mod tests {
         // SAFETY: `info` describes the fake image above; the replacement
         // fits every footprint it can touch.
         let (soname_done, symbols) = unsafe { scrub_elf_metadata(&mut info, b"libnative_1.so") };
-        eprintln!("DBG done={soname_done} syms={symbols}");
         // SAFETY: read-only checks of our own page (perms restored to R).
         // (Strings live at `strtab_off + off`, not bare `off`.)
         unsafe {
