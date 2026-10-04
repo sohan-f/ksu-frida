@@ -532,7 +532,7 @@ fn write_memfd(src_lib_path: &str) -> Option<c_int> {
         Err(_) => return None,
     };
     // SAFETY: static name above; the fd is checked below and owned here.
-    let fd = unsafe { crate::sys::memfd_create(c_name.as_ptr(), crate::sys::MFD_CLOEXEC) };
+    let fd = crate::sys::memfd_create(c_name.as_ptr(), crate::sys::MFD_CLOEXEC);
     if fd < 0 {
         loge(format!(
             "stage: memfd_create failed: {}",

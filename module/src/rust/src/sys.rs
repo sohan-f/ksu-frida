@@ -39,8 +39,10 @@ unsafe extern "C" {
 }
 
 #[cfg(any(target_os = "android", test))]
-unsafe extern "C" {
-    pub fn memfd_create(name: *const c_char, flags: c_int) -> c_int;
+pub fn memfd_create(name: *const c_char, flags: c_int) -> c_int {
+    // SAFETY: plain syscall with a static name; the return (fd or -1) is
+    // checked by the caller.
+    unsafe { libc::syscall(libc::SYS_memfd_create, name, flags) as c_int }
 }
 
 #[cfg(any(target_os = "android", test))]
