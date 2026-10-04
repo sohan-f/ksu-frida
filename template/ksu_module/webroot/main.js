@@ -6,6 +6,11 @@ const GADGET_SRC = MODDIR + "/gadget/libsecmon.so.xz";
 const GADGET32_SRC = MODDIR + "/gadget/libsecmon32.so.xz";
 const BUSYBOX_BIN = "/data/adb/ksu/bin/busybox";
 const GADGET_PATH = "/data/local/tmp/libsec/libsecmon.so";
+const GADGET_VERSION_FILE = MODDIR + "/gadget/gadget.version";
+const GADGET_META_URL = "https://github.com/sohan-f/knox-frida-patcher/releases/latest/download/gadget.json";
+const GADGET_API_URL = "https://api.github.com/repos/sohan-f/knox-frida-patcher/releases/latest";
+const GADGET_DL_DIR = "/data/local/tmp/libsec/.webui-gadget-dl";
+const GADGET_DL_LOG = "/data/local/tmp/libsec/.webui-gadget-dl.tmp";
 const VERBOSE_PATH = "/data/local/tmp/libsec/verbose";
 const DEFAULT_GADGET = '{"interaction":{"type":"listen","address":"127.0.0.1","port":27042,"on_port_conflict":"pick-next"}}';
 
@@ -18,6 +23,11 @@ let targetStatus = {};
 let pillEls = {};
 let gadgetConfig = null;
 let gadgetFileOk = false;
+let gadgetBundled = null;
+let gadgetScanned = null;
+let gadgetLatest = null;
+let gadgetUpdateUrls = {};
+let gadgetUpdating = false;
 let dirtyConfig = false;
 let dirtyGadget = false;
 let searchQuery = "";
@@ -462,6 +472,162 @@ async function refreshGadget() {
     }
 }
 
+function cmpVersions(a, b) {
+    var pa = String(a).split(".");
+    var pb = String(b).split(".");
+    for (var i = 0; i < Math.max(pa.length, pb.length); i++) {
+        var da = parseInt(pa[i] || "0", 10) || 0;
+        var db = parseInt(pb[i] || "0", 10) || 0;
+        if (da !== db) return da < db ? -1 : 1;
+    }
+    return 0;
+}
+
+function parseGadgetMeta(text) {
+    var v = /"version"\s*:\s*"([^"]+)"/.exec(text || "");
+    var arm = /"arm"\s*:\s*"([^"]+)"/.exec(text || "");
+    var arm64 = /"arm64"\s*:\s*"([^"]+)"/.exec(text || "");
+    if (!v) return null;
+    return { version: v[1], arm: arm && arm[1], arm64: arm64 && arm64[1] };
+}
+
+function gadgetUrlsForAbi(abi, meta) {
+    if (!meta) return null;
+    if (abi === "arm64-v8a" && meta.arm64) return { primary: meta.arm64, companion: meta.arm || null };
+    if (abi === "armeabi-v7a" && meta.arm) return { primary: meta.arm, companion: null };
+    return null;
+}
+
+function validReleaseUrl(u) {
+    return /^https:\/\/github\.com\/sohan-f\/knox-frida-patcher\/releases\/download\/[0-9.]+\/frida-gadget-[0-9.]+-android-(arm|arm64)\.so\.xz$/.test(u || "");
+}
+
+function validVersion(v) {
+    return /^[0-9]+\.[0-9]+\.[0-9]+$/.test(v || "");
+}
+
+function setGadgetUpdateLine(text) {
+    document.getElementById("gadget-update").textContent = text;
+}
+
+function showDownloadButton(v) {
+    var b = document.getElementById("btn-download-gadget");
+    b.textContent = "Update to " + v;
+    b.style.display = "";
+}
+
+function currentGadgetVersion() {
+    return gadgetBundled || gadgetScanned;
+}
+
+const GVER_MARK = "@@__KSUFRIDA_GVER__";
+const ABI_MARK = "@@__KSUFRIDA_ABI__";
+const META_MARK = "@@__KSUFRIDA_META__";
+
+async function checkGadgetUpdate() {
+    setGadgetUpdateLine("Checking…");
+    document.getElementById("btn-download-gadget").style.display = "none";
+    var r = await exec(
+        "echo " + GVER_MARK + "; cat " + GADGET_VERSION_FILE + " 2>/dev/null; echo; " +
+        "echo " + ABI_MARK + "; getprop ro.product.cpu.abi; " +
+        "echo " + META_MARK + "; curl -sL --max-time 20 " + GADGET_META_URL
+    );
+    var parts = splitMarked(r.stdout, [GVER_MARK, ABI_MARK, META_MARK]);
+    var bundled = (parts[GVER_MARK] || []).join("").trim();
+    if (bundled && validVersion(bundled)) gadgetBundled = bundled;
+    var abi = (parts[ABI_MARK] || []).join("").trim();
+    var meta = parseGadgetMeta((parts[META_MARK] || []).join("\n"));
+    if (!meta) {
+        var f = await exec("curl -sL --max-time 20 " + GADGET_API_URL + " | grep '\"tag_name\"'");
+        var t = /"tag_name"\s*:\s*"([^"]+)"/.exec(f.stdout || "");
+        if (t && validVersion(t[1])) {
+            meta = {
+                version: t[1],
+                arm: "https://github.com/sohan-f/knox-frida-patcher/releases/download/" + t[1] + "/frida-gadget-" + t[1] + "-android-arm.so.xz",
+                arm64: "https://github.com/sohan-f/knox-frida-patcher/releases/download/" + t[1] + "/frida-gadget-" + t[1] + "-android-arm64.so.xz"
+            };
+        }
+    }
+    if (!meta || !validVersion(meta.version)) {
+        setGadgetUpdateLine("Update check failed — no network?");
+        return;
+    }
+    gadgetLatest = meta.version;
+    var urls = gadgetUrlsForAbi(abi, meta);
+    if (!urls || !validReleaseUrl(urls.primary) || (urls.companion && !validReleaseUrl(urls.companion))) {
+        setGadgetUpdateLine("No build for this device (" + (abi || "unknown ABI") + ")");
+        return;
+    }
+    gadgetUpdateUrls = urls;
+    var cur = currentGadgetVersion();
+    if (!cur) {
+        setGadgetUpdateLine(meta.version + " available (installed version unknown)");
+        showDownloadButton(meta.version);
+    } else if (cmpVersions(cur, meta.version) < 0) {
+        setGadgetUpdateLine(cur + " installed · " + meta.version + " available");
+        showDownloadButton(meta.version);
+    } else {
+        setGadgetUpdateLine("Gadget " + cur + " is up to date");
+    }
+}
+
+async function downloadGadgetUpdate() {
+    if (gadgetUpdating || !gadgetLatest || !gadgetUpdateUrls.primary) return;
+    gadgetUpdating = true;
+    document.getElementById("btn-download-gadget").style.display = "none";
+    var v = gadgetLatest;
+    var u1 = gadgetUpdateUrls.primary;
+    var u2 = gadgetUpdateUrls.companion;
+    var script =
+        "M=" + MODDIR + "/gadget; D=/data/local/tmp/libsec; S=" + GADGET_DL_DIR + "; B=" + BUSYBOX_BIN + "; V=" + shQuote(v) + "; " +
+        "rm -rf \"$S\"; mkdir -p \"$S\" \"$D\" \"$M\"; " +
+        "if command -v curl >/dev/null 2>&1; then GET=\"curl -sLf --max-time 600 -o\"; else GET=\"wget -q -O\"; fi; " +
+        "echo STAGE:download; OK=1; " +
+        "$GET \"$S/libsecmon.so.xz\" " + shQuote(u1) + " || OK=0; " +
+        (u2 ? "$GET \"$S/libsecmon32.so.xz\" " + shQuote(u2) + " || OK=0; " : "") +
+        "if [ \"$OK\" = 1 ]; then echo STAGE:verify; " +
+        "if \"$B\" unxz -t \"$S/libsecmon.so.xz\"" + (u2 ? " && \"$B\" unxz -t \"$S/libsecmon32.so.xz\"" : "") + "; then echo STAGE:install; " +
+        "cp -f \"$S/libsecmon.so.xz\" \"$M/libsecmon.so.xz\"; " +
+        "cp -f \"$S/libsecmon.so.xz\" \"$D/libsecmon.so.xz\"; " +
+        "$B unxz -f \"$D/libsecmon.so.xz\"; chmod 644 \"$D/libsecmon.so\"; " +
+        (u2 ? "cp -f \"$S/libsecmon32.so.xz\" \"$M/libsecmon32.so.xz\"; cp -f \"$S/libsecmon32.so.xz\" \"$D/libsecmon32.so.xz\"; $B unxz -f \"$D/libsecmon32.so.xz\"; chmod 644 \"$D/libsecmon32.so\"; " : "") +
+        "echo \"$V\" > \"$M/gadget.version\"; chmod 644 \"$M/gadget.version\"; echo RESULT:ok; " +
+        "else echo RESULT:verify-fail; fi; " +
+        "else echo RESULT:dl-fail; fi; " +
+        "rm -rf \"$S\"";
+    var result = null;
+    function onUpdateBody(body) {
+        body.split("\n").forEach(function (line) {
+            if (line.indexOf("STAGE:") === 0) {
+                var s = line.slice(6);
+                setGadgetUpdateLine(s === "download" ? "Downloading " + v + "…" : s === "verify" ? "Verifying…" : "Installing…");
+            } else if (line.indexOf("RESULT:") === 0) {
+                result = line.slice(7);
+            }
+        });
+    }
+    await runDetached(script, GADGET_DL_LOG, onUpdateBody, { timeout: 660000, maxStale: 0 });
+    gadgetUpdating = false;
+    if (result === "ok") {
+        gadgetBundled = v;
+        ksu.toast("Gadget updated to " + v);
+        setGadgetUpdateLine("Gadget " + v + " installed");
+        loadStatus();
+    } else {
+        if (result === "dl-fail") {
+            ksu.toast("Download failed — check network and retry");
+            setGadgetUpdateLine("Download failed");
+        } else if (result === "verify-fail") {
+            ksu.toast("Downloaded file failed verification");
+            setGadgetUpdateLine("Verification failed");
+        } else {
+            ksu.toast("Update timed out — retry");
+            setGadgetUpdateLine("Update timed out");
+        }
+        showDownloadButton(v);
+    }
+}
+
 function appendStatusRow(label, value, bad, valueId) {
     var el = document.getElementById("status-rows");
     var row = document.createElement("div");
@@ -542,6 +708,7 @@ function startVersionScan(key) {
             if (key) {
                 try { localStorage.setItem(GADGET_VERSION_KEY, JSON.stringify({ k: key, v: v })); } catch (_) {}
             }
+            gadgetScanned = v !== "unknown" ? v : null;
             setStatusValue("status-gadget", v, v === "unknown");
         });
 }
@@ -583,9 +750,9 @@ async function loadStatus() {
     el.innerHTML = "";
     el.className = "";
     var mod = rows.MOD || "unknown";
+    if (gad !== "…" && gad !== "unknown" && gad !== "missing") gadgetScanned = gad;
     appendStatusRow("Module", mod, mod === "not installed" || mod === "unknown");
     appendStatusRow("Gadget", gad, gad === "missing" || gad === "unknown", "status-gadget");
-
     appendStatusRow("Gadget config", gadgetFileOk ? "saved" : "not found", !gadgetFileOk);
     appendVerboseRow(rows.VERBOSE === "on");
     var total = config.targets.length;
@@ -1335,6 +1502,8 @@ window.onload = function () {
     document.getElementById("btn-save").onclick = saveConfig;
     document.getElementById("btn-reload").onclick = reloadAll;
     document.getElementById("btn-save-gadget").onclick = saveGadgetConfig;
+    document.getElementById("btn-check-gadget").onclick = checkGadgetUpdate;
+    document.getElementById("btn-download-gadget").onclick = downloadGadgetUpdate;
     document.getElementById("btn-refresh-gadget").onclick = refreshGadget;
     document.getElementById("btn-close-modal").onclick = closeAppModal;
     document.getElementById("app-list").onclick = openAppFromRow;
