@@ -86,6 +86,7 @@ fi
 
 extract "$ZIPFILE" "config.json.example" "$GADGET_DIR" true
 cp -f "$GADGET_DIR/config.json.example" "$TMP_MODULE_DIR/config.json.example"
+extract "$ZIPFILE" "gadget/gadget.version" "$GADGET_DIR" true
 
 [ -f "$TMP_MODULE_DIR/config.json" ] || cp "$TMP_MODULE_DIR/config.json.example" "$TMP_MODULE_DIR/config.json"
 [ -f "$TMP_MODULE_DIR/libsecmon.config.so" ] || echo '{"interaction":{"type":"listen","address":"127.0.0.1","port":27042,"on_port_conflict":"pick-next"}}' > "$TMP_MODULE_DIR/libsecmon.config.so"

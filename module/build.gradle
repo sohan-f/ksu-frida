@@ -191,6 +191,8 @@ androidComponents {
                 into 'gadget'
             }
             doLast {
+                file("$moduleDir/gadget/gadget.version").text = fridaVersion
+
                 fileTree("$moduleDir/lib").visit { f ->
                     if (!f.directory) return
                     def srcPath = Paths.get("${f.file.absolutePath}/libzygiskfrida.so")
