@@ -230,7 +230,9 @@ fn load_advanced_config(module_dir: &str, app_name: &str) -> Option<TargetConfig
     };
 
     for target in targets {
-        let deserialized = deserialize_target_config(target)?;
+        let Some(deserialized) = deserialize_target_config(target) else {
+            continue;
+        };
         if deserialized.app_name == app_name {
             return Some(deserialized);
         }
@@ -428,6 +430,12 @@ mod tests {
         .unwrap();
         assert!(load_config(dir.to_str().unwrap(), "a.b").is_none());
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn broken_entry_does_not_disable_other_targets() {
+        let dir = temp_dir("skip-broken");
         fs::write(
             dir.join("config.json"),
             r#"{"targets":[{"app_name":"broken"},
@@ -435,7 +443,8 @@ mod tests {
                 "start_up_delay_ms":0,"injected_libraries":[]}]}"#,
         )
         .unwrap();
-        assert!(load_config(dir.to_str().unwrap(), "a.b").is_none());
+        assert!(load_config(dir.to_str().unwrap(), "a.b").is_some());
+        assert!(load_config(dir.to_str().unwrap(), "broken").is_none());
 
         fs::remove_dir_all(&dir).ok();
     }

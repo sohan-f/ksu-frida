@@ -24,7 +24,8 @@ Frida gadget injection module for KernelSU via Zygisk (API v5).
 Open KernelSU Manager → Modules → KsuFrida → WebUI. Add target apps, configure delay, toggle child
 gating, watch module/gadget status, restart targets to apply changes, validate configs before
 saving, copy the exact connect commands for the ports your gadgets picked, refresh the gadget
-binary from the bundled payload, and check for gadget updates from the upstream releases.
+binary from the bundled payload, and check for gadget updates from the knox-frida-patcher
+releases (the gadget ships separately from this module).
 
 ### Option B: Manual config
 
