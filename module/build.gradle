@@ -23,6 +23,7 @@ task fetchGadget {
     group = "build"
     description = "Fetches the latest patched gadget from knox-frida-patcher releases"
     doLast {
+        file("$rootDir/gadget").mkdirs()
         def marker = file("$rootDir/gadget/gadget.version")
         def version = null
         def urls = [:]
