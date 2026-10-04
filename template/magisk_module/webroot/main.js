@@ -253,9 +253,6 @@ function splitMarked(text, marks) {
     return parts;
 }
 
-function patEsc(s) {
-    return String(s).replace(/[\\.*?[\]()|!^$]/g, "\\$&");
-}
 
 function markDirty(which) {
     if (which === "cfg") dirtyConfig = true;
@@ -547,7 +544,7 @@ function targetStatusCmd(names) {
         names.map(function (n) { return "-e " + shQuote(n); }).join(" ") +
         " /proc/[0-9]*/cmdline 2>/dev/null); do " +
         "n=$(tr '\\0' '\\n' 2>/dev/null < \"$c\" | head -1); " +
-        "case \"$n\" in " + names.map(patEsc).join("|") + ") " +
+        "case \"$n\" in " + names.map(shQuote).join("|") + ") " +
         "p=${c#/proc/}; echo \"$n ${p%%/cmdline}\";; esac; done";
 }
 
@@ -1053,6 +1050,7 @@ function renderTargets() {
 
         var delayInput = document.createElement("input");
         delayInput.type = "number";
+        delayInput.min = "0";
         delayInput.value = t.start_up_delay_ms || 0;
         delayInput.onchange = function () { updateField(i, "delay", delayInput.value); };
         div.appendChild(fieldBlock("Delay (ms)", delayInput));
@@ -1125,7 +1123,7 @@ function updateField(i, field, value) {
             t.kernel_assisted_evasion = value;
             break;
         case "delay":
-            t.start_up_delay_ms = parseInt(value, 10) || 0;
+            t.start_up_delay_ms = Math.max(0, parseInt(value, 10) || 0);
             break;
         case "libs":
             t.injected_libraries = textToLibs(value);
