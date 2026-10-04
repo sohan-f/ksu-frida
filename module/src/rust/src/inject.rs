@@ -1,5 +1,7 @@
 
 use std::ffi::CString;
+#[cfg(any(target_os = "android", test))]
+use std::ffi::c_int;
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -521,6 +523,111 @@ fn hide_or_show(lib_path: &str, log_context: &str, hide_maps: bool) {
     scrub_dlpi_name(lib_path);
 }
 
+#[cfg(any(target_os = "android", test))]
+fn write_memfd(src_lib_path: &str) -> Option<c_int> {
+    use std::os::unix::io::{FromRawFd, IntoRawFd};
+
+    let c_name = match cstring("jit-cache") {
+        Ok(c_name) => c_name,
+        Err(_) => return None,
+    };
+    // SAFETY: static name above; the fd is checked below and owned here.
+    let fd = unsafe { crate::sys::memfd_create(c_name.as_ptr(), crate::sys::MFD_CLOEXEC) };
+    if fd < 0 {
+        loge(format!(
+            "stage: memfd_create failed: {}",
+            io::Error::last_os_error()
+        ));
+        return None;
+    }
+
+    let mut input = match File::open(src_lib_path) {
+        Ok(file) => file,
+        Err(err) => {
+            loge(format!("stage: open src failed: {src_lib_path}: {err}"));
+            // SAFETY: `fd` is ours from above.
+            unsafe { libc::close(fd) };
+            return None;
+        }
+    };
+    let src_len = match input.metadata() {
+        Ok(meta) => meta.len(),
+        Err(err) => {
+            loge(format!("stage: stat src failed: {src_lib_path}: {err}"));
+            // SAFETY: as above.
+            unsafe { libc::close(fd) };
+            return None;
+        }
+    };
+    // SAFETY: `fd` is ours from above and disowned exactly once below.
+    let mut output = unsafe { File::from_raw_fd(fd) };
+    let ok = match copy_file_range_all(&input, &output, src_lib_path, "memfd", src_len) {
+        RangeOutcome::Done => true,
+        RangeOutcome::Failed => false,
+        RangeOutcome::Unsupported => {
+            copy_file_loop(&mut input, &mut output, src_lib_path, "memfd", 0, src_len)
+        }
+    };
+    if !ok {
+        return None;
+    }
+    // SAFETY: disown without closing; the caller closes after loading.
+    Some(output.into_raw_fd())
+}
+
+#[cfg(target_os = "android")]
+fn try_memfd_inject(src_lib_path: &str, log_context: &str, hide_maps: bool) -> bool {
+    use crate::sys::{ANDROID_DLEXT_FORCE_LOAD, ANDROID_DLEXT_USE_LIBRARY_FD};
+
+    let Some(fd) = write_memfd(src_lib_path) else {
+        return false;
+    };
+    let c_path = match cstring(src_lib_path) {
+        Ok(c_path) => c_path,
+        Err(_) => {
+            // SAFETY: `fd` is ours from above.
+            unsafe { libc::close(fd) };
+            return false;
+        }
+    };
+    let info = crate::sys::AndroidDlextInfo {
+        flags: ANDROID_DLEXT_USE_LIBRARY_FD | ANDROID_DLEXT_FORCE_LOAD,
+        reserved_addr: std::ptr::null_mut(),
+        reserved_size: 0,
+        relro_fd: 0,
+        library_fd: fd,
+        library_fd_offset: 0,
+        library_namespace: std::ptr::null_mut(),
+    };
+    // SAFETY: `c_path` is live and `info` fully initialized; the returned
+    // handle is checked for null below.
+    let handle = unsafe { crate::sys::android_dlopen_ext(c_path.as_ptr(), RTLD_NOW, &info) };
+    // SAFETY: `fd` is ours from above.
+    if unsafe { libc::close(fd) } != 0 {
+        loge(format!(
+            "{log_context}memfd close failed: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    if handle.is_null() {
+        loge(format!(
+            "{log_context}memfd load failed for {src_lib_path}: {}",
+            dlerror_string()
+        ));
+        return false;
+    }
+    logi(format!(
+        "{log_context}Injected {src_lib_path} from memfd with handle {handle:p}"
+    ));
+    hide_or_show(src_lib_path, log_context, hide_maps);
+    true
+}
+
+#[cfg(not(target_os = "android"))]
+fn try_memfd_inject(_src_lib_path: &str, _log_context: &str, _hide_maps: bool) -> bool {
+    false
+}
+
 pub(crate) fn stage_and_inject(
     lib_path: &str,
     app_name: &str,
@@ -528,6 +635,9 @@ pub(crate) fn stage_and_inject(
     hide_maps: bool,
     stage: bool,
 ) {
+    if try_memfd_inject(lib_path, log_context, hide_maps) {
+        return;
+    }
     let staged = if stage {
         stage_gadget(app_name, lib_path)
     } else {
@@ -940,6 +1050,24 @@ mod tests {
         );
 
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_memfd_roundtrips_source_bytes() {
+        let dir = scratch("memfd");
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.bin");
+
+        let payload: Vec<u8> = (0..200_000).map(|i| (i % 251) as u8).collect();
+        fs::write(&src, &payload).unwrap();
+
+        let fd = write_memfd(src.to_str().unwrap()).expect("memfd stage");
+        let back = fs::read(format!("/proc/self/fd/{fd}")).unwrap();
+        // SAFETY: `fd` is ours from above; done with it.
+        unsafe { libc::close(fd) };
+        assert_eq!(back, payload);
 
         fs::remove_dir_all(&dir).ok();
     }

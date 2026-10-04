@@ -12,6 +12,40 @@ unsafe extern "C" {
     pub fn dlerror() -> *mut c_char;
 }
 
+#[cfg(target_os = "android")]
+pub const ANDROID_DLEXT_USE_LIBRARY_FD: u64 = 0x10;
+#[cfg(target_os = "android")]
+pub const ANDROID_DLEXT_FORCE_LOAD: u64 = 0x40;
+
+#[cfg(target_os = "android")]
+#[repr(C)]
+pub struct AndroidDlextInfo {
+    pub flags: u64,
+    pub reserved_addr: *mut c_void,
+    pub reserved_size: usize,
+    pub relro_fd: c_int,
+    pub library_fd: c_int,
+    pub library_fd_offset: i64,
+    pub library_namespace: *mut c_void,
+}
+
+#[cfg(target_os = "android")]
+unsafe extern "C" {
+    pub fn android_dlopen_ext(
+        filename: *const c_char,
+        flags: c_int,
+        info: *const AndroidDlextInfo,
+    ) -> *mut c_void;
+}
+
+#[cfg(any(target_os = "android", test))]
+unsafe extern "C" {
+    pub fn memfd_create(name: *const c_char, flags: c_int) -> c_int;
+}
+
+#[cfg(any(target_os = "android", test))]
+pub const MFD_CLOEXEC: c_int = 0x0001;
+
 pub const MREMAP_MAYMOVE: c_int = 1;
 pub const MREMAP_FIXED: c_int = 2;
 
