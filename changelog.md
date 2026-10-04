@@ -1,3 +1,11 @@
+# v1.9.39
+- Fixed memfd linker scrub/remap miss (matched source path instead of memfd entry)
+- Remap now skips shared mappings and dedupes by address; memfd renamed to blend with ART JIT
+- Hides executable mappings without losing concurrent writes (write-freeze + fault parking)
+- pidfd-based stale stage cleanup, sealed memfd, openat2-hardened staging, pthread_atfork state reset
+- Lazy logging (no allocation when verbose off), faster config precheck, null-guarded fork/vfork hooks
+- Silent fork-child inject reusing parent strings (no /proc re-read in child)
+
 # v1.9.36
 - Updated Zygisk API from v2 to v5 (requires a provider with API v5 support: ReZygisk or a recent Zygisk Next)
 - KernelSU is now the only supported root solution

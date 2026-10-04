@@ -4,7 +4,7 @@ use std::fs;
 
 use serde_json::Value;
 
-use crate::log::loge;
+use crate::log::{loge, loge_fmt};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ChildGatingConfig {
@@ -191,6 +191,31 @@ fn parse_injected_libraries(module_dir: &str) -> Vec<String> {
         .collect()
 }
 
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    let first = needle[0];
+    let mut pos = 0;
+    while pos + needle.len() <= haystack.len() {
+        let Some(offset) = haystack[pos..].iter().position(|&b| b == first) else {
+            return false;
+        };
+        let start = pos + offset;
+        if start + needle.len() > haystack.len() {
+            return false;
+        }
+        if &haystack[start..start + needle.len()] == needle {
+            return true;
+        }
+        pos = start + 1;
+    }
+    false
+}
+
 fn load_advanced_config(module_dir: &str, app_name: &str) -> Option<TargetConfig> {
     if app_name.is_empty() {
         return None;
@@ -198,18 +223,14 @@ fn load_advanced_config(module_dir: &str, app_name: &str) -> Option<TargetConfig
     let bytes = fs::read(format!("{module_dir}/config.json")).ok()?;
 
     // Byte precheck skips the parse for non-targets; package names are never JSON-escaped.
-    if !bytes
-        .windows(app_name.len())
-        .any(|window| window == app_name.as_bytes())
-    {
+    if !contains_bytes(&bytes, app_name.as_bytes()) {
         return None;
     }
 
-    let content = String::from_utf8_lossy(&bytes);
-    let doc: Value = match serde_json::from_str(&content) {
+    let doc: Value = match serde_json::from_slice(&bytes) {
         Ok(doc) => doc,
         Err(err) => {
-            loge(format!(
+            loge_fmt(format_args!(
                 "config is not a valid json file at line {} column {}: {}",
                 err.line(),
                 err.column(),
@@ -457,5 +478,15 @@ mod tests {
         assert_eq!(strtoul_base10("abc"), 0);
         assert_eq!(strtoul_base10(""), 0);
         assert_eq!(strtoul_base10("-5"), 0);
+    }
+
+    #[test]
+    fn contains_bytes_matches_windows() {
+        let hay = b"{\"app_name\":\"com.example.app\"}";
+        assert!(contains_bytes(hay, b"com.example.app"));
+        assert!(contains_bytes(hay, b""));
+        assert!(!contains_bytes(hay, b"com.example.approx"));
+        assert!(!contains_bytes(b"short", b"much longer needle"));
+        assert!(!contains_bytes(b"", b"a"));
     }
 }

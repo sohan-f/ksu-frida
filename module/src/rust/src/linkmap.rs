@@ -1,6 +1,6 @@
 use std::ffi::{CStr, c_char, c_int, c_void};
 
-use crate::log::{loge, logi};
+use crate::log::{loge, loge_fmt, logi_fmt};
 use crate::sys::{DlIterateCb, DlPhdrInfo, dl_iterate_phdr};
 
 struct ScrubSearch {
@@ -9,6 +9,7 @@ struct ScrubSearch {
     found: bool,
     soname: bool,
     symbols: usize,
+    substring: bool,
 }
 
 /// # Safety
@@ -39,7 +40,14 @@ unsafe extern "C" fn scrub_callback(
         let name = CStr::from_ptr((*info).name);
         (name.to_bytes(), &mut *(data.cast::<ScrubSearch>()))
     };
-    if current != search.target.as_slice() {
+    let matched = if search.substring {
+        current
+            .windows(search.target.len().max(1))
+            .any(|w| w == search.target.as_slice())
+    } else {
+        current == search.target.as_slice()
+    };
+    if !matched {
         return 0;
     }
     // SAFETY: `info` is the matched live entry; the callee bounds every
@@ -191,7 +199,7 @@ impl WritableWindow {
             )
         } != 0
         {
-            loge(format!(
+            loge_fmt(format_args!(
                 "linkmap: cannot unprotect {label}: {}",
                 std::io::Error::last_os_error()
             ));
@@ -207,7 +215,7 @@ impl WritableWindow {
     fn close(self) {
         // SAFETY: the range this window opened; the result is checked below.
         if unsafe { libc::mprotect(self.start as *mut c_void, self.len, libc::PROT_READ) } != 0 {
-            loge(format!(
+            loge_fmt(format_args!(
                 "linkmap: cannot re-protect {}: {}",
                 self.label,
                 std::io::Error::last_os_error()
@@ -360,6 +368,38 @@ unsafe fn scrub_elf_metadata(info: *mut DlPhdrInfo, replacement: &[u8]) -> (bool
     (soname_done, symbols)
 }
 
+fn run_scrub(search: &mut ScrubSearch) {
+    // SAFETY: `scrub_callback` matches the `DlIterateCb` signature; `search`
+    // outlives the synchronous walk; the return value (entries visited) is
+    // informational only.
+    unsafe {
+        dl_iterate_phdr(
+            scrub_callback as DlIterateCb,
+            (search as *mut ScrubSearch).cast::<c_void>(),
+        );
+    }
+}
+
+/// # Safety
+/// Logs every dlpi name; `info` comes from the linker.
+unsafe extern "C" fn log_names_callback(
+    info: *mut DlPhdrInfo,
+    _size: usize,
+    _data: *mut c_void,
+) -> c_int {
+    // SAFETY: linker-provided entry, read-only copy for logging.
+    unsafe {
+        let name = CStr::from_ptr((*info).name).to_string_lossy();
+        logi_fmt(format_args!("linkmap entry: {name}"));
+    }
+    0
+}
+
+fn log_all_names() {
+    // SAFETY: logging-only walk, no mutation.
+    unsafe { dl_iterate_phdr(log_names_callback as DlIterateCb, std::ptr::null_mut()) };
+}
+
 pub fn scrub_dlpi_name(staged_path: &str) {
     // SAFETY: `getpid(2)` cannot fail.
     let pid = unsafe { libc::getpid() };
@@ -369,28 +409,51 @@ pub fn scrub_dlpi_name(staged_path: &str) {
         found: false,
         soname: false,
         symbols: 0,
+        substring: false,
     };
 
-    // SAFETY: `scrub_callback` matches the `DlIterateCb` signature; `search`
-    // outlives the synchronous walk; the return value (entries visited) is
-    // informational only.
-    unsafe {
-        dl_iterate_phdr(
-            scrub_callback as DlIterateCb,
-            (&mut search as *mut ScrubSearch).cast::<c_void>(),
-        );
-    }
+    run_scrub(&mut search);
 
     if search.found {
-        logi(format!(
+        logi_fmt(format_args!(
             "Scrubbed linker name for {staged_path} (soname {}, {} symbols)",
             if search.soname { "renamed" } else { "left" },
             search.symbols
         ));
     } else {
-        loge(format!(
+        loge_fmt(format_args!(
             "linkmap: no dl_iterate_phdr entry matched {staged_path}; name left visible"
         ));
+        log_all_names();
+    }
+}
+
+/// Scrub the memfd entry (`/memfd:jit-cache`) created by `try_memfd_inject`.
+/// The linker does not use the source path for fd loads, so exact matching fails.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn scrub_memfd() {
+    // SAFETY: `getpid(2)` cannot fail.
+    let pid = unsafe { libc::getpid() };
+    let mut search = ScrubSearch {
+        target: crate::sys::MEMFD_NAME.as_bytes().to_vec(),
+        replacement: format!("libnative_{pid}.so").into_bytes(),
+        found: false,
+        soname: false,
+        symbols: 0,
+        substring: true,
+    };
+
+    run_scrub(&mut search);
+
+    if search.found {
+        logi_fmt(format_args!(
+            "Scrubbed linker name for memfd (soname {}, {} symbols)",
+            if search.soname { "renamed" } else { "left" },
+            search.symbols
+        ));
+    } else {
+        loge("linkmap: no dl_iterate_phdr entry matched memfd; name left visible");
+        log_all_names();
     }
 }
 
@@ -440,6 +503,7 @@ mod tests {
             found: false,
             soname: false,
             symbols: 0,
+            substring: false,
         };
         let data = (&mut search as *mut ScrubSearch).cast::<c_void>();
 
@@ -485,6 +549,7 @@ mod tests {
             found: false,
             soname: false,
             symbols: 0,
+            substring: false,
         };
         // SAFETY: as above.
         unsafe {
@@ -512,6 +577,37 @@ mod tests {
         assert!(!contains_frida(b"puts"));
         assert!(!contains_frida(b"fri"));
         assert!(!contains_frida(b""));
+    }
+
+    #[test]
+    fn substring_match_finds_memfd_entry() {
+        let memfd = raw_cstring("/memfd:jit-cache (deleted)");
+        let mut memfd_entry = entry(memfd);
+        let mut search = ScrubSearch {
+            target: b"jit-cache".to_vec(),
+            replacement: b"libnative_1.so".to_vec(),
+            found: false,
+            soname: false,
+            symbols: 0,
+            substring: true,
+        };
+        // SAFETY: entry is a live owned string; `search` outlives the call.
+        unsafe {
+            assert_eq!(
+                scrub_callback(
+                    &mut memfd_entry,
+                    0,
+                    (&mut search as *mut ScrubSearch).cast::<c_void>()
+                ),
+                1
+            );
+        }
+        assert!(search.found);
+        // SAFETY: read-only check, then freed by original length (24).
+        unsafe {
+            assert_eq!(CStr::from_ptr(memfd).to_bytes(), b"libnative_1.so");
+            free_cstring(memfd, 24);
+        }
     }
 
     #[test]

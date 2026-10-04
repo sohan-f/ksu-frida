@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use libc::{self, c_int};
 
-use crate::log::{loge, logi};
+use crate::log::{loge_fmt, logi, logi_fmt};
 
 const GUARDED_SIGNALS: [c_int; 2] = [libc::SIGSEGV, libc::SIGBUS];
 
@@ -27,6 +27,7 @@ struct ProcMapsInfo {
     start: usize,
     end: usize,
     perms: c_int,
+    private: bool,
     path: String,
 }
 
@@ -37,6 +38,11 @@ fn next_field(s: &str) -> Option<(&str, &str)> {
     }
     let end = s.find(char::is_whitespace).unwrap_or(s.len());
     Some((&s[..end], &s[end..]))
+}
+
+fn is_private_mapping(perms: &str) -> bool {
+    // 4th char is p/s: shared mappings must keep sharing, never convert to private anon.
+    perms.as_bytes().get(3) != Some(&b's')
 }
 
 fn get_modules_by_name(m_name: &str) -> Vec<ProcMapsInfo> {
@@ -87,11 +93,14 @@ fn get_modules_by_name(m_name: &str) -> Vec<ProcMapsInfo> {
         if perms.contains('x') {
             prot |= libc::PROT_EXEC;
         }
+        // 4th char is p/s: shared mappings must keep sharing, never convert to private anon.
+        let private = is_private_mapping(perms);
 
         maps.push(ProcMapsInfo {
             start,
             end,
             perms: prot,
+            private,
             path: rest.trim().to_string(),
         });
     }
@@ -195,7 +204,7 @@ fn install_fault_retry() -> FaultRetry {
         let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
         // SAFETY: query-only call (`act == NULL`); fills the buffer above.
         if unsafe { libc::sigaction(sig, std::ptr::null(), &mut current) } != 0 {
-            loge(format!(
+            loge_fmt(format_args!(
                 "fault retry: cannot read handler for signal {sig}: {}",
                 io::Error::last_os_error()
             ));
@@ -217,7 +226,7 @@ fn install_fault_retry() -> FaultRetry {
         action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
         // SAFETY: installs the fully initialised `action` above; the kernel copies it synchronously.
         if unsafe { libc::sigaction(sig, &action, std::ptr::null_mut()) } != 0 {
-            loge(format!(
+            loge_fmt(format_args!(
                 "fault retry: cannot install handler for signal {sig}: {}",
                 io::Error::last_os_error()
             ));
@@ -302,10 +311,27 @@ unsafe fn relocate_segment(
     }
 
     if perms & libc::PROT_READ == 0 {
-        logi(format!("Removing memory protection: {path}"));
+        logi_fmt(format_args!("Removing memory protection: {path}"));
+    }
+
+    // Publish before touching protections: writers faulted below must park.
+    begin_rebuild(address as usize, size);
+
+    // Freeze writers during the copy: drop WRITE so concurrent writes fault
+    // into park_or_forward instead of being lost. Restored after commit.
+    let need_freeze = perms & libc::PROT_WRITE != 0;
+    let copy_prot = if need_freeze {
+        perms & !libc::PROT_WRITE
+    } else if perms & libc::PROT_READ == 0 {
+        libc::PROT_READ
+    } else {
+        perms
+    };
+    if copy_prot != perms {
         // SAFETY: `address`/`size` describe a live mapping from `/proc/self/maps`; the result is checked immediately.
-        if unsafe { libc::mprotect(address, size, libc::PROT_READ) } != 0 {
+        if unsafe { libc::mprotect(address, size, copy_prot) } != 0 {
             let err = io::Error::last_os_error();
+            end_rebuild();
             // SAFETY: `map`/`size` are ours from the `mmap` above; best-effort cleanup, result deliberately ignored.
             unsafe { libc::munmap(map, size) };
             return Err(RelocateError::Protect(err));
@@ -315,8 +341,6 @@ unsafe fn relocate_segment(
     // SAFETY: source is the live segment, destination is the scratch mapping — both `size` bytes and non-overlapping.
     unsafe {
         std::ptr::copy(address as *const u8, map as *mut u8, size);
-
-        begin_rebuild(address as usize, size);
 
         let moved = crate::sys::mremap(
             map,
@@ -344,7 +368,7 @@ unsafe fn relocate_segment(
         end_rebuild();
 
         if let Some(err) = restore_error {
-            loge(format!(
+            loge_fmt(format_args!(
                 "remap: cannot restore protections on {path}: {err}"
             ));
         }
@@ -353,37 +377,75 @@ unsafe fn relocate_segment(
     Ok(map)
 }
 
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn tag_anon(address: *mut c_void, size: usize) {
+    // SAFETY: `address`/`size` is the live anon mapping just rebuilt; name is a static literal.
+    let r = unsafe { crate::sys::set_vma_anon_name(address, size, c"[anon:dalvik-jit]".as_ptr()) };
+    if let Err(e) = r {
+        match e.raw_os_error() {
+            Some(code) if code == libc::EINVAL || code == libc::ENOSYS => {}
+            _ => loge_fmt(format_args!("remap: anon rename failed: {e}")),
+        }
+    }
+}
+
 pub fn remap_lib(lib_path: &str) {
     let lib_name = match lib_path.rfind('/') {
         Some(slash) => &lib_path[slash + 1..],
         None => lib_path,
     };
 
-    let maps = get_modules_by_name(lib_name);
+    remap_matches(lib_name);
+}
+
+/// Remap memfd segments (`/memfd:dalvik-jit-cache`). The linker does not keep the
+/// source path for fd loads, so basename matching misses them.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn remap_memfd() {
+    #[cfg(any(target_os = "android", test))]
+    remap_matches(crate::sys::MEMFD_NAME);
+    #[cfg(not(any(target_os = "android", test)))]
+    remap_matches("dalvik-jit-cache");
+}
+
+fn remap_matches(query: &str) {
+    let maps = get_modules_by_name(query);
     if maps.is_empty() {
         return;
     }
 
-    logi(format!("Remapping {lib_name}"));
+    logi_fmt(format_args!("Remapping {query}"));
 
     let _retry = install_fault_retry();
 
+    let mut seen_start = std::collections::HashSet::new();
     for info in &maps {
+        if !info.private {
+            logi_fmt(format_args!("Skipping shared mapping {}", info.path));
+            continue;
+        }
+        if !seen_start.insert(info.start) {
+            continue;
+        }
         let address = info.start as *mut c_void;
         let size = info.end - info.start;
 
         // SAFETY: `address`/`size`/`perms` come from the maps scan for this exact path and we hold the rebuild lock via `install_fault_retry`; the full contract is on `relocate_segment`.
         match unsafe { relocate_segment(address, size, info.perms, &info.path) } {
-            Ok(map) => logi(format!("Allocated at address {map:p} with size of {size}")),
+            Ok(_) => {
+                logi_fmt(format_args!("Remapped {address:p} size {size}"));
+                #[cfg(any(target_os = "android", target_os = "linux"))]
+                tag_anon(address, size);
+            }
             Err(RelocateError::Allocate(e)) => {
-                loge(format!("Failed to Allocate Memory: {e}"));
+                loge_fmt(format_args!("Failed to Allocate Memory: {e}"));
                 return;
             }
             Err(RelocateError::Protect(e)) => {
-                loge(format!("remap: cannot read {}: {e}", info.path));
+                loge_fmt(format_args!("remap: cannot read {}: {e}", info.path));
             }
             Err(RelocateError::Commit(e)) => {
-                loge(format!("mremap failed: {e}"));
+                loge_fmt(format_args!("mremap failed: {e}"));
             }
         }
     }
@@ -401,6 +463,15 @@ mod tests {
         assert_eq!(field, "7ac49c2000-7ac4a26000");
         let (perms, _) = next_field(rest).unwrap();
         assert_eq!(perms, "r--p");
+    }
+
+    #[test]
+    fn shared_mappings_are_not_private() {
+        assert!(is_private_mapping("r--p"));
+        assert!(is_private_mapping("r-xp"));
+        assert!(is_private_mapping("rw-p"));
+        assert!(!is_private_mapping("rw-s"));
+        assert!(!is_private_mapping("r--s"));
     }
 
     fn perms_at(addr: usize) -> String {
