@@ -5,10 +5,6 @@ import java.nio.file.Paths
 import java.nio.file.Files
 import java.security.MessageDigest
 
-plugins {
-    id "de.undercouch.download" version "5.7.0"
-}
-
 apply plugin: 'com.android.library'
 apply from: file(rootProject.file('module.gradle'))
 
@@ -20,27 +16,56 @@ dependencies {
     implementation("io.github.vvb2060.ndk:dobby:1.2")
 }
 
-task downloadFrida(type: Download) {
-    def downloadArchs = ["arm", "arm64"]
-    def gadgetArchs = ["arm", "arm64"]
+def gadgetMetaUrl = "https://github.com/sohan-f/knox-frida-patcher/releases/latest/download/gadget.json"
+def gadgetArchs = ["arm", "arm64"]
 
-    def sources = downloadArchs.collect{
-        arch -> "https://github.com/sohan-f/knox-frida-patcher/releases/download/${fridaVersion}/frida-gadget-${fridaVersion}-android-${arch}.so.xz".toString()
-    }
-
-    def outputs = gadgetArchs.collect{
-        arch ->  "libgadget-${arch}.so.xz".toString()
-    }
-
-    def downloads = [sources, outputs].transpose().collectEntries()
-
-    src downloads.keySet()
-    dest "$rootDir/gadget"
-    overwrite true
-    onlyIfModified true
-    quiet true
-    eachFile { f ->
-        f.name = downloads[f.sourceURL.toString()]
+task fetchGadget {
+    group = "build"
+    description = "Fetches the latest patched gadget from knox-frida-patcher releases"
+    doLast {
+        def marker = file("$rootDir/gadget/gadget.version")
+        def version = null
+        def urls = [:]
+        try {
+            def conn = new URL(gadgetMetaUrl).openConnection()
+            conn.connectTimeout = 15000
+            conn.readTimeout = 30000
+            def meta = new groovy.json.JsonSlurper().parse(conn.inputStream)
+            if (meta?.version ==~ /\d+\.\d+\.\d+/) {
+                version = meta.version
+                gadgetArchs.each { arch ->
+                    def u = meta?.assets?.get(arch)
+                    if (u ==~ /https:\/\/github\.com\/sohan-f\/knox-frida-patcher\/releases\/download\/\d+\.\d+\.\d+\/frida-gadget-\d+\.\d+\.\d+-android-(arm|arm64)\.so\.xz/) {
+                        urls[arch] = u
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logger.lifecycle("gadget metadata unreachable, using local build: ${e.message}")
+        }
+        if (version == null || urls.size() != gadgetArchs.size()) {
+            def local = marker.exists() ? marker.text.trim() : null
+            if (!(local ==~ /\d+\.\d+\.\d+/)) {
+                throw new GradleException("gadget metadata unreachable and no cached gadget; connect to the network and retry")
+            }
+            version = local
+            urls = gadgetArchs.collectEntries { arch ->
+                [(arch): "https://github.com/sohan-f/knox-frida-patcher/releases/download/${version}/frida-gadget-${version}-android-${arch}.so.xz"]
+            }
+        }
+        def outputs = gadgetArchs.collect { arch -> file("$rootDir/gadget/libgadget-${arch}.so.xz") }
+        if (marker.exists() && marker.text.trim() == version && outputs.every { it.exists() }) {
+            logger.lifecycle("gadget ${version} already fetched")
+            return
+        }
+        urls.each { arch, u ->
+            def dl = new URL(u).openConnection()
+            dl.connectTimeout = 15000
+            dl.readTimeout = 600000
+            file("$rootDir/gadget/libgadget-${arch}.so.xz").withOutputStream { it << dl.inputStream }
+        }
+        marker.text = version
+        logger.lifecycle("fetched gadget ${version}")
     }
 }
 
@@ -139,7 +164,7 @@ androidComponents {
 
         def prepare = tasks.register("prepareModuleFiles${variantCapped}", Sync) {
             dependsOn("assemble$variantCapped")
-            dependsOn downloadFrida
+            dependsOn fetchGadget
             duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 
             def templatePath = "$rootDir/template/ksu_module"
@@ -191,7 +216,7 @@ androidComponents {
                 into 'gadget'
             }
             doLast {
-                file("$moduleDir/gadget/gadget.version").text = fridaVersion
+                file("$moduleDir/gadget/gadget.version").text = file("$rootDir/gadget/gadget.version").text.trim()
 
                 fileTree("$moduleDir/lib").visit { f ->
                     if (!f.directory) return
