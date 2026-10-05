@@ -1,4 +1,4 @@
-#include <string>
+#include <sys/types.h>
 
 #include "zygisk.hpp"
 
@@ -16,7 +16,7 @@ class MyModule : public zygisk::ModuleBase {
     }
 
     void postAppSpecialize(const AppSpecializeArgs *args) override {
-        // Both pointers can be null (OOM); std::string(nullptr) is UB.
+        // Both pointers can be null (OOM).
         if (args == nullptr || args->nice_name == nullptr) {
             this->api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
             return;
@@ -29,10 +29,11 @@ class MyModule : public zygisk::ModuleBase {
             return;
         }
 
-        std::string app_name = std::string(raw_app_name);
+        // The JNI pointer stays valid until released; the Rust side copies it synchronously.
+        bool keep = ksufrida_check_and_inject(raw_app_name);
         this->env->ReleaseStringUTFChars(args->nice_name, raw_app_name);
 
-        if (!ksufrida_check_and_inject(app_name.c_str())) {
+        if (!keep) {
             this->api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
         }
     }
