@@ -138,6 +138,192 @@ const DT_GNU_HASH: i64 = 0x6fff_fef5;
 const MAX_DYNAMIC: usize = 128;
 const MAX_SYMBOLS: usize = 1_000_000;
 
+/// Fuzz driver for [`scrub_elf_metadata`]: carves an adversarial but
+/// container-consistent image out of one mapping and walks it.
+///
+/// Consistency contract: placements live in fixed disjoint arenas, so
+/// tables can never collide; only table *values* are adversarial. Any
+/// fault is therefore a real finding. The guards themselves get hostile
+/// values: unbounded `strsz` (mprotect gate), oversized `nchain` (cap
+/// skip), out-of-range name offsets (skips). Middle `nchain` values would
+/// read past any fixed-size table by construction, so they fold to the
+/// walked maximum; the cap boundary itself is pinned by unit test.
+#[cfg(fuzzing)]
+pub fn fuzz_scrub_elf(data: &[u8]) {
+    const PAGE: usize = 65536;
+    const HEADER: usize = 24;
+    if data.len() < HEADER {
+        return;
+    }
+    let u16le = |i: usize| u16::from_le_bytes([data[i], data[i + 1]]) as usize;
+    let u32le =
+        |i: usize| u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as usize;
+    let pool = |k: usize| data.get(HEADER + k).copied().unwrap_or(0);
+
+    // SAFETY: fresh anonymous mapping owned by this call; unmapped at return.
+    let page = unsafe {
+        let page = libc::mmap(
+            std::ptr::null_mut(),
+            PAGE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+            -1,
+            0,
+        );
+        if page == libc::MAP_FAILED {
+            return;
+        }
+        page as *mut u8
+    };
+    // SAFETY: every write below lands in its fixed disjoint arena inside
+    // the mapping above; sizes are constants, values adversarial.
+    unsafe {
+        // Fixed disjoint arenas: placements never overlap (an earlier
+        // revision masked offsets independently and the tables collided,
+        // corrupting values the reader trusts). Only table *values* below
+        // are adversarial; every computed read stays inside these rooms.
+        let phdr_off = 64usize;
+        let phnum = (data[2] % 4) as u16;
+        let dyn_off = 256usize;
+        let dyn_count = (data[5] % 8) as usize + 1;
+        let strtab_off = 4096usize;
+        let room_small = 4096usize;
+        let strsz = u32le(8);
+        let symtab_off = 12288usize;
+        const SYMS_HELD: usize = 257;
+        let nchain_raw = u32le(14);
+        let nchain = if nchain_raw > MAX_SYMBOLS {
+            nchain_raw
+        } else {
+            nchain_raw.min(SYMS_HELD - 1)
+        };
+        let hash_kind = data[18] % 3;
+        let soname_off = u16le(19) % (room_small + 64);
+        let hash_off = 18464usize;
+        let gnu_off = 22560usize;
+
+        for i in 0..room_small {
+            page.add(strtab_off + i).write(pool(i));
+        }
+        for i in 0..SYMS_HELD {
+            let name =
+                u16::from_le_bytes([pool(2 * i), pool(2 * i + 1)]) as usize % (room_small + 64);
+            (page.add(symtab_off + i * size_of::<Sym>()) as *mut Sym).write_unaligned(Sym {
+                st_name: name as u32,
+                st_info: 0,
+                st_other: 0,
+                st_shndx: 0,
+                st_value: 0,
+                st_size: 0,
+            });
+        }
+        (page.add(hash_off) as *mut u32).write_unaligned(pool(500) as u32 % 8);
+        (page.add(hash_off + 4) as *mut u32).write_unaligned(nchain as u32);
+        // Small symoffset walks the chains; huge symoffset skips them all.
+        let symoffset = if pool(501) % 2 == 0 {
+            (pool(502) % 64) as u32
+        } else {
+            0x8000_0000 + (pool(502) as u32 % 256)
+        };
+        let gbloom = pool(504) as u32 % 4;
+        // Chain-prone bodies get stop bits first: the reader may land on any
+        // of these words as buckets or chain links, and 0xFF either skips
+        // (huge sym) or stops the walk on the first link. Headers and the
+        // single live bucket below overwrite the words the reader uses.
+        for &base in &[hash_off, gnu_off] {
+            for i in 0..512usize {
+                (page.add(base + 16 + i * 4) as *mut u32).write_unaligned(0xFFFF_FFFF);
+            }
+        }
+        (page.add(hash_off + 8) as *mut u32).write_unaligned(0);
+        (page.add(hash_off + 12) as *mut u32).write_unaligned(0);
+        (page.add(hash_off + 16) as *mut u32).write_unaligned(nchain as u32);
+        (page.add(gnu_off) as *mut u32).write_unaligned(pool(503) as u32 % 8);
+        (page.add(gnu_off + 4) as *mut u32).write_unaligned(symoffset);
+        (page.add(gnu_off + 8) as *mut u32).write_unaligned(gbloom);
+        (page.add(gnu_off + 12) as *mut u32).write_unaligned(pool(505) as u32);
+        (page.add(gnu_off + 16 + gbloom as usize * 8) as *mut u32).write_unaligned(symoffset);
+        let tags = [
+            DT_STRTAB,
+            DT_STRSZ,
+            DT_SYMTAB,
+            hash_tag(hash_kind),
+            DT_SONAME,
+            1,
+            0x6fff_fff1,
+        ];
+        let vals = [
+            strtab_off as u64,
+            strsz as u64,
+            symtab_off as u64,
+            (if hash_kind == 1 { hash_off } else { gnu_off }) as u64,
+            soname_off as u64,
+            pool(506) as u64,
+            pool(507) as u64,
+        ];
+        for k in 0..dyn_count {
+            let (tag, val) = if k + 1 == dyn_count && pool(508) % 4 != 0 {
+                (DT_NULL, 0)
+            } else {
+                let pick = pool(510 + k) as usize % tags.len();
+                (tags[pick], vals[pick])
+            };
+            (page.add(dyn_off + k * size_of::<Dyn>()) as *mut Dyn).write_unaligned(Dyn {
+                d_tag: tag as _,
+                d_val: val as _,
+            });
+        }
+        for k in 0..phnum as usize {
+            let p_type = if pool(520 + k) % 2 == 0 {
+                PT_DYNAMIC
+            } else {
+                1
+            };
+            (page.add(phdr_off + k * size_of::<Phdr>()) as *mut Phdr).write_unaligned(Phdr {
+                p_type,
+                p_flags: 0,
+                p_offset: 0,
+                p_vaddr: dyn_off as _,
+                p_paddr: 0,
+                p_filesz: 0,
+                p_memsz: 0,
+                p_align: 0,
+            });
+        }
+
+        let mut info = crate::sys::DlPhdrInfo {
+            addr: page as usize,
+            name: c"fake.so".as_ptr(),
+            phdr: page.add(phdr_off) as *const c_void,
+            phnum,
+        };
+        if std::env::var_os("KSUFRIDA_FUZZ_TRACE").is_some() {
+            eprintln!(
+                "page={page:p} phdr_off={phdr_off} phnum={phnum} dyn_off={dyn_off} \
+                 strtab_off={strtab_off} strsz={strsz} symtab_off={symtab_off} \
+                 nchain={nchain_raw} kind={hash_kind} soname={soname_off} \
+                 hash={hash_off} gnu={gnu_off} end={:p}",
+                (page as usize + PAGE) as *const u8,
+            );
+            for k in 0..dyn_count {
+                // Slots just written above, all inside the mapping.
+                let d = (page.add(dyn_off + k * size_of::<Dyn>()) as *const Dyn).read_unaligned();
+                eprintln!("dyn[{k}]: tag={} val={}", d.d_tag as i64, d.d_val as u64);
+            }
+        }
+        // SAFETY: the image above upholds the callee's container contract
+        // (valid phdr/dyn tables in one live mapping); only table *values*
+        // are adversarial, which is exactly what is under test.
+        let _ = scrub_elf_metadata(&raw mut info, b"libnative_1.so");
+        libc::munmap(page as *mut c_void, PAGE);
+    }
+}
+
+#[cfg(fuzzing)]
+fn hash_tag(kind: u8) -> i64 {
+    if kind == 1 { DT_HASH } else { DT_GNU_HASH }
+}
+
 #[cfg(target_pointer_width = "64")]
 #[repr(C)]
 struct Phdr64 {
@@ -912,6 +1098,34 @@ mod tests {
     }
 
     #[test]
+    fn scrub_tables_skips_overcapped_symbol_counts() {
+        let strtab = b"\0frida_agent\0".to_vec();
+        let syms = [Sym {
+            st_name: 1,
+            st_info: 0,
+            st_other: 0,
+            st_shndx: 0,
+            st_value: 0,
+            st_size: 0,
+        }];
+        // SAFETY: both buffers outlive the call; the count exceeds the cap
+        // so no symbol entry is read at all.
+        let (soname_done, symbols) = unsafe {
+            scrub_tables(
+                strtab.as_ptr() as usize,
+                strtab.len(),
+                syms.as_ptr() as usize,
+                0,
+                MAX_SYMBOLS + 1,
+                None,
+                b"X",
+            )
+        };
+        assert_eq!(symbols, 0);
+        assert!(!soname_done);
+    }
+
+    #[test]
     #[cfg(target_pointer_width = "64")]
     fn gnu_nsyms_counts_chained_symbols() {
         let mut blob = vec![1u32, 1, 1, 0];
@@ -1137,6 +1351,128 @@ mod tests {
             assert_eq!(symbols, 1);
             assert_eq!(at(soname_off), b"libnative_1.so");
             assert_eq!(at(sym1_off), b"libnative_1.so");
+            assert_eq!(at(sym2_off), b"puts");
+            assert_eq!(libc::munmap(page as *mut c_void, SIZE), 0);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    #[cfg(target_pointer_width = "64")]
+    fn elf_scrub_sysv_count_wins_and_skips_overcap() {
+        const SIZE: usize = 4096;
+        // SAFETY: fresh anonymous page owned by this test.
+        let page = unsafe {
+            let page = libc::mmap(
+                std::ptr::null_mut(),
+                SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                -1,
+                0,
+            );
+            assert_ne!(
+                page,
+                libc::MAP_FAILED,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+            page as *mut u8
+        };
+
+        let soname_off = 1usize;
+        let sym1_off = 20usize;
+        let sym2_off = 37usize;
+        let strtab_off = 256usize;
+        let strtab: &[u8] = b"\0libfrida-gadget.so\0frida_agent_main\0puts\0";
+        assert_eq!(strtab.len(), 42);
+        let symtab_off = 512usize;
+        let hash_off = 640usize;
+        let gnu_off = 768usize;
+        let dyn_off = 64usize;
+
+        // SAFETY: all writes land inside our own page at the offsets above.
+        unsafe {
+            (page.add(0) as *mut Phdr64).write(Phdr64 {
+                p_type: PT_DYNAMIC,
+                p_flags: 0,
+                p_offset: 0,
+                p_vaddr: dyn_off as u64,
+                p_paddr: 0,
+                p_filesz: 0,
+                p_memsz: 0,
+                p_align: 0,
+            });
+            let dyn_entries: [(i64, u64); 7] = [
+                (DT_STRTAB, strtab_off as u64),
+                (DT_STRSZ, strtab.len() as u64),
+                (DT_SYMTAB, symtab_off as u64),
+                (DT_HASH, hash_off as u64),
+                (DT_GNU_HASH, gnu_off as u64),
+                (DT_SONAME, soname_off as u64),
+                (DT_NULL, 0),
+            ];
+            for (i, (tag, val)) in dyn_entries.iter().enumerate() {
+                (page.add(dyn_off + i * size_of::<Dyn64>()) as *mut Dyn64).write(Dyn64 {
+                    d_tag: *tag,
+                    d_val: *val,
+                });
+            }
+            std::ptr::copy_nonoverlapping(strtab.as_ptr(), page.add(strtab_off), strtab.len());
+            let names = [0u32, sym1_off as u32, sym2_off as u32];
+            for (i, name) in names.iter().enumerate() {
+                (page.add(symtab_off + i * size_of::<Sym64>()) as *mut Sym64).write(Sym64 {
+                    st_name: *name,
+                    st_info: 0,
+                    st_other: 0,
+                    st_shndx: 0,
+                    st_value: 0,
+                    st_size: 0,
+                });
+            }
+            // Oversized chain count: the SysV count is skipped outright.
+            let hash: [u32; 2] = [1, (MAX_SYMBOLS + 5) as u32];
+            std::ptr::copy_nonoverlapping(
+                hash.as_ptr(),
+                page.add(hash_off) as *mut u32,
+                hash.len(),
+            );
+            // One bucket fanning from symbol 1; chain stop bits end at symbol 2.
+            let header: [u32; 4] = [1, 1, 1, 0];
+            std::ptr::copy_nonoverlapping(
+                header.as_ptr(),
+                page.add(gnu_off) as *mut u32,
+                header.len(),
+            );
+            (page.add(gnu_off + 16) as *mut u64).write(0);
+            (page.add(gnu_off + 24) as *mut u32).write(1);
+            let chain: [u32; 2] = [0, 1];
+            std::ptr::copy_nonoverlapping(
+                chain.as_ptr(),
+                page.add(gnu_off + 28) as *mut u32,
+                chain.len(),
+            );
+        }
+
+        let mut info = DlPhdrInfo {
+            addr: page as usize,
+            name: c"fake.so".as_ptr(),
+            phdr: page as *const c_void,
+            phnum: 1,
+        };
+        // SAFETY: `info` describes the fake image above; the replacement
+        // fits every footprint it can touch. The oversized SysV count wins
+        // over the live GNU table, so no symbol is walked or rewritten.
+        let (soname_done, symbols) =
+            unsafe { scrub_elf_metadata(&raw mut info, b"libnative_1.so") };
+        // SAFETY: read-only checks of our own page (perms restored to R).
+        unsafe {
+            let at =
+                |off: usize| CStr::from_ptr(page.add(strtab_off + off) as *const c_char).to_bytes();
+            assert!(soname_done);
+            assert_eq!(symbols, 0);
+            assert_eq!(at(soname_off), b"libnative_1.so");
+            assert_eq!(at(sym1_off), b"frida_agent_main");
             assert_eq!(at(sym2_off), b"puts");
             assert_eq!(libc::munmap(page as *mut c_void, SIZE), 0);
         }

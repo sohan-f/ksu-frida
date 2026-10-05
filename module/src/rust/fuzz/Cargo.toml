@@ -19,3 +19,10 @@ path = "fuzz_targets/parse_config.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "scrub_elf"
+path = "fuzz_targets/scrub_elf.rs"
+test = false
+doc = false
+bench = false

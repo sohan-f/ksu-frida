@@ -18,8 +18,12 @@ concurrency:
 
 jobs:
   fuzz:
-    name: libFuzzer parse_config
+    name: libFuzzer ${{ matrix.target }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [parse_config, scrub_elf]
 
     steps:
       - uses: actions/checkout@v7
@@ -38,6 +42,6 @@ jobs:
       - name: Fuzz
         run: |
           cd module/src/rust/fuzz
-          cargo fuzz run parse_config -- \
+          cargo fuzz run ${{ matrix.target }} -- \
             -max_total_time=${{ github.event.inputs.fuzz_seconds || '300' }} \
             -print_final_stats=1

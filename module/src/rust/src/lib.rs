@@ -19,6 +19,12 @@ pub fn fuzz_parse_config(module_dir: &str, app_name: &str) -> Option<String> {
     config::load_config(module_dir, app_name).map(|cfg| cfg.app_name)
 }
 
+// Feeds adversarial ELF images to the linkmap scrubber; only compiled under `cargo fuzz`.
+#[cfg(fuzzing)]
+pub fn fuzz_scrub_elf(data: &[u8]) {
+    linkmap::fuzz_scrub_elf(data);
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::ops::Deref;
