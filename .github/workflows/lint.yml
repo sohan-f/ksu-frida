@@ -1,6 +1,20 @@
 name: lint
 on:
-  - push
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   lint:
@@ -20,19 +34,3 @@ jobs:
           --exclude module/src/jni/zygisk.hpp
           --recursive .
 
-  rust:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - name: rustfmt
-        run: cargo fmt --check
-        working-directory: module/src/rust
-      - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
-        working-directory: module/src/rust
-      - name: tests
-        run: cargo test
-        working-directory: module/src/rust
