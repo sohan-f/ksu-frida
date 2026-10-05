@@ -37,7 +37,7 @@ pub fn loge(msg: impl AsRef<str>) {
 }
 
 pub(crate) fn basename(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
+    path.rsplit_once('/').map(|(_, base)| base).unwrap_or(path)
 }
 
 /// Formats only when verbose is on; avoids allocation otherwise.

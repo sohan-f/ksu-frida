@@ -399,23 +399,22 @@ fn remove_dir(path: &str) -> bool {
 }
 
 fn with_config_suffix(path: &str) -> String {
-    let boundary = path.rfind('/').map_or(0, |slash| slash + 1);
-    let base = &path[boundary..];
-    let Some(dot) = base.rfind(".so") else {
+    let (dir, base) = match path.rsplit_once('/') {
+        Some((dir, base)) => (Some(dir), base),
+        None => (None, path),
+    };
+    let Some((stem, rest)) = base.rsplit_once(".so") else {
         return path.to_string();
     };
-
-    let insert_at = boundary + dot;
-    let mut result = String::with_capacity(path.len() + ".config".len());
-    result.push_str(&path[..insert_at]);
-    result.push_str(".config");
-    result.push_str(&path[insert_at..]);
-    result
+    match dir {
+        Some(dir) => format!("{dir}/{stem}.config.so{rest}"),
+        None => format!("{stem}.config.so{rest}"),
+    }
 }
 
 fn split_lib_path(src_lib_path: &str) -> (&str, &str) {
-    match src_lib_path.rfind('/') {
-        Some(slash) => (&src_lib_path[..slash], &src_lib_path[slash + 1..]),
+    match src_lib_path.rsplit_once('/') {
+        Some((dir, base)) => (dir, base),
         None => (".", src_lib_path),
     }
 }
