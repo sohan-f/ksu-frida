@@ -9,7 +9,7 @@ apply plugin: 'com.android.library'
 apply from: file(rootProject.file('module.gradle'))
 
 def nativeNdkVersion = "29.0.14206865"
-def rustPlatformLevel = "30"
+def rustPlatformLevel = "31"
 
 dependencies {
     implementation 'dev.rikka.ndk.thirdparty:cxx:1.2.0'

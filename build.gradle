@@ -13,9 +13,9 @@ buildscript {
 }
 
 ext {
-    // KernelSU supports Android 10+; NDK r29 libc++ also needs API >= 26 for towctrans/wctrans
-    minSdkVersion = 30
-    compileSdkVersion = 36
+    // Floor is Android 12 (API 31): pidfd_open wrapper is INTRODUCED_IN(31),
+    minSdkVersion = 31
+    compileSdkVersion = 37
 
     outDir = file("$rootDir/out")
 }
