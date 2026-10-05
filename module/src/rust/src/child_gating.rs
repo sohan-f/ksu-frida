@@ -171,6 +171,9 @@ pub fn enable_child_gating(cfg: &ChildGatingConfig, app_name: &str) {
 
     let replacement = fork_replacement as *const () as *mut c_void;
 
+    // Without a published fork origin, a working vfork hook would fail every
+    // spawn, so both hooks stand or fall together.
+    let mut fork_ok = false;
     if fork_addr.is_null() {
         loge("[child_gating] fork address null; skipping fork hook");
     } else {
@@ -178,8 +181,9 @@ pub fn enable_child_gating(cfg: &ChildGatingConfig, app_name: &str) {
         let mut fork_trampoline: *mut c_void = std::ptr::null_mut();
         // SAFETY: `fork_addr` non-null from `dlsym` above, `fork_trampoline` lives in this frame.
         let rc = unsafe { ksufrida_dobby_hook(fork_addr, replacement, &raw mut fork_trampoline) };
-        ORIG_FORK.store(fork_trampoline, Ordering::Release);
         if rc == 0 {
+            ORIG_FORK.store(fork_trampoline, Ordering::Release);
+            fork_ok = true;
             logi("[child_gating] fork hook installed");
         } else {
             loge_fmt(format_args!(
@@ -189,7 +193,9 @@ pub fn enable_child_gating(cfg: &ChildGatingConfig, app_name: &str) {
     }
 
     // Discarded: the vfork hook resumes through the fork trampoline above.
-    if vfork_addr.is_null() {
+    if !fork_ok {
+        loge("[child_gating] skipping vfork hook without a fork origin");
+    } else if vfork_addr.is_null() {
         loge("[child_gating] vfork address null; skipping vfork hook");
     } else {
         let mut vfork_trampoline: *mut c_void = std::ptr::null_mut();

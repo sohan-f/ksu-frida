@@ -38,7 +38,14 @@ pub fn check_and_inject(app_name: &str) -> bool {
         return false;
     }
 
-    thread::spawn(move || inject_libs(&cfg, pid));
+    if std::thread::Builder::new()
+        .name("ksufrida-inject".to_string())
+        .spawn(move || inject_libs(&cfg, pid))
+        .is_err()
+    {
+        loge_fmt(format_args!("Thread spawn failed for {app_name}"));
+        return false;
+    }
 
     true
 }

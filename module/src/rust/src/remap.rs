@@ -283,6 +283,7 @@ enum RelocateError {
     Allocate(io::Error),
     Protect(io::Error),
     Commit(io::Error),
+    Restore(io::Error),
 }
 
 /// # Safety
@@ -356,22 +357,16 @@ unsafe fn relocate_segment(
             return Err(RelocateError::Commit(err));
         }
 
-        let restore_error = if libc::mprotect(address, size, perms) != 0 {
-            Some(io::Error::last_os_error())
-        } else {
-            None
-        };
+        if libc::mprotect(address, size, perms) != 0 {
+            let err = io::Error::last_os_error();
+            end_rebuild();
+            return Err(RelocateError::Restore(err));
+        }
 
         // Grace with the range still published: late-delivered faults must still observe it.
         std::thread::sleep(std::time::Duration::from_millis(5));
 
         end_rebuild();
-
-        if let Some(err) = restore_error {
-            loge_fmt(format_args!(
-                "remap: cannot restore protections on {path}: {err}"
-            ));
-        }
     }
 
     Ok(map)
@@ -446,6 +441,12 @@ fn remap_matches(query: &str) {
             }
             Err(RelocateError::Commit(e)) => {
                 loge_fmt(format_args!("mremap failed: {e}"));
+            }
+            Err(RelocateError::Restore(e)) => {
+                loge_fmt(format_args!(
+                    "remap: cannot restore protections on {}: {e}",
+                    info.path
+                ));
             }
         }
     }
