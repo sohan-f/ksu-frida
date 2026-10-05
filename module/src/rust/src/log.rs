@@ -14,14 +14,14 @@ fn log_enabled_for(path: &std::path::Path) -> bool {
 }
 
 #[cfg(target_os = "android")]
-fn verbose() -> bool {
+pub(crate) fn verbose() -> bool {
     // First-log wins: caching avoids a filesystem probe on every log line.
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| log_enabled_for(std::path::Path::new(VERBOSE_PATH)))
 }
 
 #[cfg(not(target_os = "android"))]
-fn verbose() -> bool {
+pub(crate) fn verbose() -> bool {
     true
 }
 

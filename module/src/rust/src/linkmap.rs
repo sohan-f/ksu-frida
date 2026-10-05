@@ -46,13 +46,7 @@ unsafe extern "C" fn scrub_callback(
         let name = CStr::from_ptr((*info).name);
         (name.to_bytes(), &mut *(data.cast::<ScrubSearch>()))
     };
-    let matched = if search.substring {
-        current
-            .windows(search.target.len().max(1))
-            .any(|w| w == search.target.as_slice())
-    } else {
-        current == search.target.as_slice()
-    };
+    let matched = entry_matches(current, &search.target, search.substring);
     if !matched {
         return 0;
     }
@@ -74,6 +68,62 @@ unsafe extern "C" fn scrub_callback(
     search.found = true;
     // Stop at the first match; each staged lib rescans, so later calls converge on later entries.
     1
+}
+
+fn entry_matches(current: &[u8], target: &[u8], substring: bool) -> bool {
+    if substring {
+        // `windows(0)` panics; a longer needle yields no windows.
+        current.windows(target.len().max(1)).any(|w| w == target)
+    } else {
+        current == target
+    }
+}
+
+struct VisibleSearch {
+    target: Vec<u8>,
+    substring: bool,
+    leaked: bool,
+}
+
+/// Read-only walk like [`scrub_callback`], but visits every entry: `scrub`
+/// stops at the first match, so a later duplicate would survive it.
+unsafe extern "C" fn verify_callback(
+    info: *mut DlPhdrInfo,
+    size: usize,
+    data: *mut c_void,
+) -> c_int {
+    // Only `dlpi_name` is read; it predates every later field.
+    if size < std::mem::offset_of!(DlPhdrInfo, name) + size_of::<*const c_char>() {
+        return 0;
+    }
+    // SAFETY: the linker hands the callback a valid entry; `data` is our
+    // search struct, alive for the whole synchronous walk.
+    let (current, search) = unsafe {
+        let name = CStr::from_ptr((*info).name);
+        (name.to_bytes(), &mut *(data.cast::<VisibleSearch>()))
+    };
+    if entry_matches(current, &search.target, search.substring) {
+        search.leaked = true;
+    }
+    0
+}
+
+/// Reports whether any linker entry still shows `target`.
+pub fn is_linker_visible(target: &str, substring: bool) -> bool {
+    let mut search = VisibleSearch {
+        target: target.as_bytes().to_vec(),
+        substring,
+        leaked: false,
+    };
+    // SAFETY: `verify_callback` matches the `DlIterateCb` signature; `search`
+    // outlives the synchronous walk.
+    unsafe {
+        dl_iterate_phdr(
+            verify_callback as DlIterateCb,
+            std::ptr::from_mut(&mut search).cast::<c_void>(),
+        );
+    }
+    search.leaked
 }
 
 const PT_DYNAMIC: u32 = 2;
@@ -667,6 +717,32 @@ mod tests {
         assert!(!search.found);
     }
 
+    #[test]
+    fn entry_match_covers_exact_and_substring() {
+        assert!(entry_matches(b"/a/b.so", b"/a/b.so", false));
+        assert!(!entry_matches(b"/a/b.so", b"/a/c.so", false));
+        assert!(!entry_matches(b"/a/b.so", b"", false));
+        assert!(entry_matches(
+            b"/memfd:jit-cache (deleted)",
+            b"jit-cache",
+            true
+        ));
+        assert!(!entry_matches(b"/system/lib/libc.so", b"jit-cache", true));
+        assert!(!entry_matches(b"abc", b"", true));
+        assert!(!entry_matches(b"short", b"much longer needle", true));
+        assert!(!entry_matches(b"short", b"much longer needle", false));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // dl_iterate_phdr(3) has no Miri shim
+    fn verify_walk_finds_libc_and_misses_absent_names() {
+        assert!(is_linker_visible("libc.so", true));
+        assert!(!is_linker_visible(
+            "definitely-absent-ksufrida-xyz.so",
+            false
+        ));
+        assert!(!is_linker_visible("definitely-absent-ksufrida-xyz", true));
+    }
     #[test]
     fn frida_match_is_case_insensitive_substring() {
         assert!(contains_frida(b"frida_agent_main"));

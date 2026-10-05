@@ -649,6 +649,29 @@ fn hide_or_show(lib_path: &str, log_context: &str, hide_maps: bool) {
         ));
     }
     scrub_dlpi_name(lib_path);
+    verify_hiding(lib_path, log_context, hide_maps);
+}
+
+fn verify_hiding(lib_path: &str, log_context: &str, hide_maps: bool) {
+    // Advisory only: expected-visible when hiding is off, and skipped
+    // entirely when quiet so the default path pays nothing.
+    if !hide_maps || !crate::log::verbose() {
+        return;
+    }
+    let base = basename(lib_path);
+    // Linker first (in-memory walk), maps second (file scan); scrub stops at
+    // the first match, so only a full walk catches a surviving duplicate.
+    if crate::linkmap::is_linker_visible(lib_path, false) {
+        loge_fmt(format_args!(
+            "{log_context}Hide verify LEAK (linker) for {base}"
+        ));
+    } else if crate::remap::maps_show(base) {
+        loge_fmt(format_args!(
+            "{log_context}Hide verify LEAK (maps) for {base}"
+        ));
+    } else {
+        logi_fmt(format_args!("{log_context}Hide verify clean for {base}"));
+    }
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -662,6 +685,26 @@ fn hide_or_show_memfd(log_context: &str, hide_maps: bool) {
         logi_fmt(format_args!("{log_context}Map hiding disabled for memfd"));
     }
     scrub_memfd();
+    verify_hiding_memfd(log_context, hide_maps);
+}
+
+#[cfg(any(target_os = "android", test))]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn verify_hiding_memfd(log_context: &str, hide_maps: bool) {
+    if !hide_maps || !crate::log::verbose() {
+        return;
+    }
+    if crate::linkmap::is_linker_visible(crate::sys::MEMFD_NAME, true) {
+        loge_fmt(format_args!(
+            "{log_context}Hide verify LEAK (linker) for memfd"
+        ));
+    } else if crate::remap::maps_show(crate::sys::MEMFD_NAME) {
+        loge_fmt(format_args!(
+            "{log_context}Hide verify LEAK (maps) for memfd"
+        ));
+    } else {
+        logi_fmt(format_args!("{log_context}Hide verify clean for memfd"));
+    }
 }
 
 #[cfg(any(target_os = "android", test))]

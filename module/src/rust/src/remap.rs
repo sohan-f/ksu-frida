@@ -395,6 +395,10 @@ pub fn remap_lib(lib_path: &str) {
     remap_matches(basename(lib_path));
 }
 
+pub(crate) fn maps_show(query: &str) -> bool {
+    !get_modules_by_name(query).is_empty()
+}
+
 /// Remap memfd segments (`/memfd:dalvik-jit-cache`). The linker does not keep the
 /// source path for fd loads, so basename matching misses them.
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
