@@ -4,36 +4,19 @@
 mod child_gating;
 mod config;
 mod inject;
+mod jni;
 mod linkmap;
 mod log;
 mod remap;
 mod sys;
 mod xdl;
 
-use std::ffi::{CStr, c_char};
+pub use jni::ksufrida_handle_app;
 
 // Exposes config parsing to the cargo-fuzz harness; only compiled under `cargo fuzz`.
 #[cfg(fuzzing)]
 pub fn fuzz_parse_config(module_dir: &str, app_name: &str) -> Option<String> {
     config::load_config(module_dir, app_name).map(|cfg| cfg.app_name)
-}
-
-/// Returns true when the caller must keep the module loaded.
-///
-/// # Safety
-/// `app_name` must be null or a valid NUL-terminated C string.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ksufrida_check_and_inject(app_name: *const c_char) -> bool {
-    if app_name.is_null() {
-        return false;
-    }
-    // Fail closed: a panic must never unwind into the Zygisk host.
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // SAFETY: null-checked above; the caller guarantees a valid NUL-terminated string.
-        let app_name = unsafe { CStr::from_ptr(app_name) }.to_string_lossy();
-        inject::check_and_inject(&app_name)
-    }))
-    .unwrap_or(false)
 }
 
 #[cfg(test)]

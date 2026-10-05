@@ -6,7 +6,7 @@ using zygisk::Api;
 using zygisk::AppSpecializeArgs;
 using zygisk::ServerSpecializeArgs;
 
-extern "C" bool ksufrida_check_and_inject(const char *app_name);
+extern "C" bool ksufrida_handle_app(JNIEnv *env, jstring name);
 
 class MyModule : public zygisk::ModuleBase {
  public:
@@ -16,24 +16,11 @@ class MyModule : public zygisk::ModuleBase {
     }
 
     void postAppSpecialize(const AppSpecializeArgs *args) override {
-        // Both pointers can be null (OOM).
-        if (args == nullptr || args->nice_name == nullptr) {
-            this->api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+        const jstring name = (args != nullptr) ? args->nice_name : nullptr;
+        if (this->api == nullptr) {
             return;
         }
-
-        const char *raw_app_name = env->GetStringUTFChars(args->nice_name, nullptr);
-        if (raw_app_name == nullptr) {
-            env->ExceptionClear();
-            this->api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
-            return;
-        }
-
-        // The JNI pointer stays valid until released; the Rust side copies it synchronously.
-        bool keep = ksufrida_check_and_inject(raw_app_name);
-        this->env->ReleaseStringUTFChars(args->nice_name, raw_app_name);
-
-        if (!keep) {
+        if (!ksufrida_handle_app(this->env, name)) {
             this->api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
         }
     }
@@ -44,8 +31,8 @@ class MyModule : public zygisk::ModuleBase {
     }
 
  private:
-    Api *api;
-    JNIEnv *env;
+    Api *api = nullptr;
+    JNIEnv *env = nullptr;
 };
 
 REGISTER_ZYGISK_MODULE(MyModule)
