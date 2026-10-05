@@ -1,3 +1,12 @@
+# v2.10.0
+- Pinned the Frida gadget version with SHA-256 verification at build time and on-device updates
+- Required explicit confirmation before installing unverified gadget downloads
+- Verified every module file by hash during install and warned on hashless boot installs
+- Rejected unknown child gating modes and capped the startup delay at 60 seconds
+- Renewed the WebUI interface with status feedback and desktop preview support
+- Raised the minimum Android version to 12 (API 31) and updated the linker for Android 16/17 compatibility
+- Skipped injection in system_server and aborted install on unsupported platforms
+
 # v1.9.39
 - Fixed memfd linker scrub/remap miss (matched source path instead of memfd entry)
 - Remap now skips shared mappings and dedupes by address; memfd renamed to blend with ART JIT
