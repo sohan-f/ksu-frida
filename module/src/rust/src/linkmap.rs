@@ -343,8 +343,8 @@ unsafe fn scrub_elf_metadata(info: *mut DlPhdrInfo, replacement: &[u8]) -> (bool
     let gnu_hash = base.wrapping_add(gnu_hash);
 
     let nsyms = if hash != base {
-        // SAFETY: `hash` names our own read-only table; two `u32` reads.
-        unsafe { (hash as *const u32).add(1).read() as usize }
+        // SAFETY: `hash` names our own read-only table; unaligned-safe `u32` reads.
+        unsafe { (hash as *const u32).add(1).read_unaligned() as usize }
     } else if gnu_hash != base {
         // SAFETY: `gnu_hash` names our own read-only table; the callee
         // bounds every read by the header counts below.
@@ -373,13 +373,13 @@ unsafe fn scrub_elf_metadata(info: *mut DlPhdrInfo, replacement: &[u8]) -> (bool
 /// `table` must address a readable `DT_GNU_HASH` table of our own image;
 /// every read below stays inside its header, buckets, and chains.
 unsafe fn gnu_nsyms(table: usize) -> usize {
-    // SAFETY: header of our own table; four `u32` reads.
+    // SAFETY: header of our own table; unaligned-safe `u32` reads.
     let (nbuckets, symoffset, bloom_words) = unsafe {
         let header = table as *const u32;
         (
-            header.read() as usize,
-            header.add(1).read() as usize,
-            header.add(2).read() as usize,
+            header.read_unaligned() as usize,
+            header.add(1).read_unaligned() as usize,
+            header.add(2).read_unaligned() as usize,
         )
     };
     if nbuckets == 0 || nbuckets > MAX_SYMBOLS {
@@ -400,14 +400,14 @@ unsafe fn gnu_nsyms(table: usize) -> usize {
     let mut budget = MAX_SYMBOLS;
     let mut highest = symoffset;
     for i in 0..nbuckets {
-        // SAFETY: `i` bounded by the header count; one bucket read per step.
-        let mut sym = unsafe { ((buckets as *const u32).add(i)).read() as usize };
+        // SAFETY: `i` bounded by the header count; one unaligned bucket read per step.
+        let mut sym = unsafe { ((buckets as *const u32).add(i)).read_unaligned() as usize };
         if sym < symoffset || sym >= limit {
             continue;
         }
         while budget > 0 && sym < limit {
-            // SAFETY: `sym` bounded above; one chain word per step.
-            let word = unsafe { ((chain as *const u32).add(sym - symoffset)).read() };
+            // SAFETY: `sym` bounded above; one unaligned chain word per step.
+            let word = unsafe { ((chain as *const u32).add(sym - symoffset)).read_unaligned() };
             budget -= 1;
             highest = highest.max(sym + 1);
             if word & 1 == 1 {
@@ -426,7 +426,7 @@ fn run_scrub(search: &mut ScrubSearch) {
     unsafe {
         dl_iterate_phdr(
             scrub_callback as DlIterateCb,
-            (search as *mut ScrubSearch).cast::<c_void>(),
+            std::ptr::from_mut(search).cast::<c_void>(),
         );
     }
 }
@@ -558,12 +558,12 @@ mod tests {
             symbols: 0,
             substring: false,
         };
-        let data = (&mut search as *mut ScrubSearch).cast::<c_void>();
+        let data = (&raw mut search).cast::<c_void>();
 
         // SAFETY: both entries are live owned strings; `search` outlives them.
         unsafe {
-            assert_eq!(scrub_callback(&mut first_entry, 0, data), 0);
-            assert_eq!(scrub_callback(&mut second_entry, 0, data), 1);
+            assert_eq!(scrub_callback(&raw mut first_entry, 0, data), 0);
+            assert_eq!(scrub_callback(&raw mut second_entry, 0, data), 1);
         }
 
         assert!(search.found);
@@ -607,11 +607,7 @@ mod tests {
         // SAFETY: as above.
         unsafe {
             assert_eq!(
-                scrub_callback(
-                    &mut only_entry,
-                    0,
-                    (&mut search as *mut ScrubSearch).cast::<c_void>()
-                ),
+                scrub_callback(&raw mut only_entry, 0, (&raw mut search).cast::<c_void>()),
                 0
             );
         }
@@ -647,11 +643,7 @@ mod tests {
         // SAFETY: entry is a live owned string; `search` outlives the call.
         unsafe {
             assert_eq!(
-                scrub_callback(
-                    &mut memfd_entry,
-                    0,
-                    (&mut search as *mut ScrubSearch).cast::<c_void>()
-                ),
+                scrub_callback(&raw mut memfd_entry, 0, (&raw mut search).cast::<c_void>()),
                 1
             );
         }
@@ -751,7 +743,8 @@ mod tests {
         };
         // SAFETY: `info` describes the fake image above; the replacement
         // fits every footprint it can touch.
-        let (soname_done, symbols) = unsafe { scrub_elf_metadata(&mut info, b"libnative_1.so") };
+        let (soname_done, symbols) =
+            unsafe { scrub_elf_metadata(&raw mut info, b"libnative_1.so") };
         // SAFETY: read-only checks of our own page (perms restored to R).
         // (Strings live at `strtab_off + off`, not bare `off`.)
         unsafe {
@@ -863,7 +856,8 @@ mod tests {
         };
         // SAFETY: `info` describes the fake image above; the replacement
         // fits every footprint it can touch.
-        let (soname_done, symbols) = unsafe { scrub_elf_metadata(&mut info, b"libnative_1.so") };
+        let (soname_done, symbols) =
+            unsafe { scrub_elf_metadata(&raw mut info, b"libnative_1.so") };
         // SAFETY: read-only checks of our own page (perms restored to R).
         unsafe {
             let at =

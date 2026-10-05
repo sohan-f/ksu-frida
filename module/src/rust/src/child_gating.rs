@@ -369,7 +369,7 @@ mod tests {
 
         let mut status = 0;
         // SAFETY: `child` is a live child of this process and `status` is a valid output slot.
-        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert_eq!(unsafe { libc::waitpid(child, &raw mut status, 0) }, child);
 
         ATEXIT_PROBE_FD.store(-1, Ordering::Relaxed);
         ORIG_FORK.store(std::ptr::null_mut(), Ordering::Release);
@@ -404,12 +404,12 @@ mod tests {
         thread::sleep(Duration::from_millis(200));
         let mut status = 0;
         // SAFETY: `WNOHANG` reaps only if the child already exited.
-        let seen = unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) };
+        let seen = unsafe { libc::waitpid(child, &raw mut status, libc::WNOHANG) };
         if seen == 0 {
             // SAFETY: the child is ours and still running.
             unsafe { libc::kill(child, libc::SIGKILL) };
             // SAFETY: blocking reap of our own child.
-            unsafe { libc::waitpid(child, &mut status, 0) };
+            unsafe { libc::waitpid(child, &raw mut status, 0) };
         }
 
         assert_eq!(seen, 0, "the freeze child exited early");

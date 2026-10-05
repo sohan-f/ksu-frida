@@ -134,7 +134,7 @@ fn open_dst_hardened(dst: &str) -> Option<File> {
             resolve: crate::sys::RESOLVE_NO_SYMLINKS | crate::sys::RESOLVE_NO_MAGICLINKS,
         };
         // SAFETY: `c_path` live, `how` fully init; fd checked below.
-        let fd = unsafe { crate::sys::openat2(libc::AT_FDCWD, c_path.as_ptr(), &how) };
+        let fd = unsafe { crate::sys::openat2(libc::AT_FDCWD, c_path.as_ptr(), &raw const how) };
         if fd >= 0 {
             // SAFETY: fd is ours from openat2 above.
             return Some(unsafe { File::from_raw_fd(fd) });
@@ -187,7 +187,7 @@ fn copy_file(src: &str, dst: &str) -> bool {
         // SAFETY: `zeroed` stat as an output slot; no invariants yet.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: `fstat` on our own open fd writes only into `st` above.
-        if unsafe { libc::fstat(output.as_raw_fd(), &mut st) } != 0 {
+        if unsafe { libc::fstat(output.as_raw_fd(), &raw mut st) } != 0 {
             loge_fmt(format_args!(
                 "stage: fstat dst failed: {dst}: {}",
                 io::Error::last_os_error()
@@ -271,6 +271,7 @@ fn copy_file_range_all(
     RangeOutcome::Done
 }
 
+#[allow(clippy::large_stack_arrays)]
 fn copy_file_loop(
     input: &mut File,
     output: &mut File,
@@ -279,6 +280,7 @@ fn copy_file_loop(
     already: u64,
     src_len: u64,
 ) -> bool {
+    // Stack avoids post-fork malloc; bench shows heap has no win.
     let mut buf = [0u8; 65536];
     let mut copied: u64 = already;
     loop {
@@ -336,7 +338,7 @@ fn ensure_dir(path: &str, mode: libc::mode_t) -> bool {
     // SAFETY: `zeroed` stat as an output slot; no invariants yet.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: `lstat` on our NUL-terminated path writes only into `st` above.
-    if unsafe { libc::lstat(c_path.as_ptr(), &mut st) } != 0 {
+    if unsafe { libc::lstat(c_path.as_ptr(), &raw mut st) } != 0 {
         loge_fmt(format_args!(
             "stage: stat {path} failed: {}",
             io::Error::last_os_error()
@@ -1061,7 +1063,7 @@ mod tests {
         }
         let mut status = 0;
         // SAFETY: `pid` is our child; blocking reap of exactly it.
-        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert_eq!(unsafe { libc::waitpid(pid, &raw mut status, 0) }, pid);
         pid
     }
 

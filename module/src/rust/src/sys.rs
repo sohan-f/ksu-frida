@@ -292,7 +292,7 @@ mod tests {
         }
         let mut status = 0;
         // SAFETY: `pid` is our child; blocking reap of exactly it.
-        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert_eq!(unsafe { libc::waitpid(pid, &raw mut status, 0) }, pid);
         let fd = pidfd_open(pid, 0);
         if fd >= 0 {
             // SAFETY: fd is ours from above.

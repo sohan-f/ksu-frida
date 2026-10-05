@@ -203,7 +203,7 @@ fn install_fault_retry() -> FaultRetry {
         // SAFETY: output buffer for the query below; zeroed is valid padding-initialised state.
         let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
         // SAFETY: query-only call (`act == NULL`); fills the buffer above.
-        if unsafe { libc::sigaction(sig, std::ptr::null(), &mut current) } != 0 {
+        if unsafe { libc::sigaction(sig, std::ptr::null(), &raw mut current) } != 0 {
             loge_fmt(format_args!(
                 "fault retry: cannot read handler for signal {sig}: {}",
                 io::Error::last_os_error()
@@ -225,7 +225,7 @@ fn install_fault_retry() -> FaultRetry {
         action.sa_sigaction = park_or_forward as *const () as usize;
         action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
         // SAFETY: installs the fully initialised `action` above; the kernel copies it synchronously.
-        if unsafe { libc::sigaction(sig, &action, std::ptr::null_mut()) } != 0 {
+        if unsafe { libc::sigaction(sig, &raw const action, std::ptr::null_mut()) } != 0 {
             loge_fmt(format_args!(
                 "fault retry: cannot install handler for signal {sig}: {}",
                 io::Error::last_os_error()
@@ -248,7 +248,7 @@ impl Drop for FaultRetry {
             // SAFETY: output buffer for the restore-time query below.
             let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
             // SAFETY: query-only call (`act == NULL`).
-            if unsafe { libc::sigaction(sig, std::ptr::null(), &mut current) } != 0 {
+            if unsafe { libc::sigaction(sig, std::ptr::null(), &raw mut current) } != 0 {
                 continue;
             }
             if current.sa_sigaction as usize != park_or_forward as *const () as usize {
@@ -256,7 +256,7 @@ impl Drop for FaultRetry {
             }
 
             // SAFETY: only reached when the current handler is still ours; `previous` was saved at install time for this process.
-            unsafe { libc::sigaction(sig, &self.previous[index], std::ptr::null_mut()) };
+            unsafe { libc::sigaction(sig, &raw const self.previous[index], std::ptr::null_mut()) };
         }
         REBUILDER_TID.store(0, Ordering::Relaxed);
     }
@@ -556,7 +556,7 @@ mod tests {
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
         assert_eq!(
             // SAFETY: query-only call (`act == NULL`); fills the buffer above.
-            unsafe { libc::sigaction(sig, std::ptr::null(), &mut action) },
+            unsafe { libc::sigaction(sig, std::ptr::null(), &raw mut action) },
             0
         );
         action.sa_sigaction as usize
