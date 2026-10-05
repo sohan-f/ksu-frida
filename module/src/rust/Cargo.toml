@@ -22,3 +22,5 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 [profile.release]
 lto = true
 codegen-units = 1
+# Unwind (the default) is load-bearing: catch_unwind guards both FFI
+# boundaries (jni.rs, child_gating.rs), so never set panic = "abort".

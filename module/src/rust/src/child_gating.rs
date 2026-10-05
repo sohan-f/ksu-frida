@@ -59,8 +59,8 @@ fn enable_atfork_reset() {
     });
 }
 
-// Kill/Freeze/Pass must not allocate or log: the child inherits every lock held at fork time.
-// Inject reuses parent-prepared strings, empty context, no logging; dlopen itself is best-effort.
+// Kill/Freeze/Pass allocate nothing and log nothing: the child inherits every lock held at fork time.
+// Inject reuses parent-prepared strings but still stages, logs, and dlopens, so it stays best-effort.
 fn run_child_action(action: ChildMode, libraries: &[String], app_name: &str) -> libc::pid_t {
     match action {
         ChildMode::Kill => {

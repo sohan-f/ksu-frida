@@ -20,11 +20,19 @@ pub enum ChildMode {
 
 impl ChildMode {
     pub(crate) fn parse(mode: &str) -> Option<Self> {
+        mode.parse().ok()
+    }
+}
+
+impl std::str::FromStr for ChildMode {
+    type Err = ();
+
+    fn from_str(mode: &str) -> Result<Self, Self::Err> {
         match mode {
-            "kill" => Some(Self::Kill),
-            "freeze" => Some(Self::Freeze),
-            "inject" => Some(Self::Inject),
-            _ => None,
+            "kill" => Ok(Self::Kill),
+            "freeze" => Ok(Self::Freeze),
+            "inject" => Ok(Self::Inject),
+            _ => Err(()),
         }
     }
 }
@@ -115,17 +123,30 @@ fn deserialize_child_gating_config(value: &Value) -> Option<ChildGatingConfig> {
     Some(result)
 }
 
-// Optional bool field: missing keeps the default, wrong types reject the target.
-fn opt_bool(obj: &serde_json::Map<String, Value>, key: &str) -> Option<Option<bool>> {
+// Optional field: missing keeps the default, wrong types reject the target.
+fn opt_value<T>(
+    obj: &serde_json::Map<String, Value>,
+    key: &str,
+    kind: &str,
+    convert: impl FnOnce(&Value) -> Option<T>,
+) -> Option<Option<T>> {
     let value = match obj.get(key) {
         None => return Some(None),
         Some(value) => value,
     };
-    let Some(b) = value.as_bool() else {
-        loge_fmt(format_args!("invalid config: expected {key} to be a bool"));
+    let Some(v) = convert(value) else {
+        loge_fmt(format_args!("invalid config: expected {key} to be {kind}"));
         return None;
     };
-    Some(Some(b))
+    Some(Some(v))
+}
+
+fn opt_bool(obj: &serde_json::Map<String, Value>, key: &str) -> Option<Option<bool>> {
+    opt_value(obj, key, "a bool", Value::as_bool)
+}
+
+fn opt_u64(obj: &serde_json::Map<String, Value>, key: &str) -> Option<Option<u64>> {
+    opt_value(obj, key, "an uint64", Value::as_u64)
 }
 
 fn deserialize_target_config(value: &Value) -> Option<TargetConfig> {
@@ -151,11 +172,7 @@ fn deserialize_target_config(value: &Value) -> Option<TargetConfig> {
         result.kernel_assisted_evasion = kernel_assisted_evasion;
     }
 
-    if let Some(start_up_delay_ms) = obj.get("start_up_delay_ms") {
-        let Some(start_up_delay_ms) = start_up_delay_ms.as_u64() else {
-            loge("expected config target start_up_delay_ms to be an uint64");
-            return None;
-        };
+    if let Some(start_up_delay_ms) = opt_u64(obj, "start_up_delay_ms")? {
         result.start_up_delay_ms = start_up_delay_ms.min(MAX_START_UP_DELAY_MS);
     }
 

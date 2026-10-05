@@ -488,27 +488,24 @@ fn sweep_stale_stage_dirs(cache_dir: &str) {
     }
 }
 
-fn cache_dir_for(app_name: &str) -> String {
+fn cache_dir_for(app_name: &str) -> Option<String> {
     let pkg = package_of(app_name);
     for base in ["/data/user/0", "/data/data"] {
         let dir = format!("{base}/{pkg}/.cache");
         if ensure_dir(&dir, 0o700) {
-            return dir;
+            return Some(dir);
         }
     }
-    String::new()
+    None
 }
 
-fn stage_gadget(app_name: &str, src_lib_path: &str) -> String {
-    let cache_dir = cache_dir_for(app_name);
-    if cache_dir.is_empty() {
-        return String::new();
-    }
+fn stage_gadget(app_name: &str, src_lib_path: &str) -> Option<String> {
+    let cache_dir = cache_dir_for(app_name)?;
     sweep_stale_stage_dirs(&cache_dir);
     // SAFETY: `getpid(2)` cannot fail.
     let stage_dir = format!("{cache_dir}/{}", unsafe { libc::getpid() });
     if !ensure_dir(&stage_dir, 0o700) {
-        return String::new();
+        return None;
     }
 
     let (src_dir, lib_name) = split_lib_path(src_lib_path);
@@ -526,13 +523,13 @@ fn stage_gadget(app_name: &str, src_lib_path: &str) -> String {
         remove_file(&dst_lib);
         remove_file(&dst_cfg);
         remove_dir(&stage_dir);
-        return String::new();
+        return None;
     }
 
     if !copy_file(&src_cfg, &dst_cfg) {
         remove_file(&dst_cfg);
     }
-    dst_lib
+    Some(dst_lib)
 }
 
 fn unlink_staged(staged_lib_path: &str) {
@@ -754,23 +751,19 @@ pub(crate) fn stage_and_inject(
     if try_memfd_inject(lib_path, log_context, hide_maps) {
         return;
     }
-    let staged = if stage {
+    let staged: Option<String> = if stage {
         stage_gadget(app_name, lib_path)
     } else {
         logi_fmt(format_args!("{log_context}Staging skipped for {lib_path}"));
-        String::new()
+        None
     };
-    let inject_path = if staged.is_empty() {
-        if stage {
-            loge_fmt(format_args!(
-                "{log_context}Staging {} failed; falling back to the raw path",
-                basename(lib_path)
-            ));
-        }
-        lib_path
-    } else {
-        &staged
-    };
+    if staged.is_none() && stage {
+        loge_fmt(format_args!(
+            "{log_context}Staging {} failed; falling back to the raw path",
+            basename(lib_path)
+        ));
+    }
+    let inject_path = staged.as_deref().unwrap_or(lib_path);
 
     logi_fmt(format_args!(
         "{log_context}Injecting {}",
@@ -778,8 +771,8 @@ pub(crate) fn stage_and_inject(
     ));
     inject_lib(inject_path, log_context, hide_maps);
 
-    if !staged.is_empty() {
-        unlink_staged(&staged);
+    if let Some(staged) = staged.as_deref() {
+        unlink_staged(staged);
     }
 }
 

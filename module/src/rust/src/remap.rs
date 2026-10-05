@@ -1,15 +1,18 @@
 use std::ffi::c_void;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 use libc::{self, c_int};
 
-use crate::log::{loge_fmt, logi, logi_fmt};
+use crate::log::{basename, loge_fmt, logi, logi_fmt};
 
 const GUARDED_SIGNALS: [c_int; 2] = [libc::SIGSEGV, libc::SIGBUS];
 
-static PREVIOUS_HANDLER: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
+static PREVIOUS_HANDLER: [AtomicPtr<c_void>; 2] = [
+    AtomicPtr::new(std::ptr::null_mut()),
+    AtomicPtr::new(std::ptr::null_mut()),
+];
 static PREVIOUS_FLAGS: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
 
 static IN_FLIGHT_START: AtomicUsize = AtomicUsize::new(0);
@@ -140,7 +143,7 @@ unsafe fn forward_fault(sig: c_int, info: *mut libc::siginfo_t, context: *mut c_
     };
 
     let handler = PREVIOUS_HANDLER[index].load(Ordering::Relaxed);
-    if handler == libc::SIG_DFL || handler == libc::SIG_IGN {
+    if handler.addr() == libc::SIG_DFL || handler.addr() == libc::SIG_IGN {
         // SAFETY: plain `signal(2)`/`raise(2)` on the faulting thread; the pending signal is delivered before we return to it.
         unsafe {
             libc::signal(sig, libc::SIG_DFL);
@@ -216,7 +219,10 @@ fn install_fault_retry() -> FaultRetry {
             continue;
         }
 
-        PREVIOUS_HANDLER[index].store(current.sa_sigaction as usize, Ordering::Relaxed);
+        PREVIOUS_HANDLER[index].store(
+            std::ptr::with_exposed_provenance_mut(current.sa_sigaction),
+            Ordering::Relaxed,
+        );
         PREVIOUS_FLAGS[index].store(current.sa_flags as usize, Ordering::Relaxed);
         retry.previous[index] = current;
 
@@ -385,12 +391,7 @@ fn tag_anon(address: *mut c_void, size: usize) {
 }
 
 pub fn remap_lib(lib_path: &str) {
-    let lib_name = match lib_path.rfind('/') {
-        Some(slash) => &lib_path[slash + 1..],
-        None => lib_path,
-    };
-
-    remap_matches(lib_name);
+    remap_matches(basename(lib_path));
 }
 
 /// Remap memfd segments (`/memfd:dalvik-jit-cache`). The linker does not keep the
