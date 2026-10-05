@@ -36,6 +36,10 @@ pub fn loge(msg: impl AsRef<str>) {
     }
 }
 
+pub(crate) fn basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
 /// Formats only when verbose is on; avoids allocation otherwise.
 pub fn logi_fmt(args: std::fmt::Arguments<'_>) {
     if verbose() {
@@ -64,17 +68,25 @@ fn log(prio: c_int, msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDir;
 
     #[test]
     fn verbose_flag_follows_file_existence() {
-        let dir = std::env::temp_dir().join(format!("ksufrida-verbose-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("verbose");
         let flag = dir.join("verbose");
 
         assert!(!log_enabled_for(&flag));
         std::fs::write(&flag, b"").unwrap();
         assert!(log_enabled_for(&flag));
+    }
 
-        std::fs::remove_dir_all(&dir).ok();
+    #[test]
+    fn basename_keeps_the_final_component() {
+        assert_eq!(
+            basename("/data/local/tmp/libsec/libsecmon.so"),
+            "libsecmon.so"
+        );
+        assert_eq!(basename("libsecmon.so"), "libsecmon.so");
+        assert_eq!(basename(""), "");
     }
 }

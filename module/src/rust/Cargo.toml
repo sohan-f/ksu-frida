@@ -1,6 +1,8 @@
 [package]
 name = "ksufrida-rust"
 version = "0.1.0"
+# Verified toolchain floor; the final `.so` strip happens in AGP, not here.
+rust-version = "1.99"
 edition = "2024"
 description = "KsuFrida core logic (config, injection, remapping, child gating) as a staticlib linked into libzygiskfrida.so"
 publish = false

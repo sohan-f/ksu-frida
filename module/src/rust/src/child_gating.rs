@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use crate::config::ChildGatingConfig;
+use crate::config::{ChildGatingConfig, ChildMode};
 use crate::inject::stage_and_inject;
 use crate::log::{loge, loge_fmt, logi, logi_fmt};
 use crate::sys::{RTLD_DEFAULT, dlsym, set_errno};
@@ -13,7 +13,7 @@ type ForkFn = unsafe extern "C" fn() -> libc::pid_t;
 // Null until the Release store in `enable_child_gating` publishes the trampoline.
 static ORIG_FORK: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
-static CHILD_GATING_MODE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static CHILD_GATING_MODE: std::sync::OnceLock<ChildMode> = std::sync::OnceLock::new();
 static INJECTED_LIBRARIES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 // Parent cmdline at enable time, COW-visible in fork child: avoids /proc re-read post-fork.
 static GATING_APP_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -59,35 +59,18 @@ fn enable_atfork_reset() {
     });
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum ChildAction {
-    Kill,
-    Freeze,
-    Inject,
-    Pass,
-}
-
-fn child_action(mode: &str) -> ChildAction {
-    match mode {
-        "kill" => ChildAction::Kill,
-        "freeze" => ChildAction::Freeze,
-        "inject" => ChildAction::Inject,
-        _ => ChildAction::Pass,
-    }
-}
-
 // Kill/Freeze/Pass must not allocate or log: the child inherits every lock held at fork time.
 // Inject reuses parent-prepared strings, empty context, no logging; dlopen itself is best-effort.
-fn run_child_action(action: ChildAction, libraries: &[String], app_name: &str) -> libc::pid_t {
+fn run_child_action(action: ChildMode, libraries: &[String], app_name: &str) -> libc::pid_t {
     match action {
-        ChildAction::Kill => {
+        ChildMode::Kill => {
             // SAFETY: `_exit(2)` takes a plain status and never returns.
             unsafe { libc::_exit(0) }
         }
-        ChildAction::Freeze => loop {
+        ChildMode::Freeze => loop {
             thread::sleep(Duration::from_secs(3600));
         },
-        ChildAction::Inject => {
+        ChildMode::Inject => {
             if libraries.is_empty() {
                 return 0;
             }
@@ -96,11 +79,22 @@ fn run_child_action(action: ChildAction, libraries: &[String], app_name: &str) -
             }
             0
         }
-        ChildAction::Pass => 0,
+        ChildMode::Pass => 0,
     }
 }
 
 unsafe extern "C" fn fork_replacement() -> libc::pid_t {
+    // Fail the fork rather than unwind into bionic/Dobby.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(fork_inner)) {
+        Ok(pid) => pid,
+        Err(_) => {
+            set_errno(libc::EAGAIN);
+            -1
+        }
+    }
+}
+
+fn fork_inner() -> libc::pid_t {
     let orig_ptr = ORIG_FORK.load(Ordering::Acquire);
     if orig_ptr.is_null() {
         logi("[child_gating] fork hook fired before its origin was published");
@@ -110,15 +104,12 @@ unsafe extern "C" fn fork_replacement() -> libc::pid_t {
     // SAFETY: non-null trampoline published by `enable_child_gating`.
     let orig: ForkFn = unsafe { std::mem::transmute(orig_ptr) };
 
-    let mode = CHILD_GATING_MODE
-        .get()
-        .map(String::as_str)
-        .unwrap_or_default();
+    let mode = CHILD_GATING_MODE.get().copied().unwrap_or_default();
 
     // SAFETY: `getpid(2)` cannot fail.
     let parent_pid = unsafe { libc::getpid() };
     logi_fmt(format_args!(
-        "[child_gating][pid {parent_pid}] detected fork/vfork (child_gating_mode {mode})"
+        "[child_gating][pid {parent_pid}] detected fork/vfork (child_gating_mode {mode:?})"
     ));
 
     // The vfork hook resumes via the fork trampoline, turning vfork into fork.
@@ -141,22 +132,19 @@ unsafe extern "C" fn fork_replacement() -> libc::pid_t {
         .get()
         .map(String::as_str)
         .unwrap_or_default();
-    run_child_action(child_action(mode), libraries, app_name)
+    run_child_action(mode, libraries, app_name)
 }
 
 pub fn enable_child_gating(cfg: &ChildGatingConfig, app_name: &str) {
-    if CHILD_GATING_MODE.set(cfg.mode.clone()).is_err() {
+    if CHILD_GATING_MODE.set(cfg.mode).is_err() {
         loge("child gating already enabled; ignoring second config");
         return;
     }
     let _ = INJECTED_LIBRARIES.set(cfg.injected_libraries.clone());
     let _ = GATING_APP_NAME.set(app_name.to_string());
 
-    if child_action(&cfg.mode) == ChildAction::Pass {
-        loge_fmt(format_args!(
-            "unknown child_gating_mode {:?}; children will run ungated",
-            cfg.mode
-        ));
+    if cfg.mode == ChildMode::Pass {
+        loge("child_gating mode is pass; children will run ungated");
     }
 
     logi("[child_gating] enabling child gating");
@@ -216,6 +204,7 @@ pub fn enable_child_gating(cfg: &ChildGatingConfig, app_name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ChildMode;
     use std::sync::atomic::AtomicI32;
     use std::sync::{Mutex, MutexGuard};
 
@@ -268,33 +257,33 @@ mod tests {
     fn state_is_write_once() {
         let cfg = ChildGatingConfig {
             enabled: true,
-            mode: "kill".to_string(),
+            mode: ChildMode::Kill,
             injected_libraries: vec!["/a.so".to_string()],
         };
-        let _ = CHILD_GATING_MODE.set(cfg.mode.clone());
+        let _ = CHILD_GATING_MODE.set(cfg.mode);
         let _ = INJECTED_LIBRARIES.set(cfg.injected_libraries.clone());
-        assert_eq!(CHILD_GATING_MODE.get().map(String::as_str), Some("kill"));
+        assert_eq!(CHILD_GATING_MODE.get(), Some(&ChildMode::Kill));
         assert_eq!(INJECTED_LIBRARIES.get().map(Vec::len), Some(1));
     }
 
     #[test]
-    fn child_action_dispatch_matches_the_mode() {
-        assert_eq!(child_action("kill"), ChildAction::Kill);
-        assert_eq!(child_action("freeze"), ChildAction::Freeze);
-        assert_eq!(child_action("inject"), ChildAction::Inject);
-        assert_eq!(child_action(""), ChildAction::Pass);
-        assert_eq!(child_action("kilo"), ChildAction::Pass);
+    fn child_mode_parse_matches_the_config_names() {
+        assert_eq!(ChildMode::parse("kill"), Some(ChildMode::Kill));
+        assert_eq!(ChildMode::parse("freeze"), Some(ChildMode::Freeze));
+        assert_eq!(ChildMode::parse("inject"), Some(ChildMode::Inject));
+        assert_eq!(ChildMode::parse(""), None);
+        assert_eq!(ChildMode::parse("kilo"), None);
     }
 
     #[test]
     fn inject_without_libraries_stages_nothing() {
-        assert_eq!(run_child_action(ChildAction::Inject, &[], "com.a.b"), 0);
+        assert_eq!(run_child_action(ChildMode::Inject, &[], "com.a.b"), 0);
     }
 
     #[test]
     fn pass_mode_ignores_the_library_list() {
         assert_eq!(
-            run_child_action(ChildAction::Pass, &["/a.so".into()], "com.a.b"),
+            run_child_action(ChildMode::Pass, &["/a.so".into()], "com.a.b"),
             0
         );
     }
@@ -361,7 +350,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     fn kill_child_exits_zero_without_running_atexit_handlers() {
         let _guard = lock_origin();
-        let _ = CHILD_GATING_MODE.set("kill".to_string());
+        let _ = CHILD_GATING_MODE.set(ChildMode::Kill);
 
         static REGISTER: std::sync::Once = std::sync::Once::new();
         let (read_fd, write_fd) = pipe_pair();
@@ -407,7 +396,7 @@ mod tests {
         let child = unsafe { libc::fork() };
         assert!(child >= 0, "fork(2)");
         if child == 0 {
-            run_child_action(ChildAction::Freeze, &[], "");
+            run_child_action(ChildMode::Freeze, &[], "");
             // SAFETY: child-only path; never returns in a correct build.
             unsafe { libc::_exit(99) };
         }

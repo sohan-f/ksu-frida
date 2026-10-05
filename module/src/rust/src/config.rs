@@ -9,10 +9,30 @@ use crate::log::{loge, loge_fmt};
 /// Upper bound for per-launch injection delay.
 pub const MAX_START_UP_DELAY_MS: u64 = 60_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChildMode {
+    Kill,
+    Freeze,
+    Inject,
+    #[default]
+    Pass,
+}
+
+impl ChildMode {
+    pub(crate) fn parse(mode: &str) -> Option<Self> {
+        match mode {
+            "kill" => Some(Self::Kill),
+            "freeze" => Some(Self::Freeze),
+            "inject" => Some(Self::Inject),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ChildGatingConfig {
     pub enabled: bool,
-    pub mode: String,
+    pub mode: ChildMode,
     pub injected_libraries: Vec<String>,
 }
 
@@ -82,14 +102,11 @@ fn deserialize_child_gating_config(value: &Value) -> Option<ChildGatingConfig> {
         loge("invalid config: expected child_gating.mode members to be a string");
         return None;
     };
-    match mode {
-        "kill" | "freeze" | "inject" => {}
-        _ => {
-            loge("invalid config: unknown child_gating.mode; expected kill, freeze, or inject");
-            return None;
-        }
-    }
-    result.mode = mode.to_string();
+    let Some(mode) = ChildMode::parse(mode) else {
+        loge("invalid config: unknown child_gating.mode; expected kill, freeze, or inject");
+        return None;
+    };
+    result.mode = mode;
 
     if let Some(libraries) = obj.get("injected_libraries") {
         result.injected_libraries = deserialize_libraries(libraries)?;
@@ -112,24 +129,30 @@ fn deserialize_target_config(value: &Value) -> Option<TargetConfig> {
     };
     result.app_name = app_name.to_string();
 
-    let Some(enabled) = obj.get("enabled").and_then(Value::as_bool) else {
-        loge("invalid config: expected targets.enabled members to be a bool");
-        return None;
-    };
-    result.enabled = enabled;
+    // Optional fields default fail-closed; only wrong types reject the target.
+    if let Some(enabled) = obj.get("enabled") {
+        let Some(enabled) = enabled.as_bool() else {
+            loge("invalid config: expected targets.enabled members to be a bool");
+            return None;
+        };
+        result.enabled = enabled;
+    }
 
-    let Some(kernel_assisted_evasion) = obj.get("kernel_assisted_evasion").and_then(Value::as_bool)
-    else {
-        loge("invalid config: expected kernel_assisted_evasion members to be a bool");
-        return None;
-    };
-    result.kernel_assisted_evasion = kernel_assisted_evasion;
+    if let Some(kernel_assisted_evasion) = obj.get("kernel_assisted_evasion") {
+        let Some(kernel_assisted_evasion) = kernel_assisted_evasion.as_bool() else {
+            loge("invalid config: expected kernel_assisted_evasion members to be a bool");
+            return None;
+        };
+        result.kernel_assisted_evasion = kernel_assisted_evasion;
+    }
 
-    let Some(start_up_delay_ms) = obj.get("start_up_delay_ms").and_then(Value::as_u64) else {
-        loge("expected config target start_up_delay_ms to be an uint64");
-        return None;
-    };
-    result.start_up_delay_ms = start_up_delay_ms.min(MAX_START_UP_DELAY_MS);
+    if let Some(start_up_delay_ms) = obj.get("start_up_delay_ms") {
+        let Some(start_up_delay_ms) = start_up_delay_ms.as_u64() else {
+            loge("expected config target start_up_delay_ms to be an uint64");
+            return None;
+        };
+        result.start_up_delay_ms = start_up_delay_ms.min(MAX_START_UP_DELAY_MS);
+    }
 
     if let Some(hide_maps) = obj.get("hide_maps") {
         let Some(hide_maps) = hide_maps.as_bool() else {
@@ -275,19 +298,7 @@ fn load_advanced_config(module_dir: &str, app_name: &str) -> Option<TargetConfig
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-    fn temp_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "ksufrida_test_{name}_{}_{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
+    use crate::test_support::TempDir;
 
     const ADVANCED: &str = r#"{
         "targets": [
@@ -318,7 +329,7 @@ mod tests {
 
     #[test]
     fn advanced_config_parses_matching_target() {
-        let dir = temp_dir("advanced");
+        let dir = TempDir::new("advanced");
         fs::write(dir.join("config.json"), ADVANCED).unwrap();
 
         let cfg = load_config(dir.to_str().unwrap(), "com.example.app").expect("config");
@@ -333,7 +344,7 @@ mod tests {
             ]
         );
         assert!(cfg.child_gating.enabled);
-        assert_eq!(cfg.child_gating.mode, "freeze");
+        assert_eq!(cfg.child_gating.mode, ChildMode::Freeze);
         assert_eq!(cfg.child_gating.injected_libraries.len(), 1);
 
         let other = load_config(dir.to_str().unwrap(), "org.other.app").expect("other config");
@@ -341,30 +352,25 @@ mod tests {
         assert_eq!(other.start_up_delay_ms, 0);
         assert!(!other.child_gating.enabled);
         assert!(other.child_gating.injected_libraries.is_empty());
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn unknown_app_returns_none() {
-        let dir = temp_dir("unknown");
+        let dir = TempDir::new("unknown");
         fs::write(dir.join("config.json"), ADVANCED).unwrap();
         assert!(load_config(dir.to_str().unwrap(), "com.unknown.app").is_none());
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn non_target_skips_parse_entirely() {
-        let dir = temp_dir("noparse");
+        let dir = TempDir::new("noparse");
         fs::write(dir.join("config.json"), "{ not json at all").unwrap();
         assert!(load_config(dir.to_str().unwrap(), "com.unknown.app").is_none());
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn substring_hit_falls_through_to_exact_match() {
-        let dir = temp_dir("substr");
+        let dir = TempDir::new("substr");
         fs::write(
             dir.join("config.json"),
             r#"{"targets":[{"app_name":"com.example.approx","enabled":true,
@@ -374,17 +380,13 @@ mod tests {
         .unwrap();
         assert!(load_config(dir.to_str().unwrap(), "com.example.app").is_none());
         assert!(load_config(dir.to_str().unwrap(), "com.example.approx").is_some());
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn empty_app_name_matches_nothing() {
-        let dir = temp_dir("empty");
+        let dir = TempDir::new("empty");
         fs::write(dir.join("config.json"), ADVANCED).unwrap();
         assert!(load_config(dir.to_str().unwrap(), "").is_none());
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     fn target_with_hide_maps(value: &str) -> String {
@@ -397,29 +399,26 @@ mod tests {
 
     #[test]
     fn hide_maps_defaults_to_true_and_parses_explicit_values() {
-        let dir = temp_dir("hidemaps-default");
+        let dir = TempDir::new("hidemaps-default");
         fs::write(dir.join("config.json"), ADVANCED).unwrap();
         let cfg = load_config(dir.to_str().unwrap(), "com.example.app").expect("config");
         assert!(cfg.hide_maps);
-        fs::remove_dir_all(&dir).ok();
 
         for (value, expected) in [("true", true), ("false", false)] {
-            let dir = temp_dir("hidemaps-explicit");
+            let dir = TempDir::new("hidemaps-explicit");
             fs::write(dir.join("config.json"), target_with_hide_maps(value)).unwrap();
             let cfg = load_config(dir.to_str().unwrap(), "a.b").expect("config");
             assert_eq!(cfg.hide_maps, expected);
-            fs::remove_dir_all(&dir).ok();
         }
 
-        let dir = temp_dir("hidemaps-mistype");
+        let dir = TempDir::new("hidemaps-mistype");
         fs::write(dir.join("config.json"), target_with_hide_maps("\"yes\"")).unwrap();
         assert!(load_config(dir.to_str().unwrap(), "a.b").is_none());
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn invalid_json_falls_back_to_simple_config() {
-        let dir = temp_dir("fallback");
+        let dir = TempDir::new("fallback");
         fs::write(dir.join("config.json"), "{ not json").unwrap();
         fs::write(
             dir.join("target_packages"),
@@ -438,13 +437,11 @@ mod tests {
 
         let other = load_config(dir.to_str().unwrap(), "com.other.app").expect("no-delay config");
         assert_eq!(other.start_up_delay_ms, 0);
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn wrong_types_are_rejected() {
-        let dir = temp_dir("badtypes");
+        let dir = TempDir::new("badtypes");
         fs::write(
             dir.join("config.json"),
             r#"{"targets":[{"app_name":"a.b","enabled":true,"kernel_assisted_evasion":true,
@@ -460,13 +457,11 @@ mod tests {
         )
         .unwrap();
         assert!(load_config(dir.to_str().unwrap(), "a.b").is_none());
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn missing_libraries_defaults_to_empty_for_gating_only() {
-        let dir = temp_dir("nolibs");
+        let dir = TempDir::new("nolibs");
         fs::write(
             dir.join("config.json"),
             r#"{"targets":[{"app_name":"a.b","enabled":true,"kernel_assisted_evasion":true,
@@ -477,13 +472,11 @@ mod tests {
         let cfg = load_config(dir.to_str().unwrap(), "a.b").expect("gating-only config");
         assert!(cfg.injected_libraries.is_empty());
         assert!(cfg.child_gating.enabled);
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn unknown_child_gating_mode_is_rejected() {
-        let dir = temp_dir("badmode");
+        let dir = TempDir::new("badmode");
         fs::write(
             dir.join("config.json"),
             r#"{"targets":[{"app_name":"a.b","enabled":true,"kernel_assisted_evasion":true,
@@ -492,13 +485,11 @@ mod tests {
         )
         .unwrap();
         assert!(load_config(dir.to_str().unwrap(), "a.b").is_none());
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn start_up_delay_is_capped() {
-        let dir = temp_dir("bigdelay");
+        let dir = TempDir::new("bigdelay");
         fs::write(
             dir.join("config.json"),
             r#"{"targets":[{"app_name":"a.b","enabled":true,"kernel_assisted_evasion":true,
@@ -507,24 +498,38 @@ mod tests {
         .unwrap();
         let cfg = load_config(dir.to_str().unwrap(), "a.b").expect("config");
         assert_eq!(cfg.start_up_delay_ms, MAX_START_UP_DELAY_MS);
+    }
 
-        fs::remove_dir_all(&dir).ok();
+    #[test]
+    fn missing_optionals_default_to_disabled_and_empty() {
+        let dir = TempDir::new("defaults");
+        fs::write(
+            dir.join("config.json"),
+            r#"{"targets":[{"app_name":"a.b"}]}"#,
+        )
+        .unwrap();
+        let cfg = load_config(dir.to_str().unwrap(), "a.b").expect("minimal config");
+        assert!(!cfg.enabled);
+        assert!(!cfg.kernel_assisted_evasion);
+        assert_eq!(cfg.start_up_delay_ms, 0);
+        assert!(cfg.hide_maps);
+        assert!(cfg.injected_libraries.is_empty());
+        assert!(!cfg.child_gating.enabled);
+        assert_eq!(cfg.child_gating.mode, ChildMode::Pass);
     }
 
     #[test]
     fn broken_entry_does_not_disable_other_targets() {
-        let dir = temp_dir("skip-broken");
+        let dir = TempDir::new("skip-broken");
         fs::write(
             dir.join("config.json"),
-            r#"{"targets":[{"app_name":"broken"},
+            r#"{"targets":[{"app_name":"broken","enabled":"yes"},
                 {"app_name":"a.b","enabled":true,"kernel_assisted_evasion":true,
                 "start_up_delay_ms":0,"injected_libraries":[]}]}"#,
         )
         .unwrap();
         assert!(load_config(dir.to_str().unwrap(), "a.b").is_some());
         assert!(load_config(dir.to_str().unwrap(), "broken").is_none());
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

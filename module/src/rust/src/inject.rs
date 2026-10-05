@@ -10,7 +10,7 @@ use std::time::Duration;
 use crate::child_gating::enable_child_gating;
 use crate::config::{TargetConfig, load_config};
 use crate::linkmap::scrub_dlpi_name;
-use crate::log::{loge_fmt, logi, logi_fmt};
+use crate::log::{basename, loge_fmt, logi, logi_fmt};
 use crate::remap::remap_lib;
 use crate::sys::{RTLD_NOW, cstring, dlerror_string, dlopen};
 use crate::xdl::{XDL_TRY_FORCE_LOAD, xdl_open};
@@ -106,22 +106,15 @@ fn delay_start_up(start_up_delay_ms: u64) {
         "Waiting for configured start up delay {start_up_delay_ms}ms"
     ));
 
-    let mut delay = start_up_delay_ms;
-    let mut countdown = 0;
-    let mut i = 0;
-    while i < 10 && delay > 1000 {
-        delay -= 1000;
-        countdown += 1;
-        i += 1;
-    }
+    // Countdown logs cover at most the last 10 seconds; the rest sleeps silently.
+    let countdown_secs = (start_up_delay_ms / 1000).min(10);
+    thread::sleep(Duration::from_millis(
+        start_up_delay_ms - countdown_secs * 1000,
+    ));
 
-    thread::sleep(Duration::from_millis(delay));
-
-    let mut i = countdown;
-    while i > 0 {
-        logi_fmt(format_args!("Injecting libs in {i} seconds"));
+    for remaining in (1..=countdown_secs).rev() {
+        logi_fmt(format_args!("Injecting libs in {remaining} seconds"));
         thread::sleep(Duration::from_secs(1));
-        i -= 1;
     }
 }
 
@@ -148,7 +141,8 @@ fn open_dst_hardened(dst: &str) -> Option<File> {
         }
         match io::Error::last_os_error().raw_os_error() {
             Some(code) if code == libc::ENOSYS || code == libc::EINVAL => {}
-            Some(_) => {}
+            // openat2 exists but refused the call; fall back and say why.
+            Some(code) => loge_fmt(format_args!("stage: openat2 failed ({code}); falling back")),
             None => {}
         }
     }
@@ -522,7 +516,10 @@ fn stage_gadget(app_name: &str, src_lib_path: &str) -> String {
     let dst_lib = format!("{stage_dir}/{lib_name}");
     let dst_cfg = format!("{stage_dir}/{cfg_name}");
 
-    logi_fmt(format_args!("Staging gadget: {src_lib_path} -> {dst_lib}"));
+    logi_fmt(format_args!(
+        "Staging gadget {} -> {dst_lib}",
+        basename(src_lib_path)
+    ));
 
     if !copy_file(src_lib_path, &dst_lib) {
         remove_file(&dst_lib);
@@ -552,6 +549,7 @@ fn unlink_staged(staged_lib_path: &str) {
 }
 
 pub fn inject_lib(lib_path: &str, log_context: &str, hide_maps: bool) {
+    let base = basename(lib_path);
     let c_path = match cstring(lib_path) {
         Ok(c_path) => c_path,
         Err(err) => {
@@ -566,7 +564,7 @@ pub fn inject_lib(lib_path: &str, log_context: &str, hide_maps: bool) {
     let handle = unsafe { xdl_open(c_path.as_ptr(), XDL_TRY_FORCE_LOAD) };
     if !handle.is_null() {
         logi_fmt(format_args!(
-            "{log_context}Injected {lib_path} with handle {handle:p}"
+            "{log_context}Injected {base} with handle {handle:p}"
         ));
         hide_or_show(lib_path, log_context, hide_maps);
         return;
@@ -577,7 +575,7 @@ pub fn inject_lib(lib_path: &str, log_context: &str, hide_maps: bool) {
     let handle = unsafe { dlopen(c_path.as_ptr(), RTLD_NOW) };
     if !handle.is_null() {
         logi_fmt(format_args!(
-            "{log_context}Injected {lib_path} with handle {handle:p} (dlopen fallback)"
+            "{log_context}Injected {base} with handle {handle:p} (dlopen fallback)"
         ));
         hide_or_show(lib_path, log_context, hide_maps);
         return;
@@ -585,10 +583,10 @@ pub fn inject_lib(lib_path: &str, log_context: &str, hide_maps: bool) {
     let dlopen_err = dlerror_string();
 
     loge_fmt(format_args!(
-        "{log_context}Failed to inject {lib_path} (xdl_open): {xdl_err}"
+        "{log_context}Failed to inject {base} (xdl_open): {xdl_err}"
     ));
     loge_fmt(format_args!(
-        "{log_context}Failed to inject {lib_path} (dlopen): {dlopen_err}"
+        "{log_context}Failed to inject {base} (dlopen): {dlopen_err}"
     ));
 }
 
@@ -597,7 +595,8 @@ fn hide_or_show(lib_path: &str, log_context: &str, hide_maps: bool) {
         remap_lib(lib_path);
     } else {
         logi_fmt(format_args!(
-            "{log_context}Map hiding disabled for {lib_path}"
+            "{log_context}Map hiding disabled for {}",
+            basename(lib_path)
         ));
     }
     scrub_dlpi_name(lib_path);
@@ -756,7 +755,8 @@ pub(crate) fn stage_and_inject(
     let inject_path = if staged.is_empty() {
         if stage {
             loge_fmt(format_args!(
-                "{log_context}Staging {lib_path} failed; falling back to the raw path"
+                "{log_context}Staging {} failed; falling back to the raw path",
+                basename(lib_path)
             ));
         }
         lib_path
@@ -764,7 +764,10 @@ pub(crate) fn stage_and_inject(
         &staged
     };
 
-    logi_fmt(format_args!("{log_context}Injecting {inject_path}"));
+    logi_fmt(format_args!(
+        "{log_context}Injecting {}",
+        basename(inject_path)
+    ));
     inject_lib(inject_path, log_context, hide_maps);
 
     if !staged.is_empty() {
@@ -804,7 +807,8 @@ fn inject_libs(cfg: &TargetConfig, pid: libc::pid_t) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ChildGatingConfig;
+    use crate::config::{ChildGatingConfig, ChildMode};
+    use crate::test_support::TempDir;
 
     #[test]
     fn config_suffix_is_anchored_to_the_basename() {
@@ -829,7 +833,7 @@ mod tests {
             app_name: "com.a.b".to_string(),
             child_gating: ChildGatingConfig {
                 enabled: false,
-                mode: "kill".to_string(),
+                mode: ChildMode::Kill,
                 injected_libraries: Vec::new(),
             },
             ..TargetConfig::default()
@@ -890,14 +894,9 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(5));
     }
 
-    fn scratch(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("ksufrida-{}-{name}", std::process::id()))
-    }
-
     #[test]
     fn copy_file_copies_every_byte() {
-        let dir = scratch("copy-ok");
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("copy-ok");
         let src = dir.join("src.bin");
         let dst = dir.join("dst.bin");
 
@@ -906,14 +905,11 @@ mod tests {
 
         assert!(copy_file(src.to_str().unwrap(), dst.to_str().unwrap()));
         assert_eq!(fs::read(&dst).unwrap(), payload);
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn copy_file_rejects_a_missing_source() {
-        let dir = scratch("copy-missing");
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("copy-missing");
         let dst = dir.join("dst.bin");
 
         assert!(!copy_file(
@@ -921,25 +917,19 @@ mod tests {
             dst.to_str().unwrap()
         ));
         assert!(!dst.exists());
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn copy_file_fails_on_a_directory_source() {
-        let dir = scratch("copy-dir");
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("copy-dir");
         let dst = dir.join("dst.bin");
 
         assert!(!copy_file(dir.to_str().unwrap(), dst.to_str().unwrap()));
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn copy_file_loop_copies_every_byte() {
-        let dir = scratch("loop-direct");
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("loop-direct");
         let src = dir.join("src.bin");
         let dst = dir.join("dst.bin");
 
@@ -963,14 +953,11 @@ mod tests {
             len
         ));
         assert_eq!(fs::read(&dst).unwrap(), payload);
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn copy_file_range_matches_source_size() {
-        let dir = scratch("range");
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("range");
         let src = dir.join("src.bin");
         let dst = dir.join("dst.bin");
 
@@ -990,14 +977,11 @@ mod tests {
             RangeOutcome::Unsupported => {}
             RangeOutcome::Failed => panic!("kernel copy failed outright"),
         }
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn remove_helpers_treat_missing_entries_as_clean() {
-        let dir = scratch("remove-clean");
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("remove-clean");
 
         assert!(remove_file(dir.join("never-existed").to_str().unwrap()));
         assert!(remove_dir(dir.to_str().unwrap()));
@@ -1007,8 +991,7 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)] // real symlinks are outside miri's filesystem
     fn ensure_dir_refuses_symlink_plant() {
-        let dir = scratch("mkdir-link");
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("mkdir-link");
         let target = dir.join("real");
         fs::create_dir_all(&target).unwrap();
 
@@ -1022,15 +1005,12 @@ mod tests {
 
         assert!(ensure_dir(target.to_str().unwrap(), 0o700));
         assert!(ensure_dir(dir.join("fresh").to_str().unwrap(), 0o700));
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     #[cfg_attr(miri, ignore)] // symlinks/fifos are outside miri's filesystem
     fn copy_file_refuses_symlink_and_special_files() {
-        let dir = scratch("copy-plant");
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("copy-plant");
         let src = dir.join("src.bin");
         fs::write(&src, b"payload").unwrap();
 
@@ -1047,19 +1027,14 @@ mod tests {
         // SAFETY: `c_fifo` is NUL-terminated; creates a test-owned node.
         assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
         assert!(!copy_file(src.to_str().unwrap(), fifo.to_str().unwrap()));
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn remove_dir_reports_a_leftover_stage() {
-        let dir = scratch("remove-nonempty");
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("remove-nonempty");
         fs::write(dir.join("leftover.bin"), b"x").unwrap();
 
         assert!(!remove_dir(dir.to_str().unwrap()));
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[cfg_attr(miri, ignore)] // fork(2) is not interpretable
@@ -1080,9 +1055,8 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)] // uses fork(2) via dead_pid()
     fn sweep_removes_only_dead_pid_dirs() {
-        let cache = scratch("sweep");
-        fs::create_dir_all(&cache).unwrap();
-        let cache = cache.to_str().unwrap().to_string();
+        let stage = TempDir::new("sweep");
+        let cache = stage.path().to_str().unwrap().to_string();
 
         // SAFETY: `getpid(2)` cannot fail.
         let live = unsafe { libc::getpid() }.to_string();
@@ -1114,16 +1088,13 @@ mod tests {
             std::path::Path::new(&format!("{cache}/mydata.bin")).exists(),
             "app file must stay"
         );
-
-        fs::remove_dir_all(&cache).ok();
     }
 
     #[test]
     #[cfg_attr(miri, ignore)] // uses fork(2) via dead_pid()
     fn sweep_leaves_unexpected_subdirs_alone() {
-        let cache = scratch("sweep-subdir");
-        fs::create_dir_all(&cache).unwrap();
-        let cache = cache.to_str().unwrap().to_string();
+        let stage = TempDir::new("sweep-subdir");
+        let cache = stage.path().to_str().unwrap().to_string();
 
         let dead = dead_pid().to_string();
         fs::create_dir_all(format!("{cache}/{dead}")).unwrap();
@@ -1145,14 +1116,11 @@ mod tests {
             std::path::Path::new(&format!("{cache}/{dead}")).exists(),
             "non-empty dir must stay for remove_dir to report"
         );
-
-        fs::remove_dir_all(&cache).ok();
     }
 
     #[test]
     fn no_stage_injects_without_touching_the_filesystem() {
-        let dir = scratch("no-stage");
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("no-stage");
 
         stage_and_inject(
             dir.join("missing.so").to_str().unwrap(),
@@ -1163,14 +1131,11 @@ mod tests {
         );
 
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn write_memfd_roundtrips_source_bytes() {
-        let dir = scratch("memfd");
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("memfd");
         let src = dir.join("src.bin");
 
         let payload: Vec<u8> = (0..200_000).map(|i| (i % 251) as u8).collect();
@@ -1181,7 +1146,5 @@ mod tests {
         // SAFETY: `fd` is ours from above; done with it.
         unsafe { libc::close(fd) };
         assert_eq!(back, payload);
-
-        fs::remove_dir_all(&dir).ok();
     }
 }

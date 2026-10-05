@@ -295,7 +295,7 @@ unsafe fn relocate_segment(
     size: usize,
     perms: c_int,
     path: &str,
-) -> Result<*mut c_void, RelocateError> {
+) -> Result<(), RelocateError> {
     // SAFETY: anonymous private mapping of `size`, which comes from `/proc/self/maps` and is page-aligned.
     let map = unsafe {
         libc::mmap(
@@ -369,7 +369,7 @@ unsafe fn relocate_segment(
         end_rebuild();
     }
 
-    Ok(map)
+    Ok(())
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]

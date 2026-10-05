@@ -1,6 +1,6 @@
 use std::ffi::{CStr, c_char, c_int, c_void};
 
-use crate::log::{loge, loge_fmt, logi_fmt};
+use crate::log::{basename, loge, loge_fmt, logi_fmt};
 use crate::sys::{DlIterateCb, DlPhdrInfo, dl_iterate_phdr};
 
 struct ScrubSearch {
@@ -76,6 +76,7 @@ const DT_STRTAB: i64 = 5;
 const DT_SYMTAB: i64 = 6;
 const DT_STRSZ: i64 = 10;
 const DT_SONAME: i64 = 14;
+const DT_GNU_HASH: i64 = 0x6ffffef5;
 
 const MAX_DYNAMIC: usize = 128;
 const MAX_SYMBOLS: usize = 1_000_000;
@@ -319,8 +320,8 @@ unsafe fn scrub_elf_metadata(info: *mut DlPhdrInfo, replacement: &[u8]) -> (bool
         return (false, 0);
     }
 
-    let (mut strtab, mut strsz, mut symtab, mut hash, mut soname) =
-        (0usize, 0usize, 0usize, 0usize, None::<usize>);
+    let (mut strtab, mut strsz, mut symtab, mut hash, mut gnu_hash, mut soname) =
+        (0usize, 0usize, 0usize, 0usize, 0usize, None::<usize>);
     for i in 0..MAX_DYNAMIC {
         // SAFETY: bounded walk of the linker's dynamic array; each step
         // lands on a dynamic entry of our own read-only table.
@@ -336,6 +337,7 @@ unsafe fn scrub_elf_metadata(info: *mut DlPhdrInfo, replacement: &[u8]) -> (bool
             t if t == DT_STRSZ => strsz = val,
             t if t == DT_SYMTAB => symtab = val,
             t if t == DT_HASH => hash = val,
+            t if t == DT_GNU_HASH => gnu_hash = val,
             t if t == DT_SONAME => soname = Some(val),
             _ => {}
         }
@@ -346,12 +348,17 @@ unsafe fn scrub_elf_metadata(info: *mut DlPhdrInfo, replacement: &[u8]) -> (bool
     let strtab = base.wrapping_add(strtab);
     let symtab = base.wrapping_add(symtab);
     let hash = base.wrapping_add(hash);
+    let gnu_hash = base.wrapping_add(gnu_hash);
 
-    let nsyms = if hash == base {
-        0
-    } else {
+    let nsyms = if hash != base {
         // SAFETY: `hash` names our own read-only table; two `u32` reads.
         unsafe { (hash as *const u32).add(1).read() as usize }
+    } else if gnu_hash != base {
+        // SAFETY: `gnu_hash` names our own read-only table; the callee
+        // bounds every read by the header counts below.
+        unsafe { gnu_nsyms(gnu_hash) }
+    } else {
+        0
     };
 
     // SAFETY: `strtab[..strsz]` names our own read-only table (bounded
@@ -366,6 +373,58 @@ unsafe fn scrub_elf_metadata(info: *mut DlPhdrInfo, replacement: &[u8]) -> (bool
         result
     };
     (soname_done, symbols)
+}
+
+/// Upper bound on the symbol count from a GNU hash table.
+///
+/// # Safety
+/// `table` must address a readable `DT_GNU_HASH` table of our own image;
+/// every read below stays inside its header, buckets, and chains.
+unsafe fn gnu_nsyms(table: usize) -> usize {
+    // SAFETY: header of our own table; four `u32` reads.
+    let (nbuckets, symoffset, bloom_words) = unsafe {
+        let header = table as *const u32;
+        (
+            header.read() as usize,
+            header.add(1).read() as usize,
+            header.add(2).read() as usize,
+        )
+    };
+    if nbuckets == 0 || nbuckets > MAX_SYMBOLS {
+        return 0;
+    }
+    let limit = symoffset.saturating_add(MAX_SYMBOLS);
+    let Some(buckets) = bloom_words
+        .checked_mul(size_of::<usize>())
+        .and_then(|bloom| table.checked_add(16 + bloom))
+    else {
+        return 0;
+    };
+    let Some(chain) = nbuckets.checked_mul(4).and_then(|b| buckets.checked_add(b)) else {
+        return 0;
+    };
+    // Chains of one bucket run contiguous until the LSB stop bit; total work
+    // across buckets is bounded by the shared budget below.
+    let mut budget = MAX_SYMBOLS;
+    let mut highest = symoffset;
+    for i in 0..nbuckets {
+        // SAFETY: `i` bounded by the header count; one bucket read per step.
+        let mut sym = unsafe { ((buckets as *const u32).add(i)).read() as usize };
+        if sym < symoffset || sym >= limit {
+            continue;
+        }
+        while budget > 0 && sym < limit {
+            // SAFETY: `sym` bounded above; one chain word per step.
+            let word = unsafe { ((chain as *const u32).add(sym - symoffset)).read() };
+            budget -= 1;
+            highest = highest.max(sym + 1);
+            if word & 1 == 1 {
+                break;
+            }
+            sym += 1;
+        }
+    }
+    highest
 }
 
 fn run_scrub(search: &mut ScrubSearch) {
@@ -416,13 +475,15 @@ pub fn scrub_dlpi_name(staged_path: &str) {
 
     if search.found {
         logi_fmt(format_args!(
-            "Scrubbed linker name for {staged_path} (soname {}, {} symbols)",
+            "Scrubbed linker name for {} (soname {}, {} symbols)",
+            basename(staged_path),
             if search.soname { "renamed" } else { "left" },
             search.symbols
         ));
     } else {
         loge_fmt(format_args!(
-            "linkmap: no dl_iterate_phdr entry matched {staged_path}; name left visible"
+            "linkmap: no dl_iterate_phdr entry matched {}; name left visible",
+            basename(staged_path)
         ));
         log_all_names();
     }
@@ -701,6 +762,117 @@ mod tests {
         let (soname_done, symbols) = unsafe { scrub_elf_metadata(&mut info, b"libnative_1.so") };
         // SAFETY: read-only checks of our own page (perms restored to R).
         // (Strings live at `strtab_off + off`, not bare `off`.)
+        unsafe {
+            let at =
+                |off: usize| CStr::from_ptr(page.add(strtab_off + off) as *const c_char).to_bytes();
+            assert!(soname_done);
+            assert_eq!(symbols, 1);
+            assert_eq!(at(soname_off), b"libnative_1.so");
+            assert_eq!(at(sym1_off), b"libnative_1.so");
+            assert_eq!(at(sym2_off), b"puts");
+            assert_eq!(libc::munmap(page as *mut c_void, SIZE), 0);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    #[cfg(target_pointer_width = "64")]
+    fn elf_scrub_falls_back_to_gnu_hash() {
+        const SIZE: usize = 4096;
+        // SAFETY: fresh anonymous page owned by this test.
+        let page = unsafe {
+            let page = libc::mmap(
+                std::ptr::null_mut(),
+                SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                -1,
+                0,
+            );
+            assert_ne!(
+                page,
+                libc::MAP_FAILED,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+            page as *mut u8
+        };
+
+        let soname_off = 1usize;
+        let sym1_off = 20usize;
+        let sym2_off = 37usize;
+        let strtab_off = 256usize;
+        let strtab: &[u8] = b"\0libfrida-gadget.so\0frida_agent_main\0puts\0";
+        assert_eq!(strtab.len(), 42);
+        let symtab_off = 512usize;
+        let gnu_off = 640usize;
+        let dyn_off = 64usize;
+
+        // SAFETY: all writes land inside our own page at the offsets above.
+        unsafe {
+            (page.add(0) as *mut Phdr64).write(Phdr64 {
+                p_type: PT_DYNAMIC,
+                p_flags: 0,
+                p_offset: 0,
+                p_vaddr: dyn_off as u64,
+                p_paddr: 0,
+                p_filesz: 0,
+                p_memsz: 0,
+                p_align: 0,
+            });
+            let dyn_entries: [(i64, u64); 6] = [
+                (DT_STRTAB, strtab_off as u64),
+                (DT_STRSZ, strtab.len() as u64),
+                (DT_SYMTAB, symtab_off as u64),
+                (DT_GNU_HASH, gnu_off as u64),
+                (DT_SONAME, soname_off as u64),
+                (DT_NULL, 0),
+            ];
+            for (i, (tag, val)) in dyn_entries.iter().enumerate() {
+                (page.add(dyn_off + i * size_of::<Dyn64>()) as *mut Dyn64).write(Dyn64 {
+                    d_tag: *tag,
+                    d_val: *val,
+                });
+            }
+            std::ptr::copy_nonoverlapping(strtab.as_ptr(), page.add(strtab_off), strtab.len());
+            let names = [0u32, sym1_off as u32, sym2_off as u32];
+            for (i, name) in names.iter().enumerate() {
+                (page.add(symtab_off + i * size_of::<Sym64>()) as *mut Sym64).write(Sym64 {
+                    st_name: *name,
+                    st_info: 0,
+                    st_other: 0,
+                    st_shndx: 0,
+                    st_value: 0,
+                    st_size: 0,
+                });
+            }
+            // One bucket fanning from symbol 1; chain stop bits end at symbol 2.
+            let header: [u32; 4] = [1, 1, 1, 0];
+            std::ptr::copy_nonoverlapping(
+                header.as_ptr(),
+                page.add(gnu_off) as *mut u32,
+                header.len(),
+            );
+            (page.add(gnu_off + 16) as *mut u64).write(0);
+            (page.add(gnu_off + 24) as *mut u32).write(1);
+            let chain: [u32; 2] = [0, 1];
+            std::ptr::copy_nonoverlapping(
+                chain.as_ptr(),
+                page.add(gnu_off + 28) as *mut u32,
+                chain.len(),
+            );
+        }
+
+        let mut info = DlPhdrInfo {
+            addr: page as usize,
+            name: c"fake.so".as_ptr(),
+            phdr: page as *const c_void,
+            phnum: 1,
+        };
+        // SAFETY: `info` describes the fake image above; the replacement
+        // fits every footprint it can touch.
+        let (soname_done, symbols) = unsafe { scrub_elf_metadata(&mut info, b"libnative_1.so") };
+        // SAFETY: read-only checks of our own page (perms restored to R).
         unsafe {
             let at =
                 |off: usize| CStr::from_ptr(page.add(strtab_off + off) as *const c_char).to_bytes();
