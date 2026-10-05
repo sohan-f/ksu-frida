@@ -346,7 +346,7 @@ function applyConfigText(text) {
 
 async function saveConfig() {
     var json = JSON.stringify(config, null, 4);
-    var r = await exec("{ printf '%s\\n' " + shQuote(json) + " > " + CONFIG_PATH +
+    var r = await exec("{ rm -f " + CONFIG_PATH + "; printf '%s\\n' " + shQuote(json) + " > " + CONFIG_PATH +
         " && chmod 644 " + CONFIG_PATH + " && echo " + SAVE_MARK + "; } 2>&1");
     if (String(r.stdout).indexOf(SAVE_MARK) !== -1) {
         ksu.toast("Config saved");
@@ -442,7 +442,7 @@ async function saveGadgetConfig() {
         return;
     }
     var content = document.getElementById("gadget-editor").value;
-    var r = await exec("{ printf '%s\\n' " + shQuote(content) + " > " + GADGET_CONFIG_PATH +
+    var r = await exec("{ rm -f " + GADGET_CONFIG_PATH + "; printf '%s\\n' " + shQuote(content) + " > " + GADGET_CONFIG_PATH +
         " && chmod 644 " + GADGET_CONFIG_PATH + " && echo " + SAVE_MARK + "; } 2>&1");
     if (String(r.stdout).indexOf(SAVE_MARK) !== -1) {
         ksu.toast("Gadget config saved");
@@ -468,10 +468,12 @@ async function refreshGadget() {
     var dst = "/data/local/tmp/libsec";
     var r = await exec("mkdir -p " + dst + "; " +
         "if [ -f " + GADGET_SRC + " ]; then " +
+        "rm -f " + dst + "/libsecmon.so.xz " + dst + "/libsecmon.so; " +
         "cp -f " + GADGET_SRC + " " + dst + "/libsecmon.so.xz && " +
         BUSYBOX_BIN + " unxz -f " + dst + "/libsecmon.so.xz && chmod 644 " + dst + "/libsecmon.so && echo GADGET_OK || echo GADGET_FAIL; " +
         "else echo GADGET_SRC_MISSING; fi; " +
         "if [ -f " + GADGET32_SRC + " ]; then " +
+        "rm -f " + dst + "/libsecmon32.so.xz " + dst + "/libsecmon32.so; " +
         "cp -f " + GADGET32_SRC + " " + dst + "/libsecmon32.so.xz && " +
         BUSYBOX_BIN + " unxz -f " + dst + "/libsecmon32.so.xz && chmod 644 " + dst + "/libsecmon32.so && echo GADGET32_OK || echo GADGET32_FAIL; fi; " +
         "echo " + SAVE_MARK);
@@ -633,9 +635,10 @@ async function checkGadgetUpdate() {
 // Builds a shell fragment that fails (||) unless the file at path hashes
 // to the expected sha256. `sha256sum` may live in PATH or only as a
 // busybox applet; the digest itself is hex-validated before embedding.
-function hashCheckSnippet(path, hash) {
-    return "{ H=$(sha256sum " + shQuote(path) + " 2>/dev/null | cut -d' ' -f1); " +
-        "[ -n \"$H\" ] || H=$(" + BUSYBOX_BIN + " sha256sum " + shQuote(path) +
+// path is a raw shell expression (caller-owned); only the hash is quoted.
+function hashCheckSnippet(shellPath, hash) {
+    return "{ H=$(sha256sum " + shellPath + " 2>/dev/null | cut -d' ' -f1); " +
+        "[ -n \"$H\" ] || H=$(" + BUSYBOX_BIN + " sha256sum " + shellPath +
         " 2>/dev/null | cut -d' ' -f1); " +
         "[ \"$H\" = " + shQuote(hash.toLowerCase()) + " ]; }";
 }
@@ -669,14 +672,19 @@ async function downloadGadgetUpdate() {
         "$GET \"$S/libsecmon.so.xz\" " + shQuote(u1) + " || OK=0; " +
         (u2 ? "$GET \"$S/libsecmon32.so.xz\" " + shQuote(u2) + " || OK=0; " : "") +
         "if [ \"$OK\" = 1 ]; then echo STAGE:verify; HOK=1; " +
-        (h1 ? hashCheckSnippet("$S/libsecmon.so.xz", h1) + " || HOK=0; " : "") +
-        ((u2 && h2) ? hashCheckSnippet("$S/libsecmon32.so.xz", h2) + " || HOK=0; " : "") +
+        (h1 ? hashCheckSnippet('"$S/libsecmon.so.xz"', h1) + " || HOK=0; " : "") +
+        ((u2 && h2) ? hashCheckSnippet('"$S/libsecmon32.so.xz"', h2) + " || HOK=0; " : "") +
         "if [ \"$HOK\" = 1 ] && \"$B\" unxz -t \"$S/libsecmon.so.xz\"" + (u2 ? " && \"$B\" unxz -t \"$S/libsecmon32.so.xz\"" : "") + "; then echo STAGE:install; " +
+        "rm -f \"$M/libsecmon.so.xz\" \"$M/libsecmon.so.xz.sha256sum\" \"$D/libsecmon.so.xz\" \"$D/libsecmon.so\"; " +
         "cp -f \"$S/libsecmon.so.xz\" \"$M/libsecmon.so.xz\"; " +
+        (validSha256(h1 || "") ? "echo " + shQuote(h1.toLowerCase()) + " > \"$M/libsecmon.so.xz.sha256sum\"; " : "") +
         "cp -f \"$S/libsecmon.so.xz\" \"$D/libsecmon.so.xz\"; " +
         "$B unxz -f \"$D/libsecmon.so.xz\"; chmod 644 \"$D/libsecmon.so\"; " +
-        (u2 ? "cp -f \"$S/libsecmon32.so.xz\" \"$M/libsecmon32.so.xz\"; cp -f \"$S/libsecmon32.so.xz\" \"$D/libsecmon32.so.xz\"; $B unxz -f \"$D/libsecmon32.so.xz\"; chmod 644 \"$D/libsecmon32.so\"; " : "") +
-        "echo \"$V\" > \"$M/gadget.version\"; chmod 644 \"$M/gadget.version\"; echo RESULT:ok; " +
+        (u2 ? "rm -f \"$M/libsecmon32.so.xz\" \"$M/libsecmon32.so.xz.sha256sum\" \"$D/libsecmon32.so.xz\" \"$D/libsecmon32.so\"; " +
+        "cp -f \"$S/libsecmon32.so.xz\" \"$M/libsecmon32.so.xz\"; " +
+        ((h2 && validSha256(h2)) ? "echo " + shQuote(h2.toLowerCase()) + " > \"$M/libsecmon32.so.xz.sha256sum\"; " : "") +
+        "cp -f \"$S/libsecmon32.so.xz\" \"$D/libsecmon32.so.xz\"; $B unxz -f \"$D/libsecmon32.so.xz\"; chmod 644 \"$D/libsecmon32.so\"; " : "") +
+        "rm -f \"$M/gadget.version\"; echo \"$V\" > \"$M/gadget.version\"; chmod 644 \"$M/gadget.version\"; echo RESULT:ok; " +
         "elif [ \"$HOK\" = 1 ]; then echo RESULT:verify-fail; " +
         "else echo RESULT:hash-fail; fi; " +
         "else echo RESULT:dl-fail; fi; " +
