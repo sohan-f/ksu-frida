@@ -60,9 +60,11 @@ The bundle id of the application you want to inject frida into.
 ### enabled
 If set to false, then this module will ignore this configuration.
 This is useful if you want to temporarily disable a target while maintaining the config.
+Missing `enabled` defaults to `false`, so a minimal target entry never injects by accident.
 
 ### kernel_assisted_evasion
 Enables kernel-assisted evasion for the target process (KSIE). Requires KernelSU with compatible kernel patches.
+Missing `kernel_assisted_evasion` defaults to `false`.
 
 ### hide_maps
 Whether injected libraries are remapped out of `/proc/self/maps` after
@@ -73,6 +75,7 @@ you do not need maps-hiding for the target.
 
 ### start_up_delay_ms
 Injection of libraries is delayed by this amount in milliseconds.
+Missing `start_up_delay_ms` defaults to `0`.
 
 There are times that you might want to delay the injection of the gadget. Some applications
 might run checks at start up and delaying the injection can help avoid these.
