@@ -642,6 +642,18 @@ function hashCheckSnippet(path, hash) {
 
 async function downloadGadgetUpdate() {
     if (gadgetUpdating || !gadgetLatest || !gadgetUpdateUrls.primary) return;
+    if (!gadgetUpdateVerified) {
+        var proceed = false;
+        try {
+            proceed = confirm("No hash in update metadata — download " + gadgetLatest + " unverified?");
+        } catch (_) {
+            proceed = false;
+        }
+        if (!proceed) {
+            setGadgetUpdateLine("Update cancelled (unverified)");
+            return;
+        }
+    }
     gadgetUpdating = true;
     document.getElementById("btn-download-gadget").style.display = "none";
     var v = gadgetLatest;
