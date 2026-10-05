@@ -303,6 +303,7 @@ androidComponents {
                 exclude 'package.json'
                 exclude 'package-lock.json'
                 exclude 'tsconfig.json'
+                exclude '.gitignore'
             }
             // AGP 9 nests the strip task dir: stripped_native_libs/<Variant>/<stripTask>/out/lib
             from({
