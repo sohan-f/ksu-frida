@@ -177,11 +177,12 @@ fn load_simple_config(module_dir: &str, app_name: &str) -> Option<TargetConfig> 
     let content = fs::read_to_string(format!("{module_dir}/target_packages")).ok()?;
 
     for line in content.lines() {
+        let line = line.trim();
         if line.is_empty() {
             continue;
         }
 
-        let mut fields = line.split(',');
+        let mut fields = line.split(',').map(str::trim);
         let Some(first) = fields.next() else { continue };
         if first != app_name {
             continue;
@@ -219,6 +220,7 @@ fn parse_injected_libraries(module_dir: &str) -> Vec<String> {
 
     content
         .lines()
+        .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect()
@@ -284,10 +286,11 @@ fn load_advanced_config(module_dir: &str, app_name: &str) -> Option<TargetConfig
     };
 
     for target in targets {
-        let Some(deserialized) = deserialize_target_config(target) else {
+        // Name match first: a malformed unrelated entry must stay silent.
+        if target.get("app_name").and_then(Value::as_str) != Some(app_name) {
             continue;
-        };
-        if deserialized.app_name == app_name {
+        }
+        if let Some(deserialized) = deserialize_target_config(target) {
             return Some(deserialized);
         }
     }
@@ -437,6 +440,38 @@ mod tests {
 
         let other = load_config(dir.to_str().unwrap(), "com.other.app").expect("no-delay config");
         assert_eq!(other.start_up_delay_ms, 0);
+    }
+
+    #[test]
+    fn malformed_unrelated_entry_does_not_block_resolution() {
+        let dir = TempDir::new("unrelated-broken");
+        fs::write(
+            dir.join("config.json"),
+            r#"{"targets":[{"app_name":"other.app","enabled":"yes"},
+                {"app_name":"a.b","enabled":true,"kernel_assisted_evasion":true,
+                "start_up_delay_ms":0,"injected_libraries":[]}]}"#,
+        )
+        .unwrap();
+        assert!(load_config(dir.to_str().unwrap(), "a.b").is_some());
+        assert!(load_config(dir.to_str().unwrap(), "other.app").is_none());
+    }
+
+    #[test]
+    fn legacy_lines_are_trimmed() {
+        let dir = TempDir::new("legacy-trim");
+        fs::write(
+            dir.join("target_packages"),
+            "  com.simple.app , 250  \n\ncom.other.app\n",
+        )
+        .unwrap();
+        fs::write(dir.join("injected_libraries"), "  /a.so  \n\n/b.so\n").unwrap();
+
+        let cfg = load_config(dir.to_str().unwrap(), "com.simple.app").expect("simple config");
+        assert_eq!(cfg.start_up_delay_ms, 250);
+        assert_eq!(
+            cfg.injected_libraries,
+            ["/a.so".to_string(), "/b.so".to_string()]
+        );
     }
 
     #[test]
