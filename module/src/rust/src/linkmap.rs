@@ -185,6 +185,7 @@ impl WritableWindow {
             let ps = libc::sysconf(libc::_SC_PAGESIZE);
             if ps <= 0 { 4096 } else { ps as usize }
         };
+        debug_assert!(page.is_power_of_two());
         if len == 0 {
             return None;
         }
@@ -246,8 +247,9 @@ unsafe fn scrub_tables(
     if symtab != base && nsyms <= MAX_SYMBOLS {
         for i in 0..nsyms {
             // SAFETY: `i` is bounded by `nchain` from our own hash table
-            // (capped above); each step lands on a symbol entry.
-            let sym = unsafe { &*((symtab + i * size_of::<Sym>()) as *const Sym) };
+            // (capped above); each step lands inside our own table; unaligned copy.
+            let sym: Sym =
+                unsafe { ((symtab + i * size_of::<Sym>()) as *const Sym).read_unaligned() };
             let off = sym.st_name as usize;
             if off >= strsz {
                 continue;
@@ -301,8 +303,9 @@ unsafe fn scrub_elf_metadata(info: *mut DlPhdrInfo, replacement: &[u8]) -> (bool
     let mut dyn_addr = 0usize;
     for i in 0..phnum as usize {
         // SAFETY: `i` is bounded by the linker's `phnum`; each step lands
-        // on a program header of our own read-only table.
-        let p = unsafe { &*(phdr.byte_add(i * size_of::<Phdr>()) as *const Phdr) };
+        // inside our own read-only table; unaligned copy, no alignment promise.
+        let p: Phdr =
+            unsafe { (phdr.byte_add(i * size_of::<Phdr>()) as *const Phdr).read_unaligned() };
         if p.p_type == PT_DYNAMIC {
             dyn_addr = base.wrapping_add(p.p_vaddr as usize);
             break;
@@ -316,8 +319,8 @@ unsafe fn scrub_elf_metadata(info: *mut DlPhdrInfo, replacement: &[u8]) -> (bool
         (0usize, 0usize, 0usize, 0usize, 0usize, None::<usize>);
     for i in 0..MAX_DYNAMIC {
         // SAFETY: bounded walk of the linker's dynamic array; each step
-        // lands on a dynamic entry of our own read-only table.
-        let d = unsafe { &*((dyn_addr + i * size_of::<Dyn>()) as *const Dyn) };
+        // lands inside our own read-only table; unaligned copy.
+        let d: Dyn = unsafe { ((dyn_addr + i * size_of::<Dyn>()) as *const Dyn).read_unaligned() };
         let tag = d.d_tag as i64;
         if tag == DT_NULL {
             break;

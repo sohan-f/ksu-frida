@@ -115,6 +115,19 @@ fn deserialize_child_gating_config(value: &Value) -> Option<ChildGatingConfig> {
     Some(result)
 }
 
+// Optional bool field: missing keeps the default, wrong types reject the target.
+fn opt_bool(obj: &serde_json::Map<String, Value>, key: &str) -> Option<Option<bool>> {
+    let value = match obj.get(key) {
+        None => return Some(None),
+        Some(value) => value,
+    };
+    let Some(b) = value.as_bool() else {
+        loge_fmt(format_args!("invalid config: expected {key} to be a bool"));
+        return None;
+    };
+    Some(Some(b))
+}
+
 fn deserialize_target_config(value: &Value) -> Option<TargetConfig> {
     let Some(obj) = value.as_object() else {
         loge("expected config targets array to contain objects");
@@ -130,19 +143,11 @@ fn deserialize_target_config(value: &Value) -> Option<TargetConfig> {
     result.app_name = app_name.to_string();
 
     // Optional fields default fail-closed; only wrong types reject the target.
-    if let Some(enabled) = obj.get("enabled") {
-        let Some(enabled) = enabled.as_bool() else {
-            loge("invalid config: expected targets.enabled members to be a bool");
-            return None;
-        };
+    if let Some(enabled) = opt_bool(obj, "enabled")? {
         result.enabled = enabled;
     }
 
-    if let Some(kernel_assisted_evasion) = obj.get("kernel_assisted_evasion") {
-        let Some(kernel_assisted_evasion) = kernel_assisted_evasion.as_bool() else {
-            loge("invalid config: expected kernel_assisted_evasion members to be a bool");
-            return None;
-        };
+    if let Some(kernel_assisted_evasion) = opt_bool(obj, "kernel_assisted_evasion")? {
         result.kernel_assisted_evasion = kernel_assisted_evasion;
     }
 
@@ -154,11 +159,7 @@ fn deserialize_target_config(value: &Value) -> Option<TargetConfig> {
         result.start_up_delay_ms = start_up_delay_ms.min(MAX_START_UP_DELAY_MS);
     }
 
-    if let Some(hide_maps) = obj.get("hide_maps") {
-        let Some(hide_maps) = hide_maps.as_bool() else {
-            loge("invalid config: expected targets.hide_maps to be a bool");
-            return None;
-        };
+    if let Some(hide_maps) = opt_bool(obj, "hide_maps")? {
         result.hide_maps = hide_maps;
     }
 
