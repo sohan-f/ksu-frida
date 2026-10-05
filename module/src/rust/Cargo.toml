@@ -17,7 +17,7 @@ libc = "0.2"
 serde_json = "1"
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
+unexpected_cfgs = { level = "deny", check-cfg = ["cfg(fuzzing)", "cfg(miri)"] }
 
 [profile.release]
 lto = true
