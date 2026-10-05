@@ -379,9 +379,13 @@ fn tag_anon(address: *mut c_void, size: usize) {
     let r = unsafe { crate::sys::set_vma_anon_name(address, size, c"dalvik-jit".as_ptr()) };
     if let Err(e) = r {
         match e.raw_os_error() {
-            // Rename is cosmetic: unsupported (EINVAL/ENOSYS) or a VMA miss
-            // (ENOMEM on GKI 6.6, verified by probe) need no log.
-            Some(code) if code == libc::EINVAL || code == libc::ENOSYS || code == libc::ENOMEM => {}
+            // Rename is cosmetic: unsupported (EINVAL/ENOSYS), a VMA miss
+            // (ENOMEM), or transient pressure (EAGAIN) need no log.
+            Some(code)
+                if code == libc::EINVAL
+                    || code == libc::ENOSYS
+                    || code == libc::ENOMEM
+                    || code == libc::EAGAIN => {}
             _ => loge_fmt(format_args!("remap: anon rename failed: {e}")),
         }
     }
