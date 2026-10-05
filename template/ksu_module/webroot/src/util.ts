@@ -39,7 +39,7 @@ export function parseJson<T>(raw: unknown, fallback: T): T {
     try { return JSON.parse(raw) as T; } catch (_) { return fallback; }
 }
 
-export function escHtml(s) {
+export function escHtml(s: unknown) {
     var entities: Record<string, string> = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
     return String(s).replace(/[&<>"']/g, function (c) { return entities[c]; });
 }
@@ -51,7 +51,7 @@ export interface ExecResult {
 }
 
 // Single-quoted literals only; never let package names expand as globs or subshells.
-export function shQuote(s) {
+export function shQuote(s: unknown) {
     return "'" + String(s).replace(/'/g, "'\\''") + "'";
 }
 
@@ -61,9 +61,9 @@ export const SCAN_FILE = "/data/local/tmp/libsec/.webui-scan.tmp";
 export const PKGS_FILE = "/data/local/tmp/libsec/.webui-packages.tmp";
 export const POLL_INTERVAL_MS = 1000;
 
-export function parseLabelLines(body) {
+export function parseLabelLines(body: string) {
     var pairs = new Map<string, string>();
-    body.split("\n").forEach(function (line) {
+    body.split("\n").forEach(function (line: string) {
         if (!line || line === DONE_MARK) return;
         var i = line.indexOf("|");
         if (i > 0) pairs.set(line.slice(0, i), line.slice(i + 1).trim());
@@ -81,7 +81,7 @@ export function splitMarked(text: string, marks: string[]): Record<string, strin
     return parts;
 }
 
-export function cmpVersions(a, b) {
+export function cmpVersions(a: unknown, b: unknown) {
     var pa = String(a).split(".");
     var pb = String(b).split(".");
     for (var i = 0; i < Math.max(pa.length, pb.length); i++) {
@@ -92,14 +92,14 @@ export function cmpVersions(a, b) {
     return 0;
 }
 
-export function blockField(text, block, field) {
+export function blockField(text: string, block: string, field: string) {
     var b = new RegExp('"' + block + '"\\s*:\\s*\\{([^}]*)\\}').exec(text || "");
     if (!b) return null;
     var f = new RegExp('"' + field + '"\\s*:\\s*"([^"]+)"').exec(b[1]);
     return f && f[1];
 }
 
-export function parseGadgetMeta(text) {
+export function parseGadgetMeta(text: string) {
     var v = /"version"\s*:\s*"([^"]+)"/.exec(text || "");
     if (!v) return null;
     return {
@@ -122,10 +122,10 @@ export interface GadgetMeta {
 
 export function gadgetUrlsForAbi(abi: string, meta: GadgetMeta | null): GadgetUrls | null {
     if (!meta) return null;
-    function entry(url, hash) {
+    function entry(url: string | null | undefined, hash: unknown): GadgetUrl | null {
         if (!url) return null;
-        var e = { url: url, sha256: null };
-        if (hash && validSha256(hash)) e.sha256 = hash.toLowerCase();
+        var e: GadgetUrl = { url: url, sha256: null };
+        if (typeof hash === "string" && validSha256(hash)) e.sha256 = hash.toLowerCase();
         return e;
     }
     if (abi === "arm64-v8a" && meta.arm64) return {
@@ -169,9 +169,9 @@ export function targetStatusCmd(names: string[]) {
 
 export function parsePorts(lines: string[]) {
     var ports: number[] = [];
-    (lines || []).forEach(function (l) {
+    (lines || []).forEach(function (l: string) {
         var p = parseInt(l, 10);
-        if (p) ports.push(p);
+        if (p >= 1 && p <= 65535) ports.push(p);
     });
     return ports;
 }

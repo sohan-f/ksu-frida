@@ -72,8 +72,9 @@ test("parseLabelLines skips marks and malformed rows", () => {
     assert.equal(m.has("broken"), false);
 });
 
-test("parsePorts keeps decimal ports only", () => {
-    assert.deepEqual(parsePorts(["27042", "abc", "0", "65536"]), [27042, 65536]);
+test("parsePorts keeps valid ports only", () => {
+    assert.deepEqual(parsePorts(["27042", "abc", "0", "65536", "-1"]), [27042]);
+    assert.deepEqual(parsePorts(["1", "65535"]), [1, 65535]);
 });
 
 test("targetStatusCmd quotes names and matches exactly", () => {

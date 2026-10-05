@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { FakeDevice } from "./virtual";
+import { hashCheckSnippet, shQuote, validSha256 } from "../src/util";
 
 const ROOT = path.join(__dirname, "..", "..");
 const MAIN = fs.readFileSync(path.join(ROOT, "main.ts"), "utf8");
@@ -42,13 +43,6 @@ function extractInstallScript(vars: Record<string, unknown>): string {
     const MODDIR = "/data/adb/modules/ksufrida";
     const GADGET_DL_DIR = "/data/local/tmp/libsec/.webui-gadget-dl";
     const BUSYBOX_BIN = "/data/adb/ksu/bin/busybox";
-    const shQuote = (s: string) => "'" + String(s).replace(/'/g, "'\\''") + "'";
-    const validSha256 = (h: unknown) =>
-        /^[0-9a-fA-F]{64}$/.test(typeof h === "string" ? h : "");
-    const hashCheckSnippet = (shellPath: string, hash: string, busyboxBin: string) =>
-        `{ H=$(sha256sum ${shellPath} 2>/dev/null | cut -d' ' -f1); [ "$H" = ${shQuote(
-            hash.toLowerCase(),
-        )} ]; }`;
     const scope: Record<string, unknown> = { MODDIR, GADGET_DL_DIR, BUSYBOX_BIN, shQuote, validSha256, hashCheckSnippet, ...vars };
     const names = Object.keys(scope);
     const fn = new Function(...names, `return (${out});`);
