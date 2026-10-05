@@ -50,7 +50,7 @@ pub fn check_and_inject(app_name: &str) -> bool {
     true
 }
 
-fn needs_injection_thread(cfg: &TargetConfig) -> bool {
+const fn needs_injection_thread(cfg: &TargetConfig) -> bool {
     !cfg.injected_libraries.is_empty() || cfg.child_gating.enabled
 }
 
@@ -219,6 +219,14 @@ enum RangeOutcome {
     Unsupported,
 }
 
+#[allow(clippy::unnested_or_patterns)]
+fn is_unsupported(code: Option<i32>) -> bool {
+    matches!(
+        code,
+        Some(libc::ENOSYS) | Some(libc::EXDEV) | Some(libc::EINVAL) | Some(libc::EOPNOTSUPP)
+    )
+}
+
 fn copy_file_range_all(
     input: &File,
     output: &File,
@@ -237,15 +245,7 @@ fn copy_file_range_all(
             Err(err) if err.kind() == ErrorKind::Interrupted => continue,
             Err(err) => {
                 // Only the first call may report Unsupported; support cannot change mid-file.
-                if first
-                    && matches!(
-                        err.raw_os_error(),
-                        Some(libc::ENOSYS)
-                            | Some(libc::EXDEV)
-                            | Some(libc::EINVAL)
-                            | Some(libc::EOPNOTSUPP)
-                    )
-                {
+                if first && is_unsupported(err.raw_os_error()) {
                     return RangeOutcome::Unsupported;
                 }
                 loge_fmt(format_args!(
@@ -977,6 +977,19 @@ mod tests {
             RangeOutcome::Unsupported => {}
             RangeOutcome::Failed => panic!("kernel copy failed outright"),
         }
+    }
+
+    #[test]
+    fn unsupported_errnos_map_to_fallback() {
+        assert!(is_unsupported(Some(libc::ENOSYS)));
+        assert!(is_unsupported(Some(libc::EXDEV)));
+        assert!(is_unsupported(Some(libc::EINVAL)));
+        assert!(is_unsupported(Some(libc::EOPNOTSUPP)));
+        assert!(!is_unsupported(Some(
+            libc::ENOSYS | libc::EXDEV | libc::EINVAL | libc::EOPNOTSUPP
+        )));
+        assert!(!is_unsupported(Some(0)));
+        assert!(!is_unsupported(None));
     }
 
     #[test]

@@ -54,7 +54,7 @@ pub(crate) mod test_support {
                 COUNTER.fetch_add(1, Ordering::Relaxed)
             ));
             std::fs::create_dir_all(&dir).unwrap();
-            TempDir(dir)
+            Self(dir)
         }
 
         pub(crate) fn path(&self) -> &Path {
@@ -63,9 +63,9 @@ pub(crate) mod test_support {
     }
 
     impl Deref for TempDir {
-        type Target = PathBuf;
+        type Target = Path;
 
-        fn deref(&self) -> &PathBuf {
+        fn deref(&self) -> &Path {
             &self.0
         }
     }

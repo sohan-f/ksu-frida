@@ -546,7 +546,9 @@ mod tests {
     static STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn lock_state() -> std::sync::MutexGuard<'static, ()> {
-        STATE_LOCK.lock().unwrap_or_else(|err| err.into_inner())
+        STATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn current_handler(sig: c_int) -> usize {
@@ -648,7 +650,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "manual aarch64 exec-under-relocate stress test"]
     #[cfg(target_arch = "aarch64")]
     fn relocate_exec_segment_under_concurrent_execution() {
         use std::sync::atomic::AtomicBool;
@@ -672,7 +674,7 @@ mod tests {
                 0,
             );
             assert_ne!(address, libc::MAP_FAILED, "{}", io::Error::last_os_error());
-            let code: [u32; 2] = [0x52800540, 0xD65F03C0];
+            let code: [u32; 2] = [0x5280_0540, 0xD65F_03C0];
             std::ptr::copy_nonoverlapping(code.as_ptr().cast::<u8>(), address.cast::<u8>(), 8);
             assert_eq!(
                 libc::mprotect(address, SIZE, libc::PROT_READ | libc::PROT_EXEC),

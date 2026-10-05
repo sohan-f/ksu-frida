@@ -77,7 +77,7 @@ pub fn seal_memfd_fixed(fd: c_int) -> Result<(), io::Error> {
 }
 
 #[cfg(any(target_os = "android", target_os = "linux", test))]
-pub const PR_SET_VMA: c_int = 0x53564d41;
+pub const PR_SET_VMA: c_int = 0x5356_4D41;
 #[cfg(any(target_os = "android", target_os = "linux", test))]
 pub const PR_SET_VMA_ANON_NAME: c_int = 0;
 

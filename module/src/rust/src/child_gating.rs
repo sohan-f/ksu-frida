@@ -28,7 +28,7 @@ unsafe extern "C" {
 }
 
 #[cfg(not(target_os = "android"))]
-unsafe fn ksufrida_dobby_hook(
+const unsafe fn ksufrida_dobby_hook(
     _addr: *mut c_void,
     _replace: *mut c_void,
     _orig: *mut *mut c_void,

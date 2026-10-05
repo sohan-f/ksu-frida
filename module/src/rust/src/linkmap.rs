@@ -76,7 +76,7 @@ const DT_STRTAB: i64 = 5;
 const DT_SYMTAB: i64 = 6;
 const DT_STRSZ: i64 = 10;
 const DT_SONAME: i64 = 14;
-const DT_GNU_HASH: i64 = 0x6ffffef5;
+const DT_GNU_HASH: i64 = 0x6fff_fef5;
 
 const MAX_DYNAMIC: usize = 128;
 const MAX_SYMBOLS: usize = 1_000_000;
@@ -206,31 +206,23 @@ impl WritableWindow {
             ));
             return None;
         }
-        Some(WritableWindow {
+        Some(Self {
             start,
             len: end - start,
             label,
         })
     }
+}
 
-    fn close(self) {
-        // SAFETY: the range this window opened; the result is checked below.
+impl Drop for WritableWindow {
+    fn drop(&mut self) {
+        // SAFETY: the range `open` flipped; best-effort restore.
         if unsafe { libc::mprotect(self.start as *mut c_void, self.len, libc::PROT_READ) } != 0 {
             loge_fmt(format_args!(
                 "linkmap: cannot re-protect {}: {}",
                 self.label,
                 std::io::Error::last_os_error()
             ));
-        }
-        std::mem::forget(self);
-    }
-}
-
-impl Drop for WritableWindow {
-    fn drop(&mut self) {
-        // SAFETY: same range `open` flipped; best-effort restore.
-        unsafe {
-            libc::mprotect(self.start as *mut c_void, self.len, libc::PROT_READ);
         }
     }
 }
@@ -369,7 +361,7 @@ unsafe fn scrub_elf_metadata(info: *mut DlPhdrInfo, replacement: &[u8]) -> (bool
             return (false, 0);
         };
         let result = scrub_tables(strtab, strsz, symtab, base, nsyms, soname, replacement);
-        window.close();
+        drop(window);
         result
     };
     (soname_done, symbols)

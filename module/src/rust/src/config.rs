@@ -49,7 +49,7 @@ pub struct TargetConfig {
 
 impl Default for TargetConfig {
     fn default() -> Self {
-        TargetConfig {
+        Self {
             enabled: false,
             app_name: String::new(),
             start_up_delay_ms: 0,
@@ -227,28 +227,8 @@ fn parse_injected_libraries(module_dir: &str) -> Vec<String> {
 }
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() {
-        return true;
-    }
-    if haystack.len() < needle.len() {
-        return false;
-    }
-    let first = needle[0];
-    let mut pos = 0;
-    while pos + needle.len() <= haystack.len() {
-        let Some(offset) = haystack[pos..].iter().position(|&b| b == first) else {
-            return false;
-        };
-        let start = pos + offset;
-        if start + needle.len() > haystack.len() {
-            return false;
-        }
-        if &haystack[start..start + needle.len()] == needle {
-            return true;
-        }
-        pos = start + 1;
-    }
-    false
+    // `windows(0)` panics; longer needle yields empty iterator → false.
+    needle.is_empty() || haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 fn load_advanced_config(module_dir: &str, app_name: &str) -> Option<TargetConfig> {
