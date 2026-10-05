@@ -33,6 +33,13 @@ jobs:
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
 
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: template/ksu_module/webroot/package-lock.json
+
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:

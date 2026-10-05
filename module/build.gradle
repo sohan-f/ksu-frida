@@ -186,8 +186,7 @@ android {
     }
 }
 
-def rustBuildLibrary = tasks.register("buildRustLibrary", Exec) {
-    group = "build"
+def rustBuildLibrary = tasks.register("buildRustLibrary", Exec) {    group = "build"
     description = "Builds the Rust core staticlib for all module ABIs"
 
     workingDir = file("src/rust")
@@ -217,6 +216,19 @@ def rustBuildLibrary = tasks.register("buildRustLibrary", Exec) {
             "build", "--release", "--lib"
 }
 
+// Builds the WebUI bundle (TypeScript strict + esbuild) before packaging.
+def webuiDir = file("$rootDir/template/ksu_module/webroot")
+def buildWebUI = tasks.register("buildWebUI", Exec) {
+    group = "build"
+    description = "Type-checks and bundles the WebUI"
+
+    workingDir = webuiDir
+    commandLine "sh", "-c", "npm ci --no-audit --no-fund && npm run build"
+
+    inputs.files("$webuiDir/main.ts", "$webuiDir/package.json", "$webuiDir/package-lock.json")
+    outputs.file("$webuiDir/main.js")
+}
+
 // The Rust staticlib must exist before ndk-build links it.
 tasks.configureEach { task ->
     if (task.name.startsWith("configureNdkBuild") || task.name.startsWith("buildNdkBuild")) {
@@ -238,6 +250,7 @@ androidComponents {
         def prepare = tasks.register("prepareModuleFiles${variantCapped}", Sync) {
             dependsOn("assemble$variantCapped")
             dependsOn fetchGadget
+            dependsOn buildWebUI
             duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 
             def templatePath = "$rootDir/template/ksu_module"
@@ -250,6 +263,12 @@ androidComponents {
                 exclude 'module.prop'
                 exclude 'customize.sh'
                 exclude 'verify.sh'
+                exclude 'webroot/node_modules/**'
+                exclude 'webroot/main.ts'
+                exclude 'webroot/package.json'
+                exclude 'webroot/package-lock.json'
+                exclude 'webroot/tsconfig.json'
+                exclude 'webroot/.gitignore'
             }
             from(templatePath) {
                 include 'module.prop'
@@ -275,6 +294,11 @@ androidComponents {
             }
             from(templatePath + "/webroot") {
                 into 'webroot'
+                exclude 'node_modules/**'
+                exclude 'main.ts'
+                exclude 'package.json'
+                exclude 'package-lock.json'
+                exclude 'tsconfig.json'
             }
             // AGP 9 nests the strip task dir: stripped_native_libs/<Variant>/<stripTask>/out/lib
             from({
