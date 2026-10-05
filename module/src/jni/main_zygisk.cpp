@@ -16,10 +16,10 @@ class MyModule : public zygisk::ModuleBase {
     }
 
     void postAppSpecialize(const AppSpecializeArgs *args) override {
-        const jstring name = (args != nullptr) ? args->nice_name : nullptr;
         if (this->api == nullptr) {
             return;
         }
+        const jstring name = (args != nullptr) ? args->nice_name : nullptr;
         if (!ksufrida_handle_app(this->env, name)) {
             this->api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
         }
