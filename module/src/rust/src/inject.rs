@@ -39,7 +39,8 @@ pub fn check_and_inject(app_name: &str) -> bool {
     }
 
     if std::thread::Builder::new()
-        .name("ksufrida-inject".to_string())
+        // Bland startup-worker name (≤15 bytes: TASK_COMM_LEN);
+        .name("AppInitThread".to_string())
         .spawn(move || inject_libs(&cfg, pid))
         .is_err()
     {
@@ -526,7 +527,8 @@ fn sweep_stale_stage_dirs(cache_dir: &str) {
 }
 
 // Marker proving a numeric cache subdir is our stage dir: the sweep only enters dirs carrying it.
-const STAGE_MARKER: &str = ".ksufrida-stage";
+// Bland dotfile; a natural-looking name risks colliding with app-owned files.
+const STAGE_MARKER: &str = ".staging";
 
 fn cache_dir_for(app_name: &str) -> Option<String> {
     let pkg = package_of(app_name);
