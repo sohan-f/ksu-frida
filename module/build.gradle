@@ -29,9 +29,11 @@ task fetchGadget {
 
         def fail = { msg -> throw new GradleException(msg) }
 
-        // gadget-pins.json is authoritative: builds never follow "latest"
-        // silently. To adopt a new gadget, copy version + sha256 from the
-        // release gadget.json (or SHA256SUMS) into gadget-pins.json.
+        // gadget-pins.json is authoritative: every downloaded byte is verified
+        // against it, and a newer published gadget only warns (the build
+        // proceeds with the pinned one). To adopt a new gadget, copy
+        // version + sha256 from the release gadget.json (or SHA256SUMS)
+        // into gadget-pins.json.
         def pins = null
         try {
             pins = new groovy.json.JsonSlurper().parse(pinsFile)
@@ -74,39 +76,52 @@ task fetchGadget {
         }
 
         def urls = [:]
+        def metaUsable = false
         if (meta != null) {
             def metaVersion = meta?.version
             if (!(metaVersion ==~ /\d+\.\d+\.\d+/)) {
                 fail("gadget metadata has invalid version: ${metaVersion}")
             }
-            if (metaVersion != pinnedVersion) {
-                fail("gadget ${metaVersion} is published but pins require ${pinnedVersion};"
-                        + " update gadget-pins.json to adopt it")
-            }
-            gadgetArchs.each { arch ->
-                def u = meta?.assets?.get(arch)
-                if (!(u ==~ /https:\/\/github\.com\/sohan-f\/knox-frida-patcher\/releases\/download\/\d+\.\d+\.\d+\/frida-gadget-\d+\.\d+\.\d+-android-(arm|arm64)\.so\.xz/)) {
-                    fail("gadget metadata has invalid URL for ${arch}: ${u}")
+            if (metaVersion == pinnedVersion) {
+                gadgetArchs.each { arch ->
+                    def u = meta?.assets?.get(arch)
+                    if (!(u ==~ /https:\/\/github\.com\/sohan-f\/knox-frida-patcher\/releases\/download\/\d+\.\d+\.\d+\/frida-gadget-\d+\.\d+\.\d+-android-(arm|arm64)\.so\.xz/)) {
+                        fail("gadget metadata has invalid URL for ${arch}: ${u}")
+                    }
+                    def h = meta?.sha256?.get(arch)
+                    if (!(h ==~ /[0-9a-fA-F]{64}/)
+                            || !h.toString().equalsIgnoreCase(pinnedHashes.get(arch).toString())) {
+                        fail("gadget metadata sha256 for ${arch} does not match gadget-pins.json;"
+                                + " refusing to download (possible metadata tampering)")
+                    }
+                    urls[arch] = u
                 }
-                def h = meta?.sha256?.get(arch)
-                if (!(h ==~ /[0-9a-fA-F]{64}/)
-                        || !h.toString().equalsIgnoreCase(pinnedHashes.get(arch).toString())) {
-                    fail("gadget metadata sha256 for ${arch} does not match gadget-pins.json;"
-                            + " refusing to download (possible metadata tampering)")
-                }
-                urls[arch] = u
+                metaUsable = true
+            } else {
+                logger.warn("gadget ${metaVersion} is published but pins require ${pinnedVersion};"
+                        + " building with the pinned gadget instead (update gadget-pins.json to adopt it)")
             }
-        } else {
+        }
+        if (!metaUsable) {
+            // No usable metadata (unreachable, or newer than pins): fall back to
+            // deterministic pinned-version URLs. Every downloaded byte is still
+            // verified against gadget-pins.json before use; only the adoption
+            // step stays manual (or via the bump PR workflow).
             if (marker.exists() && marker.text.trim() == pinnedVersion && verifyOutputs()) {
                 logger.lifecycle("gadget ${pinnedVersion} already fetched and verified")
                 return
             }
-            if (!marker.exists() || marker.text.trim() != pinnedVersion) {
+            if (meta == null) {
+                if (marker.exists() && marker.text.trim() == pinnedVersion) {
+                    fail("cached gadget for ${pinnedVersion} failed sha256 verification;"
+                            + " delete gadget/libgadget-*.so.xz and retry")
+                }
                 fail("gadget metadata unreachable and no cached gadget for pinned version"
                         + " ${pinnedVersion}; connect to the network and retry")
             }
-            fail("cached gadget for ${pinnedVersion} failed sha256 verification;"
-                    + " delete gadget/libgadget-*.so.xz and retry")
+            gadgetArchs.each { arch ->
+                urls[arch] = "https://github.com/sohan-f/knox-frida-patcher/releases/download/${pinnedVersion}/frida-gadget-${pinnedVersion}-android-${arch}.so.xz"
+            }
         }
 
         if (marker.exists() && marker.text.trim() == pinnedVersion && verifyOutputs()) {
