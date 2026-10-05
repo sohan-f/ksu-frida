@@ -1,0 +1,170 @@
+name: Gadget pins bump
+
+# Automation proposes, a human merge authorizes: fetchGadget stays
+# fail-closed, so a newer upstream gadget can only land via a reviewed PR.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gadget-bump
+  cancel-in-progress: false
+
+jobs:
+  propose:
+    name: Propose gadget pins update
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check for newer gadget
+        id: check
+        run: |
+          set -euo pipefail
+
+          META_URL="https://github.com/sohan-f/knox-frida-patcher/releases/latest/download/gadget.json"
+          TMPDIR="$(mktemp -d "${RUNNER_TEMP:-/tmp}/gadget-bump.XXXXXX")"
+          trap 'rm -rf "$TMPDIR"' EXIT
+
+          if ! curl -sfL --max-time 60 "$META_URL" -o "$TMPDIR/meta.json"; then
+            echo "::notice::gadget metadata unreachable; skipping bump check"
+            echo "bump=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          python3 - "$TMPDIR/meta.json" gadget-pins.json "$TMPDIR" "$GITHUB_OUTPUT" <<'PYEOF'
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import sys
+          import urllib.request
+
+          meta_path, pins_path, tmpdir, github_output = sys.argv[1:5]
+          out_lines = []
+
+          def fail(msg):
+              print(f"::error::{msg}")
+              sys.exit(1)
+
+          def emit(key, value):
+              out_lines.append(f"{key}={value}")
+
+          try:
+              with open(meta_path) as f:
+                  meta = json.load(f)
+          except Exception as e:
+              fail(f"gadget metadata is not valid JSON: {e}")
+
+          ver_re = r"\d+\.\d+\.\d+"
+          url_re = (r"https://github\.com/sohan-f/knox-frida-patcher/releases/download/"
+                    r"\d+\.\d+\.\d+/frida-gadget-\d+\.\d+\.\d+-android-(arm|arm64)\.so\.xz")
+          hex_re = r"[0-9a-fA-F]{64}"
+
+          version = meta.get("version")
+          assets = meta.get("assets") or {}
+          digests = meta.get("sha256") or {}
+          if not (isinstance(version, str) and re.fullmatch(ver_re, version)):
+              fail(f"gadget metadata has invalid version: {version!r}")
+          wanted = {}
+          for arch in ("arm", "arm64"):
+              url, digest = assets.get(arch), digests.get(arch)
+              if not (isinstance(url, str) and re.fullmatch(url_re, url)):
+                  fail(f"gadget metadata has invalid URL for {arch}: {url!r}")
+              if not (isinstance(digest, str) and re.fullmatch(hex_re, digest)):
+                  fail(f"gadget metadata has invalid sha256 for {arch}: {digest!r}")
+              wanted[arch] = (url, digest)
+
+          with open(pins_path) as f:
+              pins = json.load(f)
+          old_version = pins.get("version", "0.0.0")
+          if [int(x) for x in version.split(".")] <= [int(x) for x in old_version.split(".")]:
+              if version != old_version:
+                  fail(f"gadget metadata rolled back to {version} from pinned {old_version}")
+              print(f"pins already at {old_version}; nothing to do")
+              emit("bump", "false")
+              with open(github_output, "a") as f:
+                  f.write("\n".join(out_lines) + "\n")
+              sys.exit(0)
+
+          fetched = {}
+          for arch, (url, digest) in wanted.items():
+              dest = f"{tmpdir}/{arch}.so.xz"
+              try:
+                  with urllib.request.urlopen(url, timeout=600) as resp, open(dest, "wb") as f:
+                      while chunk := resp.read(65536):
+                          f.write(chunk)
+              except Exception as e:
+                  fail(f"failed to download gadget {arch}: {e}")
+              actual = hashlib.sha256(open(dest, "rb").read()).hexdigest()
+              if actual.lower() != digest.lower():
+                  fail(f"gadget {arch} digest mismatch: metadata {digest}, got {actual}")
+              try:
+                  subprocess.run(["xz", "-t", dest], check=True, capture_output=True)
+                  soname = subprocess.run(
+                      ["readelf", "-d", dest], check=True, capture_output=True, text=True
+                  ).stdout
+              except Exception as e:
+                  fail(f"gadget {arch} failed integrity inspection: {e}")
+              match = re.search(r"\(SONAME\)[^[]*\[([^\]]+)\]", soname)
+              if not match:
+                  fail(f"gadget {arch} has no SONAME; refusing to propose it")
+              import os
+              fetched[arch] = (digest.lower(), os.path.getsize(dest), match.group(1))
+
+          with open(pins_path, "w") as f:
+              json.dump(
+                  {"version": version, "sha256": {a: fetched[a][0] for a in ("arm", "arm64")}},
+                  f,
+                  indent=4,
+              )
+              f.write("\n")
+
+          emit("bump", "true")
+          emit("old_version", old_version)
+          emit("version", version)
+          for arch in ("arm", "arm64"):
+              digest, size, soname = fetched[arch]
+              emit(f"{arch}_sha", digest)
+              emit(f"{arch}_size", str(size))
+              emit(f"{arch}_soname", soname)
+          with open(github_output, "a") as f:
+              f.write("\n".join(out_lines) + "\n")
+          print(f"proposing pins {old_version} -> {version}")
+          PYEOF
+
+      - name: Open update PR
+        if: steps.check.outputs.bump == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "build: adopt gadget ${{ steps.check.outputs.version }} pins"
+          branch: gadget-bump-${{ steps.check.outputs.version }}
+          delete-branch: true
+          title: "build: adopt gadget ${{ steps.check.outputs.version }} pins"
+          body: |
+            Automated gadget pins proposal. Merging is the authorization step —
+            `fetchGadget` stays fail-closed until this lands.
+
+            - pins: `${{ steps.check.outputs.old_version }}` -> `${{ steps.check.outputs.version }}`
+            - sha256 arm: `${{ steps.check.outputs.arm_sha }}`
+            - sha256 arm64: `${{ steps.check.outputs.arm64_sha }}`
+            - sizes (bytes): arm `${{ steps.check.outputs.arm_size }}`, arm64 `${{ steps.check.outputs.arm64_size }}`
+            - SONAMEs: arm `${{ steps.check.outputs.arm_soname }}`, arm64 `${{ steps.check.outputs.arm64_soname }}`
+            - upstream release: https://github.com/sohan-f/knox-frida-patcher/releases/tag/${{ steps.check.outputs.version }}
+
+            Verified by this workflow before proposing:
+            - metadata schema matches `fetchGadget` (version/URL/digest patterns)
+            - both `.xz` downloaded and hashed against the metadata digests
+            - `xz -t` integrity passed and each file carries a SONAME
+
+            Reviewer: confirm the version is a genuine upstream Frida gadget
+            release before merging. Full CI (including the fail-closed gadget
+            fetch) runs on this PR.
