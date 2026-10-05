@@ -10,6 +10,52 @@ on:
       - main
 
 jobs:
+  rust-checks:
+    name: Rust checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: module/src/rust -> target
+
+      - name: fmt, clippy, test
+        run: |
+          cd module/src/rust
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+
+  miri:
+    name: Miri (nightly)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: module/src/rust -> target
+
+      - name: Miri test
+        run: |
+          cd module/src/rust
+          MIRIFLAGS="-Zmiri-disable-isolation" cargo miri test
+
   build:
     name: Build Module
     runs-on: ubuntu-latest

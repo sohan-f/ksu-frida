@@ -1,0 +1,31 @@
+name: Fuzz-Parser
+on:
+  schedule:
+    - cron: '0 3 * * 0'
+  workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: 'Fuzzing budget in seconds'
+        default: '300'
+        required: false
+
+jobs:
+  fuzz:
+    name: libFuzzer parse_config
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Fuzz
+        run: |
+          cd module/src/rust/fuzz
+          cargo fuzz run parse_config -- \
+            -max_total_time=${{ github.event.inputs.fuzz_seconds || '300' }} \
+            -print_final_stats=1
