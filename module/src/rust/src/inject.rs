@@ -131,7 +131,7 @@ fn open_dst_hardened(dst: &str) -> Option<File> {
                 | libc::O_NOFOLLOW
                 | libc::O_NONBLOCK) as u64,
             mode: 0o700,
-            resolve: crate::sys::RESOLVE_NO_SYMLINKS | crate::sys::RESOLVE_NO_MAGICLINKS,
+            resolve: crate::sys::RESOLVE_NO_SYMLINKS,
         };
         // SAFETY: `c_path` live, `how` fully init; fd checked below.
         let fd = unsafe { crate::sys::openat2(libc::AT_FDCWD, c_path.as_ptr(), &raw const how) };

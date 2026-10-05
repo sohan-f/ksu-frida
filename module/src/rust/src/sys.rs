@@ -87,6 +87,7 @@ pub const PR_SET_VMA_ANON_NAME: c_int = 0;
 // openat2 resolve flags from linux/openat2.h (NDK 29). Only NO_SYMLINKS +
 // NO_MAGICLINKS are used for staging: BENEATH/IN_ROOT break absolute paths.
 #[cfg(any(target_os = "android", target_os = "linux", test))]
+#[allow(dead_code)] // Kept for explicitness; NO_SYMLINKS already implies it.
 pub const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
 #[cfg(any(target_os = "android", target_os = "linux", test))]
 pub const RESOLVE_NO_SYMLINKS: u64 = 0x04;
@@ -349,7 +350,7 @@ mod tests {
         };
         assert_ne!(addr, libc::MAP_FAILED);
         // SAFETY: addr/size is our live anon mapping; name is a static literal.
-        let r = unsafe { set_vma_anon_name(addr, SIZE, c"[anon:dalvik-jit]".as_ptr()) };
+        let r = unsafe { set_vma_anon_name(addr, SIZE, c"dalvik-jit".as_ptr()) };
         // SAFETY: cleanup our mapping.
         unsafe { libc::munmap(addr, SIZE) };
         if let Err(e) = r {

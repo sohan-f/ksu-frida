@@ -34,18 +34,52 @@ struct ProcMapsInfo {
     path: String,
 }
 
-fn next_field(s: &str) -> Option<(&str, &str)> {
-    let s = s.trim_start();
-    if s.is_empty() {
-        return None;
-    }
-    let end = s.find(char::is_whitespace).unwrap_or(s.len());
-    Some((&s[..end], &s[end..]))
-}
-
 fn is_private_mapping(perms: &str) -> bool {
     // 4th char is p/s: shared mappings must keep sharing, never convert to private anon.
     perms.as_bytes().get(3) != Some(&b's')
+}
+
+fn parse_maps_line(line: &str) -> Option<ProcMapsInfo> {
+    // The kernel separates the five fixed fields with single spaces, but the
+    // pathname itself may contain spaces (shown unescaped), so split 6 ways.
+    let mut parts = line.trim_start().splitn(6, ' ');
+    let (range, perms, _, _, _, path) = (
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+    );
+
+    let (start_hex, end_hex) = range.split_once('-')?;
+    let (Ok(start), Ok(end)) = (
+        usize::from_str_radix(start_hex, 16),
+        usize::from_str_radix(end_hex, 16),
+    ) else {
+        return None;
+    };
+
+    let mut prot = 0;
+    if perms.contains('r') {
+        prot |= libc::PROT_READ;
+    }
+    if perms.contains('w') {
+        prot |= libc::PROT_WRITE;
+    }
+    if perms.contains('x') {
+        prot |= libc::PROT_EXEC;
+    }
+    // 4th char is p/s: shared mappings must keep sharing, never convert to private anon.
+    let private = is_private_mapping(perms);
+
+    Some(ProcMapsInfo {
+        start,
+        end,
+        perms: prot,
+        private,
+        path: path.trim().to_string(),
+    })
 }
 
 fn get_modules_by_name(m_name: &str) -> Vec<ProcMapsInfo> {
@@ -60,52 +94,9 @@ fn get_modules_by_name(m_name: &str) -> Vec<ProcMapsInfo> {
             continue;
         }
 
-        let Some((range, rest)) = next_field(&line) else {
-            continue;
-        };
-        let Some((perms, rest)) = next_field(rest) else {
-            continue;
-        };
-        let Some((_offset, rest)) = next_field(rest) else {
-            continue;
-        };
-        let Some((_dev, rest)) = next_field(rest) else {
-            continue;
-        };
-        let Some((_inode, rest)) = next_field(rest) else {
-            continue;
-        };
-
-        let Some((start_hex, end_hex)) = range.split_once('-') else {
-            continue;
-        };
-        let (Ok(start), Ok(end)) = (
-            usize::from_str_radix(start_hex, 16),
-            usize::from_str_radix(end_hex, 16),
-        ) else {
-            continue;
-        };
-
-        let mut prot = 0;
-        if perms.contains('r') {
-            prot |= libc::PROT_READ;
+        if let Some(info) = parse_maps_line(&line) {
+            maps.push(info);
         }
-        if perms.contains('w') {
-            prot |= libc::PROT_WRITE;
-        }
-        if perms.contains('x') {
-            prot |= libc::PROT_EXEC;
-        }
-        // 4th char is p/s: shared mappings must keep sharing, never convert to private anon.
-        let private = is_private_mapping(perms);
-
-        maps.push(ProcMapsInfo {
-            start,
-            end,
-            perms: prot,
-            private,
-            path: rest.trim().to_string(),
-        });
     }
 
     maps
@@ -385,10 +376,12 @@ unsafe fn relocate_segment(
 #[cfg(any(target_os = "android", target_os = "linux"))]
 fn tag_anon(address: *mut c_void, size: usize) {
     // SAFETY: `address`/`size` is the live anon mapping just rebuilt; name is a static literal.
-    let r = unsafe { crate::sys::set_vma_anon_name(address, size, c"[anon:dalvik-jit]".as_ptr()) };
+    let r = unsafe { crate::sys::set_vma_anon_name(address, size, c"dalvik-jit".as_ptr()) };
     if let Err(e) = r {
         match e.raw_os_error() {
-            Some(code) if code == libc::EINVAL || code == libc::ENOSYS => {}
+            // Rename is cosmetic: unsupported (EINVAL/ENOSYS) or a VMA miss
+            // (ENOMEM on GKI 6.6, verified by probe) need no log.
+            Some(code) if code == libc::EINVAL || code == libc::ENOSYS || code == libc::ENOMEM => {}
             _ => loge_fmt(format_args!("remap: anon rename failed: {e}")),
         }
     }
@@ -464,11 +457,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_maps_fields() {
-        let (field, rest) = next_field("  7ac49c2000-7ac4a26000 r--p 0 00:00 0 /a b").unwrap();
-        assert_eq!(field, "7ac49c2000-7ac4a26000");
-        let (perms, _) = next_field(rest).unwrap();
-        assert_eq!(perms, "r--p");
+    fn maps_line_with_spaced_path_parses() {
+        let info =
+            parse_maps_line("  7ac49c2000-7ac4a26000 r--p 00000000 00:00 0 /a b").expect("line");
+        assert_eq!(info.start, 0x7ac49c2000);
+        assert_eq!(info.end, 0x7ac4a26000);
+        assert_eq!(info.perms, libc::PROT_READ);
+        assert!(info.private);
+        assert_eq!(info.path, "/a b");
+
+        assert!(parse_maps_line("").is_none());
+        assert!(parse_maps_line("7ac49c2000-7ac4a26000 r--p").is_none());
+        assert!(parse_maps_line("zz-top r--p 0 00:00 0 /a").is_none());
     }
 
     #[test]
@@ -494,22 +494,13 @@ mod tests {
         assert_eq!(copy_prot_for(libc::PROT_EXEC), libc::PROT_READ);
     }
 
-    fn perms_at(addr: usize) -> String {
+    fn prot_at(addr: usize) -> (c_int, bool) {
         for line in std::fs::read_to_string("/proc/self/maps").unwrap().lines() {
-            let Some((range, rest)) = next_field(line) else {
+            let Some(info) = parse_maps_line(line) else {
                 continue;
             };
-            let Some((start_hex, end_hex)) = range.split_once('-') else {
-                continue;
-            };
-            let (Ok(start), Ok(end)) = (
-                usize::from_str_radix(start_hex, 16),
-                usize::from_str_radix(end_hex, 16),
-            ) else {
-                continue;
-            };
-            if (start..end).contains(&addr) {
-                return next_field(rest).unwrap().0.to_string();
+            if (info.start..info.end).contains(&addr) {
+                return (info.perms, info.private);
             }
         }
         panic!("no mapping contains {addr:#x}");
@@ -538,14 +529,18 @@ mod tests {
             std::ptr::copy_nonoverlapping(expected.as_ptr(), address as *mut u8, SIZE);
 
             assert_eq!(libc::mprotect(address, SIZE, libc::PROT_READ), 0);
-            assert_eq!(perms_at(address as usize), "r--p");
+            assert_eq!(prot_at(address as usize), (libc::PROT_READ, true));
 
             relocate_segment(address, SIZE, libc::PROT_READ, "/test/libgadget.so")
                 .expect("relocate_segment failed");
 
             let after = std::slice::from_raw_parts(address as *const u8, SIZE);
             assert_eq!(after, &expected[..], "segment contents must survive");
-            assert_eq!(perms_at(address as usize), "r--p", "protections restored");
+            assert_eq!(
+                prot_at(address as usize),
+                (libc::PROT_READ, true),
+                "protections restored"
+            );
 
             assert_eq!(libc::munmap(address, SIZE), 0);
         }
@@ -741,7 +736,10 @@ mod tests {
 
         // SAFETY: the mapping is still ours; relocation keeps the address.
         unsafe {
-            assert_eq!(perms_at(address as usize), "r-xp");
+            assert_eq!(
+                prot_at(address as usize),
+                (libc::PROT_READ | libc::PROT_EXEC, true)
+            );
             assert_eq!(libc::munmap(address, SIZE), 0);
         }
     }

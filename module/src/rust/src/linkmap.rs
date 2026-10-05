@@ -31,9 +31,15 @@ unsafe fn overwrite_in_place(buf: *mut c_char, len: usize, replacement: &[u8]) {
 /// `data` is the live [`ScrubSearch`] below.
 unsafe extern "C" fn scrub_callback(
     info: *mut DlPhdrInfo,
-    _size: usize,
+    size: usize,
     data: *mut c_void,
 ) -> c_int {
+    // The linker may pass a larger struct as fields are added; the first
+    // four (through `phnum`) are stable. A smaller `size` means even those
+    // cannot be trusted.
+    if size < size_of::<DlPhdrInfo>() {
+        return 0;
+    }
     // SAFETY: the linker hands the callback a valid entry; `data` is our
     // search struct, alive for the whole synchronous walk.
     let (current, search) = unsafe {
@@ -523,6 +529,10 @@ mod tests {
         CString::new(s).unwrap().into_raw()
     }
 
+    fn entry_size() -> usize {
+        size_of::<DlPhdrInfo>()
+    }
+
     fn entry(name: *const c_char) -> DlPhdrInfo {
         DlPhdrInfo {
             addr: 0,
@@ -566,8 +576,8 @@ mod tests {
 
         // SAFETY: both entries are live owned strings; `search` outlives them.
         unsafe {
-            assert_eq!(scrub_callback(&raw mut first_entry, 0, data), 0);
-            assert_eq!(scrub_callback(&raw mut second_entry, 0, data), 1);
+            assert_eq!(scrub_callback(&raw mut first_entry, entry_size(), data), 0);
+            assert_eq!(scrub_callback(&raw mut second_entry, entry_size(), data), 1);
         }
 
         assert!(search.found);
@@ -611,7 +621,11 @@ mod tests {
         // SAFETY: as above.
         unsafe {
             assert_eq!(
-                scrub_callback(&raw mut only_entry, 0, (&raw mut search).cast::<c_void>()),
+                scrub_callback(
+                    &raw mut only_entry,
+                    entry_size(),
+                    (&raw mut search).cast::<c_void>()
+                ),
                 0
             );
         }
@@ -620,6 +634,37 @@ mod tests {
         unsafe {
             free_cstring(only, 19);
         }
+    }
+
+    #[test]
+    fn undersized_phdr_info_is_ignored() {
+        let only = raw_cstring("/data/data/com.a.b/.cache/1234/libsecmon.so");
+        let mut only_entry = entry(only);
+        let mut search = ScrubSearch {
+            target: b"/data/data/com.a.b/.cache/1234/libsecmon.so".to_vec(),
+            replacement: b"libnative_1.so".to_vec(),
+            found: false,
+            soname: false,
+            symbols: 0,
+            substring: false,
+        };
+        // SAFETY: live owned string; undersized `size` must stop before touching it.
+        unsafe {
+            assert_eq!(
+                scrub_callback(
+                    &raw mut only_entry,
+                    entry_size() - 1,
+                    (&raw mut search).cast::<c_void>()
+                ),
+                0
+            );
+            assert_eq!(
+                CStr::from_ptr(only).to_bytes(),
+                b"/data/data/com.a.b/.cache/1234/libsecmon.so"
+            );
+            free_cstring(only, 43);
+        }
+        assert!(!search.found);
     }
 
     #[test]
@@ -647,7 +692,11 @@ mod tests {
         // SAFETY: entry is a live owned string; `search` outlives the call.
         unsafe {
             assert_eq!(
-                scrub_callback(&raw mut memfd_entry, 0, (&raw mut search).cast::<c_void>()),
+                scrub_callback(
+                    &raw mut memfd_entry,
+                    entry_size(),
+                    (&raw mut search).cast::<c_void>()
+                ),
                 1
             );
         }
