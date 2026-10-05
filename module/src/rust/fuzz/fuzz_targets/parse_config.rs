@@ -18,12 +18,20 @@ fn fuzz_dir() -> std::path::PathBuf {
 
 fuzz_target!(|data: &[u8]| {
     // App name: leading bytes up to the first NUL (capped, so the config
-    // body below stays the bulk of the input). The rest is the file.
+    // body below stays the bulk of the input). The config is the body after
+    // the separator — or the whole input when no NUL is present — so a
+    // resolving input (name match) is reachable; testing the whole data as
+    // the config would make the match arm below dead (a NUL never parses).
     let split = data.iter().position(|&b| b == 0).unwrap_or(64.min(data.len()));
     let app = String::from_utf8_lossy(&data[..split]).into_owned();
+    let body = if split < data.len() {
+        &data[split + 1..]
+    } else {
+        data
+    };
 
     let dir = fuzz_dir();
-    if std::fs::write(dir.join("config.json"), data).is_err() {
+    if std::fs::write(dir.join("config.json"), body).is_err() {
         return;
     }
     // Property under test (audit A9): a resolved target must carry exactly
