@@ -1,0 +1,16 @@
+{
+  "name": "ksufrida-webui",
+  "version": "1.0.0",
+  "private": true,
+  "description": "KsuFrida WebUI sources; bundled to main.js at module build time",
+  "scripts": {
+    "build": "tsc --noEmit && esbuild main.ts --bundle --minify --target=es2020 --outfile=main.js",
+    "typecheck": "tsc --noEmit",
+    "test": "esbuild test/*.test.ts --bundle --platform=node --format=cjs --outdir=test/dist --log-level=error && node --test \"test/dist/*.test.js\""
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "typescript": "7.0.2",
+    "@types/node": "26.6.4"
+  }
+}

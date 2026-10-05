@@ -223,7 +223,7 @@ def buildWebUI = tasks.register("buildWebUI", Exec) {
     description = "Type-checks and bundles the WebUI"
 
     workingDir = webuiDir
-    commandLine "sh", "-c", "npm ci --no-audit --no-fund && npm run build"
+    commandLine "sh", "-c", "npm ci --no-audit --no-fund && npm test && npm run build"
 
     inputs.files("$webuiDir/main.ts", "$webuiDir/package.json", "$webuiDir/package-lock.json")
     outputs.file("$webuiDir/main.js")
@@ -264,6 +264,8 @@ androidComponents {
                 exclude 'customize.sh'
                 exclude 'verify.sh'
                 exclude 'webroot/node_modules/**'
+                exclude 'webroot/src/**'
+                exclude 'webroot/test/**'
                 exclude 'webroot/main.ts'
                 exclude 'webroot/package.json'
                 exclude 'webroot/package-lock.json'
@@ -295,6 +297,8 @@ androidComponents {
             from(templatePath + "/webroot") {
                 into 'webroot'
                 exclude 'node_modules/**'
+                exclude 'src/**'
+                exclude 'test/**'
                 exclude 'main.ts'
                 exclude 'package.json'
                 exclude 'package-lock.json'

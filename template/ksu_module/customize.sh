@@ -80,7 +80,7 @@ $BUSYBOX_BIN unxz -f "$TMP_MODULE_DIR/libsecmon.so.xz" || abort "! failed to dec
 
 if [ "$IS64BIT" = true ]; then
   extract "$ZIPFILE" "gadget/libgadget-arm.so.xz" "$GADGET_DIR" true
-  mv -f "$GADGET_DIR/libgadget-$ARCH32.so.xz" "$GADGET_DIR/libsecmon32.so.xz"
+  mv -f "$GADGET_DIR/libgadget-arm.so.xz" "$GADGET_DIR/libsecmon32.so.xz"
   rm -f "$TMP_MODULE_DIR/libsecmon32.so.xz" "$TMP_MODULE_DIR/libsecmon32.so"
   cp -f "$GADGET_DIR/libsecmon32.so.xz" "$TMP_MODULE_DIR/libsecmon32.so.xz"
   $BUSYBOX_BIN unxz -f "$TMP_MODULE_DIR/libsecmon32.so.xz" || abort "! failed to decompress 32-bit gadget (storage full?)"

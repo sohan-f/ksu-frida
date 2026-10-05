@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    "target": "es2020",
+    "module": "es2020",
+    "strict": true,
+    "noImplicitAny": false,
+    "exactOptionalPropertyTypes": false,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "types": [
+      "node"
+    ],
+    "lib": [
+      "es2022",
+      "dom",
+      "dom.iterable"
+    ]
+  },
+  "include": [
+    "main.ts",
+    "src/util.ts",
+    "test/*.ts"
+  ]
+}
