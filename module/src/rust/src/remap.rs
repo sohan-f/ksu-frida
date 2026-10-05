@@ -399,6 +399,22 @@ pub(crate) fn maps_show(query: &str) -> bool {
     !get_modules_by_name(query).is_empty()
 }
 
+/// Protections of the single mapping containing `[start, end)`, if any.
+pub(crate) fn mapped_perms(start: usize, end: usize) -> Option<c_int> {
+    let Ok(file) = File::open("/proc/self/maps") else {
+        return None;
+    };
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        let Some(info) = parse_maps_line(&line) else {
+            continue;
+        };
+        if info.start <= start && end <= info.end {
+            return Some(info.perms);
+        }
+    }
+    None
+}
+
 /// Remap memfd segments (`/memfd:dalvik-jit-cache`). The linker does not keep the
 /// source path for fd loads, so basename matching misses them.
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]

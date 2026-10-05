@@ -229,6 +229,7 @@ fn contains_frida(name: &[u8]) -> bool {
 struct WritableWindow {
     start: usize,
     len: usize,
+    perms: c_int,
     label: &'static str,
 }
 
@@ -247,8 +248,12 @@ impl WritableWindow {
             return None;
         }
         let end = addr.checked_add(len)?;
+        // The range must sit inside a single live mapping: a corrupt size
+        // would otherwise widen onto neighbor mappings, and the restore
+        // below would clobber their protections.
+        let perms = crate::remap::mapped_perms(addr, end)?;
         let start = addr & !(page - 1);
-        let end = (end + page - 1) & !(page - 1);
+        let end = end.checked_add(page - 1)? & !(page - 1);
         // SAFETY: page-aligned range around caller-owned data; checked below.
         if unsafe {
             libc::mprotect(
@@ -267,6 +272,7 @@ impl WritableWindow {
         Some(Self {
             start,
             len: end - start,
+            perms,
             label,
         })
     }
@@ -274,8 +280,10 @@ impl WritableWindow {
 
 impl Drop for WritableWindow {
     fn drop(&mut self) {
-        // SAFETY: the range `open` flipped; best-effort restore.
-        if unsafe { libc::mprotect(self.start as *mut c_void, self.len, libc::PROT_READ) } != 0 {
+        // SAFETY: the range `open` flipped; best-effort restore of the
+        // protections it had (a blanket PROT_READ would strip neighbors
+        // sharing the rounded pages).
+        if unsafe { libc::mprotect(self.start as *mut c_void, self.len, self.perms) } != 0 {
             loge_fmt(format_args!(
                 "linkmap: cannot re-protect {}: {}",
                 self.label,
@@ -751,6 +759,73 @@ mod tests {
         assert!(!contains_frida(b"puts"));
         assert!(!contains_frida(b"fri"));
         assert!(!contains_frida(b""));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // mmap(2)/mprotect(2) have no Miri shims
+    fn window_refuses_range_past_its_mapping() {
+        const SIZE: usize = 4096;
+        // SAFETY: fresh anonymous mapping owned by this test.
+        let addr = unsafe {
+            let addr = libc::mmap(
+                std::ptr::null_mut(),
+                SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                -1,
+                0,
+            );
+            assert_ne!(
+                addr,
+                libc::MAP_FAILED,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+            addr as *mut u8
+        };
+        // SAFETY: `addr` is live; no single VMA can span to usize::MAX, so
+        // no window may open. A just-past-the-end range would work too, but
+        // the kernel may merge our page into a larger neighbor VMA.
+        unsafe {
+            assert!(
+                WritableWindow::open(addr as usize, usize::MAX - addr as usize, "test").is_none()
+            );
+            assert_eq!(libc::munmap(addr as *mut c_void, SIZE), 0);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // mmap(2)/mprotect(2) have no Miri shims
+    fn window_restore_keeps_original_protections() {
+        const SIZE: usize = 4096;
+        // SAFETY: fresh anonymous mapping owned by this test.
+        let addr = unsafe {
+            let addr = libc::mmap(
+                std::ptr::null_mut(),
+                SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                -1,
+                0,
+            );
+            assert_ne!(
+                addr,
+                libc::MAP_FAILED,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+            addr as *mut u8
+        };
+        {
+            // SAFETY: `addr`/`SIZE` is our live mapping.
+            let _window =
+                unsafe { WritableWindow::open(addr as usize, SIZE, "test").expect("window") };
+        }
+        // SAFETY: still ours; a blanket PROT_READ restore would fault here.
+        unsafe {
+            addr.write_bytes(0x5A, SIZE);
+            assert_eq!(libc::munmap(addr as *mut c_void, SIZE), 0);
+        }
     }
 
     #[test]
