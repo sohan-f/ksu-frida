@@ -63,6 +63,26 @@ jobs:
           cd module/src/rust
           MIRIFLAGS="-Zmiri-disable-isolation" cargo miri test
 
+  ub-checks:
+    name: UB checks (nightly)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: module/src/rust -> target
+
+      - name: Test with UB checks
+        run: |
+          cd module/src/rust
+          RUSTFLAGS="-Zub-checks" cargo test
+
   build:
     name: Build Module
     runs-on: ubuntu-latest
