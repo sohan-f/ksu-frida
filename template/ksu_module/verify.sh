@@ -31,10 +31,11 @@ extract() {
     hash_path="$TMPDIR_FOR_VERIFY/$file.sha256sum"
   fi
 
-  unzip $opts "$zip" "$file" -d "$dir" >&2
+  unzip $opts "$zip" "$file" -d "$dir" >&2 || abort_verify "cannot extract $file"
   [ -f "$file_path" ] || abort_verify "$file not exists"
 
-  unzip $opts "$zip" "$file.sha256sum" -d "$TMPDIR_FOR_VERIFY" >&2
+  rm -f "$hash_path"
+  unzip $opts "$zip" "$file.sha256sum" -d "$TMPDIR_FOR_VERIFY" >&2 || abort_verify "cannot extract $file.sha256sum"
   [ -f "$hash_path" ] || abort_verify "$file.sha256sum not exists"
 
   if command -v sha256sum >/dev/null 2>&1; then

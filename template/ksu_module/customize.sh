@@ -12,8 +12,8 @@ fi
 
 TMP_MODULE_DIR=/data/local/tmp/libsec
 
-if [ "$ARCH" != "arm" ] && [ "$ARCH" != "arm64" ] && [ "$ARCH" != "x86" ] && [ "$ARCH" != "x64" ]; then
-  abort "! Unsupported platform: $ARCH"
+if [ "$ARCH" != "arm" ] && [ "$ARCH" != "arm64" ]; then
+  abort "! Unsupported platform: $ARCH (no gadget builds for x86)"
 else
   ui_print "- Device platform: $ARCH"
 fi
@@ -31,7 +31,8 @@ fi
 ui_print "- Using busybox: $BUSYBOX_BIN"
 
 ui_print "- Extracting verify.sh"
-unzip -o "$ZIPFILE" 'verify.sh' -d "$TMPDIR" >&2
+rm -f "$TMPDIR/verify.sh"
+unzip -o "$ZIPFILE" 'verify.sh' -d "$TMPDIR" >&2 || abort "cannot extract verify.sh (corrupt zip?)"
 if [ ! -f "$TMPDIR/verify.sh" ]; then
   ui_print    "*********************************************************"
   ui_print    "! Unable to extract verify.sh!"
@@ -53,9 +54,6 @@ LIB32_NAME="armeabi-v7a.so"
 LIB64_NAME="arm64-v8a.so"
 LIB32_DEST="$MODPATH/zygisk"
 LIB64_DEST="$MODPATH/zygisk"
-
-[ "$ARCH" = "x86" ] || [ "$ARCH" = "x64" ] && LIB32_NAME="x86.so"
-[ "$ARCH" = "x86" ] || [ "$ARCH" = "x64" ] && LIB64_NAME="x86_64.so"
 
 mkdir -p "$LIB32_DEST"
 mkdir -p "$LIB64_DEST"
@@ -81,10 +79,7 @@ cp -f "$GADGET_DIR/libsecmon.so.xz" "$TMP_MODULE_DIR/libsecmon.so.xz"
 $BUSYBOX_BIN unxz -f "$TMP_MODULE_DIR/libsecmon.so.xz" || abort "! failed to decompress gadget (storage full?)"
 
 if [ "$IS64BIT" = true ]; then
-  ARCH32="arm"
-  [ "$ARCH" = "x64" ] && ARCH32="x86"
-
-  extract "$ZIPFILE" "gadget/libgadget-$ARCH32.so.xz" "$GADGET_DIR" true
+  extract "$ZIPFILE" "gadget/libgadget-arm.so.xz" "$GADGET_DIR" true
   mv -f "$GADGET_DIR/libgadget-$ARCH32.so.xz" "$GADGET_DIR/libsecmon32.so.xz"
   rm -f "$TMP_MODULE_DIR/libsecmon32.so.xz" "$TMP_MODULE_DIR/libsecmon32.so"
   cp -f "$GADGET_DIR/libsecmon32.so.xz" "$TMP_MODULE_DIR/libsecmon32.so.xz"

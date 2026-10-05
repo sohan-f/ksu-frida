@@ -22,9 +22,14 @@ refresh_gadget() {
       echo "KsuFrida: gadget hash mismatch for $xz_name, skipping" >&2
       return 0
     fi
+  else
+    echo "KsuFrida: no hash for $xz_name, installing unverified" >&2
   fi
   rm -f "$SEC_DIR/$xz_name" "$SEC_DIR/$so_name"
-  cp -f "$MODDIR/gadget/$xz_name" "$SEC_DIR/$xz_name" || return 0
+  if ! cp -f "$MODDIR/gadget/$xz_name" "$SEC_DIR/$xz_name"; then
+    echo "KsuFrida: failed to stage $xz_name" >&2
+    return 0
+  fi
   if ! $BUSYBOX_BIN unxz -f "$SEC_DIR/$xz_name"; then
     echo "KsuFrida: failed to decompress $xz_name" >&2
     rm -f "$SEC_DIR/$so_name"
