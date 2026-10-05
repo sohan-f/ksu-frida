@@ -626,10 +626,17 @@ fn write_memfd(src_lib_path: &str) -> Option<c_int> {
         Err(_) => return None,
     };
     // SAFETY: static name above; the fd is checked below and owned here.
-    let fd = crate::sys::memfd_create(
+    // MFD_EXEC first: vm.memfd_noexec=1 forces NX and =2 rejects flagless.
+    let mut fd = crate::sys::memfd_create(
         c_name.as_ptr(),
-        crate::sys::MFD_CLOEXEC | crate::sys::MFD_ALLOW_SEALING,
+        crate::sys::MFD_CLOEXEC | crate::sys::MFD_ALLOW_SEALING | crate::sys::MFD_EXEC,
     );
+    if fd < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) {
+        fd = crate::sys::memfd_create(
+            c_name.as_ptr(),
+            crate::sys::MFD_CLOEXEC | crate::sys::MFD_ALLOW_SEALING,
+        );
+    }
     if fd < 0 {
         loge_fmt(format_args!(
             "stage: memfd_create failed: {}",

@@ -47,6 +47,9 @@ pub fn memfd_create(name: *const c_char, flags: c_int) -> c_int {
 pub const MFD_CLOEXEC: c_int = 0x0001;
 #[cfg(any(target_os = "android", test))]
 pub const MFD_ALLOW_SEALING: c_int = 0x0002;
+// Kernel 6.3+: explicit X so vm.memfd_noexec=1/2 cannot force NX or reject.
+#[cfg(any(target_os = "android", test))]
+pub const MFD_EXEC: c_int = 0x0010;
 
 /// memfd staging name. Distinct from ART `dalvik-jit-code-cache` so
 /// `contains` matching never hits the legit mapping.
@@ -210,6 +213,7 @@ pub fn set_errno(value: c_int) {
 
 /// # Safety
 /// `fd_in`/`fd_out` must be open files; `len` bounds the transfer.
+// Raw syscall: libc copy_file_range needs API 34, floor is 31.
 pub fn copy_file_range(fd_in: c_int, fd_out: c_int, len: usize) -> Result<u64, io::Error> {
     // SAFETY: two live fds with NULL offsets (file-offset form); return/errno is read immediately.
     let n = unsafe {
