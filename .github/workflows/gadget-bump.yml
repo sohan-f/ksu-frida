@@ -22,7 +22,7 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Check for newer gadget
         id: check
@@ -142,7 +142,7 @@ jobs:
 
       - name: Open update PR
         if: steps.check.outputs.bump == 'true'
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           commit-message: "build: adopt gadget ${{ steps.check.outputs.version }} pins"
