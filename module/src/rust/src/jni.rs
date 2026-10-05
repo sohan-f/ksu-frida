@@ -104,11 +104,13 @@ mod tests {
         0
     }
 
+    // Raw pointers pair into_raw with from_raw at each call site: reading the
+    // tables through a live Box borrow and then dropping it is UB under Miri.
     fn mock_env(
         get: unsafe extern "C" fn(JniEnv, JString, *mut u8) -> *const c_char,
-    ) -> (Box<JniTable>, Box<*const JniTable>, JString) {
-        // JNIEnv is a pointer to a table pointer; both boxes pin their heap addresses.
-        let table = Box::new(JniTable {
+    ) -> (*mut JniTable, *mut *const JniTable, JString) {
+        // JNIEnv is a pointer to a table pointer; into_raw hands out both addresses.
+        let table = Box::into_raw(Box::new(JniTable {
             _head: [std::ptr::null(); IDX_EXCEPTION_CLEAR],
             exception_clear: stub_clear,
             _mid: [std::ptr::null(); IDX_GET_STRING_UTF_CHARS - IDX_EXCEPTION_CLEAR - 1],
@@ -116,10 +118,20 @@ mod tests {
             release_string_utf_chars: stub_release,
             _tail: [std::ptr::null(); IDX_EXCEPTION_CHECK - IDX_RELEASE_STRING_UTF_CHARS - 1],
             _exception_check: stub_check,
-        });
-        let mut slot: Box<*const JniTable> = Box::new(std::ptr::null());
-        *slot = &raw const *table;
+        }));
+        let slot: *mut *const JniTable = Box::into_raw(Box::new(std::ptr::null()));
+        // SAFETY: both are live into_raw outputs; the slot stores the table address.
+        unsafe { *slot = table as *const JniTable };
         (table, slot, 0x1234 as JString)
+    }
+
+    // Reconstructs exactly one mock_env pair; both pointers must be its live outputs.
+    unsafe fn free_mock_env(table: *mut JniTable, slot: *mut *const JniTable) {
+        // SAFETY: into_raw outputs reconstructed exactly once each.
+        unsafe {
+            drop(Box::from_raw(table));
+            drop(Box::from_raw(slot));
+        }
     }
 
     #[test]
@@ -137,18 +149,20 @@ mod tests {
         );
 
         // OOM conversion clears the pending exception and releases nothing.
-        let (_t, slot, name) = mock_env(stub_get_oom);
-        let env = &raw const *slot as JniEnv;
+        let (table_oom, slot_oom, name) = mock_env(stub_get_oom);
+        let env = slot_oom as JniEnv;
         RELEASED.store(false, Ordering::Relaxed);
         CLEARED.store(false, Ordering::Relaxed);
-        // SAFETY: `slot` box outlives the call; stubs only flip atomics.
+        // SAFETY: raw pair from mock_env, alive for the call; stubs only flip atomics.
         assert_eq!(unsafe { read_app_name(env, name) }, None);
         assert!(CLEARED.load(Ordering::Relaxed));
         assert!(!RELEASED.load(Ordering::Relaxed));
+        // SAFETY: the pair above, reconstructed exactly once.
+        unsafe { free_mock_env(table_oom, slot_oom) };
 
         // Valid string is copied, then released.
-        let (_t, slot, name) = mock_env(stub_get);
-        let env = &raw const *slot as JniEnv;
+        let (table_ok, slot_ok, name) = mock_env(stub_get);
+        let env = slot_ok as JniEnv;
         RELEASED.store(false, Ordering::Relaxed);
         assert_eq!(
             // SAFETY: as above; the mock string is a valid NUL-terminated static.
@@ -156,6 +170,8 @@ mod tests {
             Some("com.mock.app".to_string())
         );
         assert!(RELEASED.load(Ordering::Relaxed));
+        // SAFETY: the pair above, reconstructed exactly once.
+        unsafe { free_mock_env(table_ok, slot_ok) };
 
         // End to end stays fail-closed without a device config dir.
         assert!(!unsafe {

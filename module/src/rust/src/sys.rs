@@ -268,6 +268,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // raw pidfd_open(2) has no Miri shim
     fn pidfd_opens_self() {
         // SAFETY: getpid cannot fail.
         let pid = unsafe { libc::getpid() };
@@ -286,6 +287,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // fork(2) is not interpretable
     fn pidfd_rejects_dead_pid() {
         // SAFETY: fork child exits immediately; parent reaps it.
         let pid = unsafe { libc::fork() };
@@ -313,6 +315,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // raw memfd_create(2) has no Miri shim
     fn memfd_seals_fix_size() {
         let name = cstring("jit-cache").unwrap();
         // SAFETY: static name; fd checked below.
@@ -330,6 +333,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // mmap(2)/prctl(2) have no Miri shims
     fn vma_rename_is_best_effort() {
         const SIZE: usize = 4096;
         // SAFETY: fresh anon mapping owned by this test.

@@ -66,6 +66,7 @@ unsafe extern "C" fn scrub_callback(
         );
     }
     search.found = true;
+    // Stop at the first match; each staged lib rescans, so later calls converge on later entries.
     1
 }
 
@@ -651,11 +652,78 @@ mod tests {
             );
         }
         assert!(search.found);
-        // SAFETY: read-only check, then freed by original length (24).
+        // SAFETY: read-only check, then freed by original length (26).
         unsafe {
             assert_eq!(CStr::from_ptr(memfd).to_bytes(), b"libnative_1.so");
-            free_cstring(memfd, 24);
+            free_cstring(memfd, 26);
         }
+    }
+
+    #[test]
+    fn scrub_tables_rewrites_only_frida_names() {
+        let strtab = b"\0frida_agent\0puts\0".to_vec();
+        let syms = [
+            Sym {
+                st_name: 0,
+                st_info: 0,
+                st_other: 0,
+                st_shndx: 0,
+                st_value: 0,
+                st_size: 0,
+            },
+            Sym {
+                st_name: 1,
+                st_info: 0,
+                st_other: 0,
+                st_shndx: 0,
+                st_value: 0,
+                st_size: 0,
+            },
+            Sym {
+                st_name: 13,
+                st_info: 0,
+                st_other: 0,
+                st_shndx: 0,
+                st_value: 0,
+                st_size: 0,
+            },
+        ];
+        // SAFETY: both buffers outlive the call; every access stays inside measured footprints.
+        let (soname_done, symbols) = unsafe {
+            scrub_tables(
+                strtab.as_ptr() as usize,
+                strtab.len(),
+                syms.as_ptr() as usize,
+                0,
+                syms.len(),
+                Some(1),
+                b"X",
+            )
+        };
+        assert!(soname_done);
+        assert_eq!(symbols, 1);
+        // SAFETY: read-only checks of our own buffer.
+        unsafe {
+            let at =
+                |off: usize| CStr::from_ptr(strtab.as_ptr().add(off) as *const c_char).to_bytes();
+            assert_eq!(at(1), b"X");
+            assert_eq!(at(13), b"puts");
+        }
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn gnu_nsyms_counts_chained_symbols() {
+        let mut blob = vec![1u32, 1, 1, 0];
+        blob.extend([0u32, 0]);
+        blob.extend([1u32]);
+        blob.extend([0u32, 1]);
+        // SAFETY: blob outlives the call; header counts bound every read.
+        assert_eq!(unsafe { gnu_nsyms(blob.as_ptr() as usize) }, 3);
+
+        let empty = [0u32, 1, 1, 0];
+        // SAFETY: as above; zero buckets short-circuits.
+        assert_eq!(unsafe { gnu_nsyms(empty.as_ptr() as usize) }, 0);
     }
 
     #[test]

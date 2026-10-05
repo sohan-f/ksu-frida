@@ -234,6 +234,24 @@ fn copy_file_range_all(
     dst: &str,
     src_len: u64,
 ) -> RangeOutcome {
+    copy_file_range_with(
+        input,
+        output,
+        src,
+        dst,
+        src_len,
+        crate::sys::copy_file_range,
+    )
+}
+
+fn copy_file_range_with(
+    input: &File,
+    output: &File,
+    src: &str,
+    dst: &str,
+    src_len: u64,
+    mut op: impl FnMut(libc::c_int, libc::c_int, usize) -> Result<u64, io::Error>,
+) -> RangeOutcome {
     use std::os::unix::io::AsRawFd;
 
     let mut remaining = src_len;
@@ -241,7 +259,7 @@ fn copy_file_range_all(
     while remaining > 0 {
         // 1 GiB chunks: len is 32-bit size_t on 32-bit ABIs.
         let chunk = remaining.min(1 << 30) as usize;
-        match crate::sys::copy_file_range(input.as_raw_fd(), output.as_raw_fd(), chunk) {
+        match op(input.as_raw_fd(), output.as_raw_fd(), chunk) {
             Err(err) if err.kind() == ErrorKind::Interrupted => continue,
             Err(err) => {
                 // Only the first call may report Unsupported; support cannot change mid-file.
@@ -434,6 +452,21 @@ fn remove_stage_dir_contents(dir: &str) {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum PidfdOutcome {
+    Dead,
+    Unsupported,
+    Alive,
+}
+
+fn classify_pidfd_errno(code: Option<i32>) -> PidfdOutcome {
+    match code {
+        Some(code) if code == libc::ESRCH => PidfdOutcome::Dead,
+        Some(code) if code == libc::ENOSYS => PidfdOutcome::Unsupported,
+        _ => PidfdOutcome::Alive,
+    }
+}
+
 fn pid_is_alive(pid: libc::pid_t) -> bool {
     if pid <= 0 {
         return true;
@@ -448,10 +481,10 @@ fn pid_is_alive(pid: libc::pid_t) -> bool {
             unsafe { libc::close(fd) };
             return true;
         }
-        match io::Error::last_os_error().raw_os_error() {
-            Some(code) if code == libc::ESRCH => return false,
-            Some(code) if code == libc::ENOSYS => {} // Fall through to kill below.
-            _ => return true,
+        match classify_pidfd_errno(io::Error::last_os_error().raw_os_error()) {
+            PidfdOutcome::Dead => return false,
+            PidfdOutcome::Unsupported => {} // Fall through to kill below.
+            PidfdOutcome::Alive => return true,
         }
     }
     // SAFETY: signal 0 sends nothing; the return value is purely the
@@ -481,12 +514,19 @@ fn sweep_stale_stage_dirs(cache_dir: &str) {
             continue;
         }
         let dir = format!("{cache_dir}/{name}");
+        // Only our stage dirs carry the marker; app-owned numeric dirs stay untouched.
+        if !std::path::Path::new(&dir).join(STAGE_MARKER).exists() {
+            continue;
+        }
         remove_stage_dir_contents(&dir);
         if remove_dir(&dir) {
             logi_fmt(format_args!("Swept stale stage dir {dir}"));
         }
     }
 }
+
+// Marker proving a numeric cache subdir is our stage dir: the sweep only enters dirs carrying it.
+const STAGE_MARKER: &str = ".ksufrida-stage";
 
 fn cache_dir_for(app_name: &str) -> Option<String> {
     let pkg = package_of(app_name);
@@ -505,6 +545,11 @@ fn stage_gadget(app_name: &str, src_lib_path: &str) -> Option<String> {
     // SAFETY: `getpid(2)` cannot fail.
     let stage_dir = format!("{cache_dir}/{}", unsafe { libc::getpid() });
     if !ensure_dir(&stage_dir, 0o700) {
+        return None;
+    }
+    // Hardened empty file: symlink plants fail the open, anything else fails the sweep gate below.
+    if open_dst_hardened(&format!("{stage_dir}/{STAGE_MARKER}")).is_none() {
+        remove_dir(&stage_dir);
         return None;
     }
 
@@ -537,7 +582,11 @@ fn unlink_staged(staged_lib_path: &str) {
     let cfg_ok = remove_file(&with_config_suffix(staged_lib_path));
 
     let dir_ok = match staged_lib_path.rfind('/') {
-        Some(slash) => remove_dir(&staged_lib_path[..slash]),
+        Some(slash) => {
+            let dir = &staged_lib_path[..slash];
+            // Missing marker counts as clean, so pre-marker stage dirs still unlink.
+            remove_file(&format!("{dir}/{STAGE_MARKER}")) && remove_dir(dir)
+        }
         None => true,
     };
 
@@ -896,6 +945,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // raw openat2(2) has no Miri shim
     fn copy_file_copies_every_byte() {
         let dir = TempDir::new("copy-ok");
         let src = dir.join("src.bin");
@@ -921,6 +971,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // Miri cannot open directories
     fn copy_file_fails_on_a_directory_source() {
         let dir = TempDir::new("copy-dir");
         let dst = dir.join("dst.bin");
@@ -957,6 +1008,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // raw copy_file_range(2) has no Miri shim
     fn copy_file_range_matches_source_size() {
         let dir = TempDir::new("range");
         let src = dir.join("src.bin");
@@ -991,6 +1043,90 @@ mod tests {
         )));
         assert!(!is_unsupported(Some(0)));
         assert!(!is_unsupported(None));
+    }
+
+    #[test]
+    fn pidfd_errors_classify_like_the_sweep() {
+        assert_eq!(classify_pidfd_errno(Some(libc::ESRCH)), PidfdOutcome::Dead);
+        assert_eq!(
+            classify_pidfd_errno(Some(libc::ENOSYS)),
+            PidfdOutcome::Unsupported
+        );
+        assert_eq!(
+            classify_pidfd_errno(Some(libc::EINVAL)),
+            PidfdOutcome::Alive
+        );
+        assert_eq!(classify_pidfd_errno(None), PidfdOutcome::Alive);
+    }
+
+    fn scripted_files(name: &str) -> (TempDir, File, File) {
+        let dir = TempDir::new(name);
+        let src = dir.join("src.bin");
+        let dst = dir.join("dst.bin");
+        fs::write(&src, b"0123456789").unwrap();
+        let input = File::open(&src).unwrap();
+        let output = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&dst)
+            .unwrap();
+        (dir, input, output)
+    }
+
+    #[test]
+    fn kernel_copy_retries_interrupts_then_completes() {
+        let (_dir, input, output) = scripted_files("range-eintr");
+        let mut calls = 0;
+        let outcome = copy_file_range_with(&input, &output, "src", "dst", 10, |_, _, _| {
+            calls += 1;
+            if calls == 1 {
+                Err(io::Error::from_raw_os_error(libc::EINTR))
+            } else {
+                Ok(10)
+            }
+        });
+        assert!(matches!(outcome, RangeOutcome::Done));
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn kernel_copy_reports_unsupported_only_on_first_call() {
+        let (_dir, input, output) = scripted_files("range-unsupported");
+        let mut calls = 0;
+        let outcome = copy_file_range_with(&input, &output, "src", "dst", 10, |_, _, _| {
+            calls += 1;
+            Err(io::Error::from_raw_os_error(libc::EXDEV))
+        });
+        assert!(matches!(outcome, RangeOutcome::Unsupported));
+        assert_eq!(calls, 1);
+
+        let (_dir, input, output) = scripted_files("range-mid-failure");
+        let mut calls = 0;
+        let outcome = copy_file_range_with(&input, &output, "src", "dst", 10, |_, _, _| {
+            calls += 1;
+            if calls == 1 {
+                Ok(4)
+            } else {
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            }
+        });
+        assert!(matches!(outcome, RangeOutcome::Failed));
+    }
+
+    #[test]
+    fn kernel_copy_rejects_short_transfers() {
+        let (_dir, input, output) = scripted_files("range-short");
+        let outcome = copy_file_range_with(&input, &output, "src", "dst", 10, |_, _, _| Ok(0));
+        assert!(matches!(outcome, RangeOutcome::Failed));
+
+        let (_dir, input, output) = scripted_files("range-split");
+        let mut calls = 0;
+        let outcome = copy_file_range_with(&input, &output, "src", "dst", 10, |_, _, _| {
+            calls += 1;
+            Ok(if calls == 1 { 4 } else { 6 })
+        });
+        assert!(matches!(outcome, RangeOutcome::Done));
     }
 
     #[test]
@@ -1079,6 +1215,7 @@ mod tests {
         fs::create_dir_all(format!("{cache}/{dead}")).unwrap();
         fs::write(format!("{cache}/{dead}/libsecmon.so"), b"x").unwrap();
         fs::write(format!("{cache}/{dead}/libsecmon.config.so"), b"y").unwrap();
+        fs::write(format!("{cache}/{dead}/{STAGE_MARKER}"), b"").unwrap();
         fs::create_dir_all(format!("{cache}/{live}")).unwrap();
         fs::write(format!("{cache}/{live}/libsecmon.so"), b"x").unwrap();
         fs::create_dir_all(format!("{cache}/not-a-pid")).unwrap();
@@ -1113,6 +1250,7 @@ mod tests {
         let dead = dead_pid().to_string();
         fs::create_dir_all(format!("{cache}/{dead}")).unwrap();
         fs::write(format!("{cache}/{dead}/libsecmon.so"), b"x").unwrap();
+        fs::write(format!("{cache}/{dead}/{STAGE_MARKER}"), b"").unwrap();
         fs::create_dir_all(format!("{cache}/{dead}/weird")).unwrap();
         fs::write(format!("{cache}/{dead}/weird/nested.bin"), b"y").unwrap();
 
@@ -1133,6 +1271,25 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // uses fork(2) via dead_pid()
+    fn sweep_ignores_numeric_dirs_without_marker() {
+        let stage = TempDir::new("sweep-unmarked");
+        let cache = stage.path().to_str().unwrap().to_string();
+
+        let dead = dead_pid().to_string();
+        fs::create_dir_all(format!("{cache}/{dead}")).unwrap();
+        fs::write(format!("{cache}/{dead}/app-data.bin"), b"app file").unwrap();
+
+        sweep_stale_stage_dirs(&cache);
+
+        assert!(
+            std::path::Path::new(&format!("{cache}/{dead}/app-data.bin")).exists(),
+            "unmarked numeric dir must stay"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // raw memfd_create(2) has no Miri shim
     fn no_stage_injects_without_touching_the_filesystem() {
         let dir = TempDir::new("no-stage");
 
@@ -1148,6 +1305,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // raw memfd_create(2) has no Miri shim
     fn write_memfd_roundtrips_source_bytes() {
         let dir = TempDir::new("memfd");
         let src = dir.join("src.bin");

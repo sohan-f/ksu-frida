@@ -292,6 +292,18 @@ enum RelocateError {
     Restore(io::Error),
 }
 
+fn copy_prot_for(perms: c_int) -> c_int {
+    // Freeze writers during the copy: drop WRITE so concurrent writes fault
+    // into park_or_forward instead of being lost. Restored after commit.
+    if perms & libc::PROT_WRITE != 0 {
+        perms & !libc::PROT_WRITE
+    } else if perms & libc::PROT_READ == 0 {
+        libc::PROT_READ
+    } else {
+        perms
+    }
+}
+
 /// # Safety
 /// `address` must be page aligned and backed by a mapping of exactly `size`
 /// bytes. The caller must hold the rebuild lock, and must not itself be running
@@ -324,16 +336,8 @@ unsafe fn relocate_segment(
     // Publish before touching protections: writers faulted below must park.
     begin_rebuild(address as usize, size);
 
-    // Freeze writers during the copy: drop WRITE so concurrent writes fault
-    // into park_or_forward instead of being lost. Restored after commit.
-    let need_freeze = perms & libc::PROT_WRITE != 0;
-    let copy_prot = if need_freeze {
-        perms & !libc::PROT_WRITE
-    } else if perms & libc::PROT_READ == 0 {
-        libc::PROT_READ
-    } else {
-        perms
-    };
+    // Freeze writers during the copy, restored after commit (see `copy_prot_for`).
+    let copy_prot = copy_prot_for(perms);
     if copy_prot != perms {
         // SAFETY: `address`/`size` describe a live mapping from `/proc/self/maps`; the result is checked immediately.
         if unsafe { libc::mprotect(address, size, copy_prot) } != 0 {
@@ -476,6 +480,20 @@ mod tests {
         assert!(!is_private_mapping("r--s"));
     }
 
+    #[test]
+    fn copy_prot_drops_write_but_keeps_read() {
+        assert_eq!(
+            copy_prot_for(libc::PROT_READ | libc::PROT_WRITE),
+            libc::PROT_READ
+        );
+        assert_eq!(copy_prot_for(libc::PROT_READ), libc::PROT_READ);
+        assert_eq!(
+            copy_prot_for(libc::PROT_READ | libc::PROT_EXEC),
+            libc::PROT_READ | libc::PROT_EXEC
+        );
+        assert_eq!(copy_prot_for(libc::PROT_EXEC), libc::PROT_READ);
+    }
+
     fn perms_at(addr: usize) -> String {
         for line in std::fs::read_to_string("/proc/self/maps").unwrap().lines() {
             let Some((range, rest)) = next_field(line) else {
@@ -498,6 +516,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // mmap(2)/mprotect(2) have no Miri shims
     fn relocate_segment_preserves_contents_and_protections() {
         let _state = lock_state();
         const SIZE: usize = 4096;
@@ -564,6 +583,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // sigaction(2) has no Miri shim
     fn fault_retry_restores_the_previous_handlers() {
         let _state = lock_state();
         let before = [
@@ -594,6 +614,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // mmap(2) has no Miri shim
     fn fault_in_rebuilt_range_is_parked_until_commit() {
         let _state = lock_state();
         const SIZE: usize = 4096;
