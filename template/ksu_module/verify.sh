@@ -1,5 +1,8 @@
+: "${TMPDIR:?TMPDIR is not set}"
+: "${BUSYBOX_BIN:?BUSYBOX_BIN is not set}"
+
 TMPDIR_FOR_VERIFY="$TMPDIR/.vunzip"
-mkdir "$TMPDIR_FOR_VERIFY"
+mkdir -p "$TMPDIR_FOR_VERIFY"
 
 abort_verify() {
   ui_print "*********************************************************"
@@ -16,11 +19,11 @@ extract() {
   junk_paths=$4
   [ -z "$junk_paths" ] && junk_paths=false
   opts="-o"
-  [ $junk_paths = true ] && opts="-oj"
+  [ "$junk_paths" = true ] && opts="-oj"
 
   file_path=""
   hash_path=""
-  if [ $junk_paths = true ]; then
+  if [ "$junk_paths" = true ]; then
     file_path="$dir/$(basename "$file")"
     hash_path="$TMPDIR_FOR_VERIFY/$(basename "$file").sha256sum"
   else
@@ -34,6 +37,10 @@ extract() {
   unzip $opts "$zip" "$file.sha256sum" -d "$TMPDIR_FOR_VERIFY" >&2
   [ -f "$hash_path" ] || abort_verify "$file.sha256sum not exists"
 
-  (echo "$(cat "$hash_path")  $file_path" | sha256sum -c -s -) || abort_verify "Failed to verify $file"
+  if command -v sha256sum >/dev/null 2>&1; then
+    (echo "$(cat "$hash_path")  $file_path" | sha256sum -c -s -) || abort_verify "Failed to verify $file"
+  else
+    (echo "$(cat "$hash_path")  $file_path" | "$BUSYBOX_BIN" sha256sum -c -s -) || abort_verify "Failed to verify $file"
+  fi
   ui_print "- Verified $file" >&1
 }

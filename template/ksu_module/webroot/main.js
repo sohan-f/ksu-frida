@@ -228,7 +228,7 @@ const POLL_INTERVAL_MS = 1000;
 async function runDetached(script, path, onBody, opts) {
     opts = opts || {};
     if (execMode === "none") return false;
-    await exec("{ " + script + "; echo \"" + DONE_MARK + "\"; } > " + shQuote(path) +
+    await exec("rm -f " + shQuote(path) + "; { " + script + "; echo \"" + DONE_MARK + "\"; } > " + shQuote(path) +
         " </dev/null 2>/dev/null &");
     var deadline = Date.now() + (opts.timeout || 120000);
     var maxStale = opts.maxStale == null ? 8 : opts.maxStale;
