@@ -145,7 +145,10 @@ unsafe extern "C" fn fork_replacement() -> libc::pid_t {
 }
 
 pub fn enable_child_gating(cfg: &ChildGatingConfig, app_name: &str) {
-    let _ = CHILD_GATING_MODE.set(cfg.mode.clone());
+    if CHILD_GATING_MODE.set(cfg.mode.clone()).is_err() {
+        loge("child gating already enabled; ignoring second config");
+        return;
+    }
     let _ = INJECTED_LIBRARIES.set(cfg.injected_libraries.clone());
     let _ = GATING_APP_NAME.set(app_name.to_string());
 

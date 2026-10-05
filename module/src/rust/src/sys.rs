@@ -48,9 +48,8 @@ pub const MFD_CLOEXEC: c_int = 0x0001;
 #[cfg(any(target_os = "android", test))]
 pub const MFD_ALLOW_SEALING: c_int = 0x0002;
 
-/// memfd name used for stealth staging. Shows as `/memfd:<name>` in maps.
-/// `dalvik-jit-cache` blends with ART `dalvik-jit-code-cache` but stays
-/// distinct so `contains` matching never hits the legit mapping.
+/// memfd staging name. Distinct from ART `dalvik-jit-code-cache` so
+/// `contains` matching never hits the legit mapping.
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub const MEMFD_NAME: &str = "dalvik-jit-cache";
 

@@ -6,6 +6,9 @@ use serde_json::Value;
 
 use crate::log::{loge, loge_fmt};
 
+/// Upper bound for per-launch injection delay.
+pub const MAX_START_UP_DELAY_MS: u64 = 60_000;
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ChildGatingConfig {
     pub enabled: bool,
@@ -79,6 +82,13 @@ fn deserialize_child_gating_config(value: &Value) -> Option<ChildGatingConfig> {
         loge("invalid config: expected child_gating.mode members to be a string");
         return None;
     };
+    match mode {
+        "kill" | "freeze" | "inject" => {}
+        _ => {
+            loge("invalid config: unknown child_gating.mode; expected kill, freeze, or inject");
+            return None;
+        }
+    }
     result.mode = mode.to_string();
 
     if let Some(libraries) = obj.get("injected_libraries") {
@@ -119,7 +129,7 @@ fn deserialize_target_config(value: &Value) -> Option<TargetConfig> {
         loge("expected config target start_up_delay_ms to be an uint64");
         return None;
     };
-    result.start_up_delay_ms = start_up_delay_ms;
+    result.start_up_delay_ms = start_up_delay_ms.min(MAX_START_UP_DELAY_MS);
 
     if let Some(hide_maps) = obj.get("hide_maps") {
         let Some(hide_maps) = hide_maps.as_bool() else {
@@ -129,9 +139,9 @@ fn deserialize_target_config(value: &Value) -> Option<TargetConfig> {
         result.hide_maps = hide_maps;
     }
 
-    let null = Value::Null;
-    let libraries = obj.get("injected_libraries").unwrap_or(&null);
-    result.injected_libraries = deserialize_libraries(libraries)?;
+    if let Some(libraries) = obj.get("injected_libraries") {
+        result.injected_libraries = deserialize_libraries(libraries)?;
+    }
 
     if let Some(child_gating) = obj.get("child_gating") {
         result.child_gating = deserialize_child_gating_config(child_gating)?;
@@ -162,7 +172,7 @@ fn load_simple_config(module_dir: &str, app_name: &str) -> Option<TargetConfig> 
         };
 
         if let Some(delay) = fields.next() {
-            cfg.start_up_delay_ms = strtoul_base10(delay);
+            cfg.start_up_delay_ms = strtoul_base10(delay).min(MAX_START_UP_DELAY_MS);
         }
         cfg.injected_libraries = parse_injected_libraries(module_dir);
 
@@ -446,10 +456,57 @@ mod tests {
         fs::write(
             dir.join("config.json"),
             r#"{"targets":[{"app_name":"a.b","enabled":true,"kernel_assisted_evasion":true,
-                "start_up_delay_ms":0}]}"#,
+                "start_up_delay_ms":0,"injected_libraries":"nope"}]}"#,
         )
         .unwrap();
         assert!(load_config(dir.to_str().unwrap(), "a.b").is_none());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_libraries_defaults_to_empty_for_gating_only() {
+        let dir = temp_dir("nolibs");
+        fs::write(
+            dir.join("config.json"),
+            r#"{"targets":[{"app_name":"a.b","enabled":true,"kernel_assisted_evasion":true,
+                "start_up_delay_ms":0,
+                "child_gating":{"enabled":true,"mode":"freeze"}}]}"#,
+        )
+        .unwrap();
+        let cfg = load_config(dir.to_str().unwrap(), "a.b").expect("gating-only config");
+        assert!(cfg.injected_libraries.is_empty());
+        assert!(cfg.child_gating.enabled);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unknown_child_gating_mode_is_rejected() {
+        let dir = temp_dir("badmode");
+        fs::write(
+            dir.join("config.json"),
+            r#"{"targets":[{"app_name":"a.b","enabled":true,"kernel_assisted_evasion":true,
+                "start_up_delay_ms":0,"injected_libraries":[],
+                "child_gating":{"enabled":true,"mode":"kil"}}]}"#,
+        )
+        .unwrap();
+        assert!(load_config(dir.to_str().unwrap(), "a.b").is_none());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn start_up_delay_is_capped() {
+        let dir = temp_dir("bigdelay");
+        fs::write(
+            dir.join("config.json"),
+            r#"{"targets":[{"app_name":"a.b","enabled":true,"kernel_assisted_evasion":true,
+                "start_up_delay_ms":999999999,"injected_libraries":[]}]}"#,
+        )
+        .unwrap();
+        let cfg = load_config(dir.to_str().unwrap(), "a.b").expect("config");
+        assert_eq!(cfg.start_up_delay_ms, MAX_START_UP_DELAY_MS);
 
         fs::remove_dir_all(&dir).ok();
     }
