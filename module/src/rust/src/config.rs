@@ -251,8 +251,14 @@ fn parse_injected_libraries(module_dir: &str) -> Vec<String> {
 }
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    // `windows(0)` panics; longer needle yields empty iterator → false.
-    needle.is_empty() || haystack.windows(needle.len()).any(|w| w == needle)
+    if needle.is_empty() {
+        return true;
+    }
+    // First-byte skip: most windows die on one compare instead of a full memcmp.
+    let first = needle[0];
+    haystack
+        .windows(needle.len())
+        .any(|w| w[0] == first && w == needle)
 }
 
 fn load_advanced_config(module_dir: &str, app_name: &str) -> Option<TargetConfig> {

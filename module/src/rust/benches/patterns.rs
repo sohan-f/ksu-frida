@@ -648,3 +648,168 @@ fn sweep_path_reuse_new(bencher: divan::Bencher) {
         }
     });
 }
+
+// Zero-cost batch P1-P3: first-byte pre-filter on substring scans ---------
+
+fn contains_old(haystack: &[u8], needle: &[u8]) -> bool {
+    needle.is_empty() || haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+fn contains_new(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let first = needle[0];
+    haystack
+        .windows(needle.len())
+        .any(|w| w[0] == first && w == needle)
+}
+
+const CONFIG_HAY: &[u8] =
+    br#"{"targets":[{"app_name":"com.example.app","enabled":true},{"app_name":"org.other.app"}]}"#;
+
+#[divan::bench]
+fn contains_bytes_windows_old(bencher: divan::Bencher) {
+    assert_eq!(
+        contains_old(CONFIG_HAY, b"com.example.app"),
+        contains_new(CONFIG_HAY, b"com.example.app")
+    );
+    assert_eq!(
+        contains_old(CONFIG_HAY, b"com.unknown.app"),
+        contains_new(CONFIG_HAY, b"com.unknown.app")
+    );
+    bencher.bench(|| {
+        black_box(contains_old(
+            black_box(CONFIG_HAY),
+            black_box(b"com.unknown.app"),
+        ))
+    });
+}
+
+#[divan::bench]
+fn contains_bytes_prefilter_new(bencher: divan::Bencher) {
+    assert_eq!(
+        contains_old(CONFIG_HAY, b"com.example.app"),
+        contains_new(CONFIG_HAY, b"com.example.app")
+    );
+    assert_eq!(
+        contains_old(CONFIG_HAY, b"com.unknown.app"),
+        contains_new(CONFIG_HAY, b"com.unknown.app")
+    );
+    bencher.bench(|| {
+        black_box(contains_new(
+            black_box(CONFIG_HAY),
+            black_box(b"com.unknown.app"),
+        ))
+    });
+}
+
+fn entry_old(current: &[u8], target: &[u8]) -> bool {
+    current.windows(target.len().max(1)).any(|w| w == target)
+}
+
+fn entry_new(current: &[u8], target: &[u8]) -> bool {
+    if target.is_empty() {
+        return false;
+    }
+    let first = target[0];
+    current
+        .windows(target.len())
+        .any(|w| w[0] == first && w == target)
+}
+
+const LINKER_ENTRIES: [&[u8]; 4] = [
+    b"/memfd:dalvik-jit-cache (deleted)",
+    b"/system/lib64/libc.so",
+    b"/data/app/com.foo/lib/arm64/libsecmon.so",
+    b"/apex/com.android.runtime/lib64/bionic/libc.so",
+];
+
+#[divan::bench]
+fn entry_match_windows_old(bencher: divan::Bencher) {
+    for e in LINKER_ENTRIES {
+        assert_eq!(
+            entry_old(e, b"dalvik-jit-cache"),
+            entry_new(e, b"dalvik-jit-cache")
+        );
+    }
+    bencher.bench(|| {
+        let mut acc = 0;
+        for e in LINKER_ENTRIES {
+            acc += entry_old(black_box(e), black_box(b"dalvik-jit-cache")) as u32;
+        }
+        black_box(acc)
+    });
+}
+
+#[divan::bench]
+fn entry_match_prefilter_new(bencher: divan::Bencher) {
+    for e in LINKER_ENTRIES {
+        assert_eq!(
+            entry_old(e, b"dalvik-jit-cache"),
+            entry_new(e, b"dalvik-jit-cache")
+        );
+    }
+    bencher.bench(|| {
+        let mut acc = 0;
+        for e in LINKER_ENTRIES {
+            acc += entry_new(black_box(e), black_box(b"dalvik-jit-cache")) as u32;
+        }
+        black_box(acc)
+    });
+}
+
+fn blocked_old(name: &[u8]) -> bool {
+    const NEEDLES: [&[u8]; 3] = [b"frida", b"gadget", b"gum"];
+    NEEDLES.iter().any(|needle| {
+        name.windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle))
+    })
+}
+
+fn blocked_new(name: &[u8]) -> bool {
+    const NEEDLES: [(&[u8], u8); 3] = [(b"frida", b'f'), (b"gadget", b'g'), (b"gum", b'g')];
+    NEEDLES.iter().any(|(needle, first)| {
+        name.windows(needle.len())
+            .any(|w| (w[0] | 32) == *first && w.eq_ignore_ascii_case(needle))
+    })
+}
+
+const THREAD_NAMES: [&[u8]; 6] = [
+    b"HeapTaskDaemon",
+    b"RenderThread",
+    b"AppInitThread",
+    b"pool-frida",
+    b"main",
+    b"gdyhkfgadget",
+];
+
+// P3 tie-proof: prefilter showed no median gain on host or device, so the
+// plain scan stays; both benches remain as the rejection record.
+#[divan::bench]
+fn blocked_names_plain(bencher: divan::Bencher) {
+    for n in THREAD_NAMES {
+        assert_eq!(blocked_old(n), blocked_new(n));
+    }
+    bencher.bench(|| {
+        let mut acc = 0;
+        for n in THREAD_NAMES {
+            acc += blocked_old(black_box(n)) as u32;
+        }
+        black_box(acc)
+    });
+}
+
+#[divan::bench]
+fn blocked_names_prefilter(bencher: divan::Bencher) {
+    for n in THREAD_NAMES {
+        assert_eq!(blocked_old(n), blocked_new(n));
+    }
+    bencher.bench(|| {
+        let mut acc = 0;
+        for n in THREAD_NAMES {
+            acc += blocked_new(black_box(n)) as u32;
+        }
+        black_box(acc)
+    });
+}

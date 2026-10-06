@@ -74,8 +74,14 @@ unsafe extern "C" fn scrub_callback(
 #[inline(always)]
 fn entry_matches(current: &[u8], target: &[u8], substring: bool) -> bool {
     if substring {
-        // `windows(0)` panics; a longer needle yields no windows.
-        current.windows(target.len().max(1)).any(|w| w == target)
+        if target.is_empty() {
+            return false;
+        }
+        // First-byte skip: linker names share prefixes, a full memcmp is rare.
+        let first = target[0];
+        current
+            .windows(target.len())
+            .any(|w| w[0] == first && w == target)
     } else {
         current == target
     }
@@ -663,6 +669,10 @@ unsafe fn gnu_nsyms(table: usize) -> usize {
     let mut budget = MAX_SYMBOLS;
     let mut highest = symoffset;
     for i in 0..nbuckets {
+        // Spent budget cannot extend the count; later buckets read nothing new.
+        if budget == 0 {
+            break;
+        }
         // SAFETY: `i` bounded by the header count; one unaligned bucket read per step.
         let mut sym = unsafe { ((buckets as *const u32).add(i)).read_unaligned() as usize };
         if sym < symoffset || sym >= limit {
