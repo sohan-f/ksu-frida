@@ -340,9 +340,10 @@ unsafe fn relocate_segment(
         }
     }
 
-    // SAFETY: source is the live segment, destination is the scratch mapping — both `size` bytes and non-overlapping.
+    // SAFETY: source is the live segment, destination is the fresh scratch
+    // mapping from `mmap` without `FIXED` — both `size` bytes and non-overlapping.
     unsafe {
-        std::ptr::copy(address as *const u8, map as *mut u8, size);
+        std::ptr::copy_nonoverlapping(address as *const u8, map as *mut u8, size);
 
         let moved = crate::sys::mremap(
             map,
