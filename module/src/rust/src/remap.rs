@@ -571,6 +571,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // asserts on Miri's own process layout, not our code
     fn module_filter_finds_self_maps() {
         let exe = std::env::current_exe().unwrap();
         let name = exe.file_name().unwrap().to_str().unwrap();
