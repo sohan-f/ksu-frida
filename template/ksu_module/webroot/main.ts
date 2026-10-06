@@ -1156,7 +1156,6 @@ function renderDetail() {
 
     var settings = document.createElement("div");
     settings.className = "settings";
-    settings.appendChild(settingRow("Kernel Evasion", makeSwitch(t.kernel_assisted_evasion, "ksie", i)));
     settings.appendChild(settingRow("Hide maps", makeSwitch(t.hide_maps !== false, "hidemaps", i)));
     settings.appendChild(settingRow("Scrub ELF header", makeSwitch(!!t.scrub_elf_header, "scrubhdr", i)));
     settings.appendChild(settingRow("Child Gating", makeSwitch(!!(t.child_gating && t.child_gating.enabled), "child_enabled", i)));
@@ -1241,9 +1240,6 @@ function updateField(i: number, field: string, value: any) {
         case "enabled":
             t.enabled = value;
             break;
-        case "ksie":
-            t.kernel_assisted_evasion = value;
-            break;
         case "hidemaps":
             t.hide_maps = value;
             break;
@@ -1288,7 +1284,6 @@ function addTarget(pkg: string) {
     config.targets.push({
         app_name: pkg,
         enabled: true,
-        kernel_assisted_evasion: false,
         hide_maps: true,
         scrub_elf_header: false,
         start_up_delay_ms: 0,

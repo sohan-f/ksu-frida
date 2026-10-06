@@ -1,1 +1,1 @@
-{"targets":[{"app_name":"com.a.b","enabled":true,"kernel_assisted_evasion":false,"hide_maps":true,"start_up_delay_ms":0,"injected_libraries":[]}]}
+{"targets":[{"app_name":"com.a.b","enabled":true,"hide_maps":true,"start_up_delay_ms":0,"injected_libraries":[]}]}

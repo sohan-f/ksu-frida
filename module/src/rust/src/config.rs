@@ -49,7 +49,6 @@ pub struct TargetConfig {
     pub enabled: bool,
     pub app_name: String,
     pub start_up_delay_ms: u64,
-    pub kernel_assisted_evasion: bool,
     pub hide_maps: bool,
     pub scrub_elf_header: bool,
     pub injected_libraries: Vec<String>,
@@ -62,7 +61,6 @@ impl Default for TargetConfig {
             enabled: false,
             app_name: String::new(),
             start_up_delay_ms: 0,
-            kernel_assisted_evasion: false,
             hide_maps: true,
             scrub_elf_header: false,
             injected_libraries: Vec::new(),
@@ -170,10 +168,6 @@ fn deserialize_target_config(value: &Value) -> Option<TargetConfig> {
         result.enabled = enabled;
     }
 
-    if let Some(kernel_assisted_evasion) = opt_bool(obj, "kernel_assisted_evasion")? {
-        result.kernel_assisted_evasion = kernel_assisted_evasion;
-    }
-
     if let Some(start_up_delay_ms) = opt_u64(obj, "start_up_delay_ms")? {
         result.start_up_delay_ms = start_up_delay_ms.min(MAX_START_UP_DELAY_MS);
     }
@@ -215,7 +209,6 @@ fn load_simple_config(module_dir: &str, app_name: &str) -> Option<TargetConfig> 
         let mut cfg = TargetConfig {
             app_name: first.to_string(),
             enabled: true,
-            kernel_assisted_evasion: true,
             ..Default::default()
         };
 
@@ -318,7 +311,6 @@ mod tests {
             {
                 "app_name": "com.example.app",
                 "enabled": true,
-                "kernel_assisted_evasion": false,
                 "start_up_delay_ms": 1500,
                 "injected_libraries": [
                     { "path": "/data/local/tmp/libsec/libsecmon.so" },
@@ -333,7 +325,6 @@ mod tests {
             {
                 "app_name": "org.other.app",
                 "enabled": true,
-                "kernel_assisted_evasion": true,
                 "start_up_delay_ms": 0,
                 "injected_libraries": [ { "path": "/other.so" } ]
             }
@@ -347,7 +338,6 @@ mod tests {
 
         let cfg = load_config(dir.to_str().unwrap(), "com.example.app").expect("config");
         assert!(cfg.enabled);
-        assert!(!cfg.kernel_assisted_evasion);
         assert_eq!(cfg.start_up_delay_ms, 1500);
         assert_eq!(
             cfg.injected_libraries,
@@ -361,7 +351,6 @@ mod tests {
         assert_eq!(cfg.child_gating.injected_libraries.len(), 1);
 
         let other = load_config(dir.to_str().unwrap(), "org.other.app").expect("other config");
-        assert!(other.kernel_assisted_evasion);
         assert_eq!(other.start_up_delay_ms, 0);
         assert!(!other.child_gating.enabled);
         assert!(other.child_gating.injected_libraries.is_empty());
@@ -387,7 +376,7 @@ mod tests {
         fs::write(
             dir.join("config.json"),
             r#"{"targets":[{"app_name":"com.example.approx","enabled":true,
-                "kernel_assisted_evasion":true,"start_up_delay_ms":0,
+                "start_up_delay_ms":0,
                 "injected_libraries":[]}]}"#,
         )
         .unwrap();
@@ -405,7 +394,7 @@ mod tests {
     fn target_with_hide_maps(value: &str) -> String {
         format!(
             r#"{{"targets":[{{"app_name":"a.b","enabled":true,
-                "kernel_assisted_evasion":false,"start_up_delay_ms":0,
+                "start_up_delay_ms":0,
                 "hide_maps":{value},"injected_libraries":[]}}]}}"#,
         )
     }
@@ -426,7 +415,7 @@ mod tests {
                 dir.join("config.json"),
                 format!(
                     r#"{{"targets":[{{"app_name":"a.b","enabled":true,
-                        "kernel_assisted_evasion":false,"start_up_delay_ms":0,
+                        "start_up_delay_ms":0,
                         {fragment},"injected_libraries":[]}}]}}"#,
                 ),
             )
@@ -438,7 +427,7 @@ mod tests {
         let dir = TempDir::new("scrubhdr-mistype");
         fs::write(
             dir.join("config.json"),
-            r#"{"targets":[{"app_name":"a.b","enabled":true,"kernel_assisted_evasion":false,
+            r#"{"targets":[{"app_name":"a.b","enabled":true,
                 "start_up_delay_ms":0,"scrub_elf_header":"yes","injected_libraries":[]}]}"#,
         )
         .unwrap();
@@ -476,7 +465,6 @@ mod tests {
 
         let cfg = load_config(dir.to_str().unwrap(), "com.simple.app").expect("simple config");
         assert!(cfg.enabled);
-        assert!(cfg.kernel_assisted_evasion);
         assert_eq!(cfg.start_up_delay_ms, 250);
         assert_eq!(
             cfg.injected_libraries,
@@ -493,7 +481,7 @@ mod tests {
         fs::write(
             dir.join("config.json"),
             r#"{"targets":[{"app_name":"other.app","enabled":"yes"},
-                {"app_name":"a.b","enabled":true,"kernel_assisted_evasion":true,
+                {"app_name":"a.b","enabled":true,
                 "start_up_delay_ms":0,"injected_libraries":[]}]}"#,
         )
         .unwrap();
@@ -524,7 +512,7 @@ mod tests {
         let dir = TempDir::new("badtypes");
         fs::write(
             dir.join("config.json"),
-            r#"{"targets":[{"app_name":"a.b","enabled":true,"kernel_assisted_evasion":true,
+            r#"{"targets":[{"app_name":"a.b","enabled":true,
                 "start_up_delay_ms":"500","injected_libraries":[]}]}"#,
         )
         .unwrap();
@@ -532,7 +520,7 @@ mod tests {
 
         fs::write(
             dir.join("config.json"),
-            r#"{"targets":[{"app_name":"a.b","enabled":true,"kernel_assisted_evasion":true,
+            r#"{"targets":[{"app_name":"a.b","enabled":true,
                 "start_up_delay_ms":0,"injected_libraries":"nope"}]}"#,
         )
         .unwrap();
@@ -544,7 +532,7 @@ mod tests {
         let dir = TempDir::new("nolibs");
         fs::write(
             dir.join("config.json"),
-            r#"{"targets":[{"app_name":"a.b","enabled":true,"kernel_assisted_evasion":true,
+            r#"{"targets":[{"app_name":"a.b","enabled":true,
                 "start_up_delay_ms":0,
                 "child_gating":{"enabled":true,"mode":"freeze"}}]}"#,
         )
@@ -559,7 +547,7 @@ mod tests {
         let dir = TempDir::new("badmode");
         fs::write(
             dir.join("config.json"),
-            r#"{"targets":[{"app_name":"a.b","enabled":true,"kernel_assisted_evasion":true,
+            r#"{"targets":[{"app_name":"a.b","enabled":true,
                 "start_up_delay_ms":0,"injected_libraries":[],
                 "child_gating":{"enabled":true,"mode":"kil"}}]}"#,
         )
@@ -572,7 +560,7 @@ mod tests {
         let dir = TempDir::new("bigdelay");
         fs::write(
             dir.join("config.json"),
-            r#"{"targets":[{"app_name":"a.b","enabled":true,"kernel_assisted_evasion":true,
+            r#"{"targets":[{"app_name":"a.b","enabled":true,
                 "start_up_delay_ms":999999999,"injected_libraries":[]}]}"#,
         )
         .unwrap();
@@ -590,7 +578,6 @@ mod tests {
         .unwrap();
         let cfg = load_config(dir.to_str().unwrap(), "a.b").expect("minimal config");
         assert!(!cfg.enabled);
-        assert!(!cfg.kernel_assisted_evasion);
         assert_eq!(cfg.start_up_delay_ms, 0);
         assert!(cfg.hide_maps);
         assert!(!cfg.scrub_elf_header);
@@ -600,12 +587,27 @@ mod tests {
     }
 
     #[test]
+    fn removed_legacy_keys_are_ignored() {
+        let dir = TempDir::new("legacy-key");
+        fs::write(
+            dir.join("config.json"),
+            r#"{"targets":[{"app_name":"a.b","enabled":true,
+                "kernel_assisted_evasion":true,"start_up_delay_ms":0,
+                "injected_libraries":[]}]}"#,
+        )
+        .unwrap();
+        let cfg = load_config(dir.to_str().unwrap(), "a.b").expect("legacy config");
+        assert!(cfg.enabled);
+        assert!(cfg.injected_libraries.is_empty());
+    }
+
+    #[test]
     fn broken_entry_does_not_disable_other_targets() {
         let dir = TempDir::new("skip-broken");
         fs::write(
             dir.join("config.json"),
             r#"{"targets":[{"app_name":"broken","enabled":"yes"},
-                {"app_name":"a.b","enabled":true,"kernel_assisted_evasion":true,
+                {"app_name":"a.b","enabled":true,
                 "start_up_delay_ms":0,"injected_libraries":[]}]}"#,
         )
         .unwrap();

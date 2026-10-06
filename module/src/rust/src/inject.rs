@@ -934,10 +934,6 @@ fn inject_libs(cfg: &TargetConfig, pid: libc::pid_t) {
         enable_child_gating(&cfg.child_gating, &cfg.app_name, cfg.scrub_elf_header);
     }
 
-    if cfg.kernel_assisted_evasion {
-        logi_fmt(format_args!("KSIE enabled for PID: {pid}"));
-    }
-
     sweep_stale_stage_dirs(&format!(
         "/data/user/0/{}/.cache",
         package_of(&cfg.app_name)

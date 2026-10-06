@@ -12,7 +12,6 @@ export interface ChildGating {
 export interface Target {
     app_name: string;
     enabled: boolean;
-    kernel_assisted_evasion: boolean;
     start_up_delay_ms: number;
     hide_maps?: boolean;
     scrub_elf_header?: boolean;

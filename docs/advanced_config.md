@@ -21,7 +21,6 @@ Example config
         {
             "app_name": "com.example.package",
             "enabled": true,
-            "kernel_assisted_evasion": false,
             "hide_maps": true,
             "start_up_delay_ms": 0,
             "injected_libraries": [
@@ -61,10 +60,6 @@ The bundle id of the application you want to inject frida into.
 If set to false, then this module will ignore this configuration.
 This is useful if you want to temporarily disable a target while maintaining the config.
 Missing `enabled` defaults to `false`, so a minimal target entry never injects by accident.
-
-### kernel_assisted_evasion
-Enables kernel-assisted evasion for the target process (KSIE). Requires KernelSU with compatible kernel patches.
-Missing `kernel_assisted_evasion` defaults to `false`.
 
 ### hide_maps
 Whether injected libraries are remapped out of `/proc/self/maps` after

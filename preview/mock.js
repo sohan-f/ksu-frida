@@ -29,7 +29,6 @@
                 {
                     app_name: "com.example.app",
                     enabled: true,
-                    kernel_assisted_evasion: false,
                     hide_maps: true,
                     start_up_delay_ms: 500,
                     injected_libraries: [{ path: "/data/local/tmp/libsec/libsecmon.so" }],
@@ -38,7 +37,6 @@
                 {
                     app_name: "com.example.game",
                     enabled: false,
-                    kernel_assisted_evasion: false,
                     hide_maps: true,
                     start_up_delay_ms: 0,
                     injected_libraries: [{ path: "/data/local/tmp/libsec/libsecmon.so" }],

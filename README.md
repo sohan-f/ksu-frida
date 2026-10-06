@@ -60,7 +60,6 @@ Example `config.json`:
         {
             "app_name": "com.example.app",
             "enabled": true,
-            "kernel_assisted_evasion": false,
             "start_up_delay_ms": 0,
             "injected_libraries": [
                 { "path": "/data/local/tmp/libsec/libsecmon.so" }
