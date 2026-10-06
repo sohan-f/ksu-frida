@@ -80,6 +80,15 @@ Missing `start_up_delay_ms` defaults to `0`.
 There are times that you might want to delay the injection of the gadget. Some applications
 might run checks at start up and delaying the injection can help avoid these.
 
+### scrub_elf_header
+Overwrites the 16 ELF identification bytes at the base of each injected
+library after hiding it. Missing `scrub_elf_header` defaults to `false`.
+
+Memory scanners look for the `\x7fELF` magic at the base of anonymous
+executable mappings; wiping it removes that signal. The loader is done with
+the header by the time injection runs, but validate tombstones and agent
+features against each new gadget version before enabling this.
+
 ### injected_libraries
 These are the libraries that will be injected into the process. The libraries
 specified here will be loaded in the order of the array.
