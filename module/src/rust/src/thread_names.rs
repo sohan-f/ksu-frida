@@ -2,6 +2,7 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::log::{loge, loge_fmt, logi};
+use crate::sys::{RTLD_DEFAULT, RTLD_NOLOAD, RTLD_NOW, dlerror_string, dlopen, dlsym};
 
 #[cfg(target_os = "android")]
 unsafe extern "C" {
@@ -97,19 +98,15 @@ fn first_blocked_in(tasks: &std::path::Path) -> Option<String> {
 pub fn enable_thread_name_sanitizing() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        // SAFETY: `RTLD_DEFAULT` is the documented sentinel handle and
-        // `c"pthread_setname_np"` matches the NDK signature verbatim.
-        let addr =
-            unsafe { crate::sys::dlsym(crate::sys::RTLD_DEFAULT, c"pthread_setname_np".as_ptr()) };
-        if addr.is_null() {
+        let Some(addr) = lookup_setname() else {
             loge("setname hook: symbol address null; thread names stay as-is");
             return;
-        }
+        };
 
         let replacement = setname_replacement as *const () as *mut c_void;
         // Stack local: filled synchronously below, published once after.
         let mut trampoline: *mut c_void = std::ptr::null_mut();
-        // SAFETY: `addr` non-null from `dlsym` above, `trampoline` lives in this frame.
+        // SAFETY: `addr` non-null from the lookup above, `trampoline` lives in this frame.
         let rc = unsafe { ksufrida_dobby_hook(addr, replacement, &raw mut trampoline) };
         if rc == 0 && !trampoline.is_null() {
             ORIG_SETNAME.store(trampoline, Ordering::Release);
@@ -118,6 +115,46 @@ pub fn enable_thread_name_sanitizing() {
             loge_fmt(format_args!("setname hook installation failed: {rc}"));
         }
     });
+}
+
+/// Address of `pthread_setname_np` for the Dobby hook below, if resolvable.
+fn lookup_setname() -> Option<*mut c_void> {
+    const NAME: &CStr = c"pthread_setname_np";
+    // Explicit handle first: the default scope provably misses from this
+    // module, so the known scope leads. The handle is intentionally never
+    // closed; it pins nothing new.
+    // SAFETY: `RTLD_NOLOAD` takes no new reference beyond the
+    // already-loaded library, and every result below is checked for null.
+    let handle = unsafe { dlopen(c"libc.so".as_ptr(), RTLD_NOW | RTLD_NOLOAD) };
+    if !handle.is_null() {
+        // SAFETY: `handle` is live from above; `NAME` is NUL-terminated.
+        let addr = unsafe { dlsym(handle, NAME.as_ptr()) };
+        if !addr.is_null() {
+            return Some(addr);
+        }
+        loge_fmt(format_args!(
+            "setname hook: libc-scoped lookup failed: {}",
+            dlerror_string()
+        ));
+    } else {
+        loge_fmt(format_args!(
+            "setname hook: libc handle lookup failed: {}",
+            dlerror_string()
+        ));
+    }
+    // Fallback: default scope covers non-libc targets and loaders where
+    // the explicit handle does not resolve.
+    // SAFETY: `RTLD_DEFAULT` is the documented sentinel handle; a null
+    // return only skips the hook below.
+    let addr = unsafe { dlsym(RTLD_DEFAULT, NAME.as_ptr()) };
+    if addr.is_null() {
+        loge_fmt(format_args!(
+            "setname hook: default-namespace lookup failed: {}",
+            dlerror_string()
+        ));
+        return None;
+    }
+    Some(addr)
 }
 
 #[cfg(test)]
@@ -207,6 +244,13 @@ mod tests {
         }
 
         ORIG_SETNAME.store(std::ptr::null_mut(), Ordering::Release);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // raw dlsym(3) has no Miri shim
+    fn lookup_resolves_on_host_libc() {
+        // glibc exports the symbol, so the default-namespace branch hits.
+        assert!(!lookup_setname().unwrap_or(std::ptr::null_mut()).is_null());
     }
 
     #[test]

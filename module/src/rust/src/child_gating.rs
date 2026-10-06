@@ -1,4 +1,4 @@
-use std::ffi::{c_int, c_void};
+use std::ffi::{CStr, c_int, c_void};
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::config::{ChildGatingConfig, ChildMode};
 use crate::inject::stage_and_inject;
 use crate::log::{loge, loge_fmt, logi, logi_fmt};
-use crate::sys::{RTLD_DEFAULT, dlsym, set_errno};
+use crate::sys::{RTLD_DEFAULT, RTLD_NOLOAD, RTLD_NOW, dlerror_string, dlopen, dlsym, set_errno};
 
 type ForkFn = unsafe extern "C" fn() -> libc::pid_t;
 
@@ -135,6 +135,47 @@ fn fork_inner() -> libc::pid_t {
     run_child_action(mode, libraries, app_name)
 }
 
+/// Address of a hook target by name, if resolvable in any visible scope.
+fn lookup_hook_target(name: &CStr) -> Option<*mut c_void> {
+    // Explicit handle first: the default scope provably misses from this
+    // module, so the known scope leads. The handle is intentionally never
+    // closed; it pins nothing new.
+    // SAFETY: `RTLD_NOLOAD` takes no new reference beyond the
+    // already-loaded library, and every result below is checked for null.
+    let handle = unsafe { dlopen(c"libc.so".as_ptr(), RTLD_NOW | RTLD_NOLOAD) };
+    if !handle.is_null() {
+        // SAFETY: `handle` is live from above; `name` is NUL-terminated.
+        let addr = unsafe { dlsym(handle, name.as_ptr()) };
+        if !addr.is_null() {
+            return Some(addr);
+        }
+        loge_fmt(format_args!(
+            "[child_gating] libc-scoped lookup failed for {}: {}",
+            name.to_string_lossy(),
+            dlerror_string()
+        ));
+    } else {
+        loge_fmt(format_args!(
+            "[child_gating] libc handle lookup failed: {}",
+            dlerror_string()
+        ));
+    }
+    // Fallback: default scope covers non-libc targets and loaders where
+    // the explicit handle does not resolve.
+    // SAFETY: `RTLD_DEFAULT` is the documented sentinel handle; a null
+    // return only skips the hook below.
+    let addr = unsafe { dlsym(RTLD_DEFAULT, name.as_ptr()) };
+    if addr.is_null() {
+        loge_fmt(format_args!(
+            "[child_gating] default-namespace lookup failed for {}: {}",
+            name.to_string_lossy(),
+            dlerror_string()
+        ));
+        return None;
+    }
+    Some(addr)
+}
+
 pub fn enable_child_gating(cfg: &ChildGatingConfig, app_name: &str) {
     if CHILD_GATING_MODE.set(cfg.mode).is_err() {
         loge("child gating already enabled; ignoring second config");
@@ -150,24 +191,24 @@ pub fn enable_child_gating(cfg: &ChildGatingConfig, app_name: &str) {
     logi("[child_gating] enabling child gating");
     enable_atfork_reset();
 
-    // SAFETY: `RTLD_DEFAULT` is the documented sentinel handle and `c"fork"` is a valid NUL-terminated literal.
-    let fork_addr = unsafe { dlsym(RTLD_DEFAULT, c"fork".as_ptr()) };
-    logi_fmt(format_args!("[child_gating] fork address {fork_addr:p}"));
-    // SAFETY: as above, with `c"vfork"`.
-    let vfork_addr = unsafe { dlsym(RTLD_DEFAULT, c"vfork".as_ptr()) };
-    logi_fmt(format_args!("[child_gating] vfork address {vfork_addr:p}"));
+    let fork_addr = lookup_hook_target(c"fork");
+    if let Some(addr) = fork_addr {
+        logi_fmt(format_args!("[child_gating] fork address {addr:p}"));
+    }
+    let vfork_addr = lookup_hook_target(c"vfork");
+    if let Some(addr) = vfork_addr {
+        logi_fmt(format_args!("[child_gating] vfork address {addr:p}"));
+    }
 
     let replacement = fork_replacement as *const () as *mut c_void;
 
     // Without a published fork origin, a working vfork hook would fail every
     // spawn, so both hooks stand or fall together.
     let mut fork_ok = false;
-    if fork_addr.is_null() {
-        loge("[child_gating] fork address null; skipping fork hook");
-    } else {
+    if let Some(fork_addr) = fork_addr {
         // Stack local: only this thread observes it, so the publish cannot race hooks on other threads.
         let mut fork_trampoline: *mut c_void = std::ptr::null_mut();
-        // SAFETY: `fork_addr` non-null from `dlsym` above, `fork_trampoline` lives in this frame.
+        // SAFETY: `fork_addr` non-null from the lookup above, `fork_trampoline` lives in this frame.
         let rc = unsafe { ksufrida_dobby_hook(fork_addr, replacement, &raw mut fork_trampoline) };
         if rc == 0 {
             ORIG_FORK.store(fork_trampoline, Ordering::Release);
@@ -178,16 +219,16 @@ pub fn enable_child_gating(cfg: &ChildGatingConfig, app_name: &str) {
                 "[child_gating] fork hook installation failed: {rc}"
             ));
         }
+    } else {
+        loge("[child_gating] fork address null; skipping fork hook");
     }
 
     // Discarded: the vfork hook resumes through the fork trampoline above.
     if !fork_ok {
         loge("[child_gating] skipping vfork hook without a fork origin");
-    } else if vfork_addr.is_null() {
-        loge("[child_gating] vfork address null; skipping vfork hook");
-    } else {
+    } else if let Some(vfork_addr) = vfork_addr {
         let mut vfork_trampoline: *mut c_void = std::ptr::null_mut();
-        // SAFETY: as above, for the vfork slot; nothing ever reads the value.
+        // SAFETY: non-null from the lookup above; nothing ever reads the value.
         let rc = unsafe { ksufrida_dobby_hook(vfork_addr, replacement, &raw mut vfork_trampoline) };
         if rc == 0 {
             logi("[child_gating] vfork hook installed");
@@ -196,6 +237,8 @@ pub fn enable_child_gating(cfg: &ChildGatingConfig, app_name: &str) {
                 "[child_gating] vfork hook installation failed: {rc}"
             ));
         }
+    } else {
+        loge("[child_gating] vfork address null; skipping vfork hook");
     }
 
     logi("[child_gating] child gating enabled");
@@ -250,6 +293,22 @@ mod tests {
                 ksufrida_dobby_hook(std::ptr::null_mut(), std::ptr::null_mut(), &raw mut orig)
             },
             0
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // raw dlsym(3) has no Miri shim
+    fn lookup_resolves_libc_symbols_on_host() {
+        // glibc exports both, so the default-namespace branch hits.
+        assert!(
+            !lookup_hook_target(c"fork")
+                .unwrap_or(std::ptr::null_mut())
+                .is_null()
+        );
+        assert!(
+            !lookup_hook_target(c"vfork")
+                .unwrap_or(std::ptr::null_mut())
+                .is_null()
         );
     }
 

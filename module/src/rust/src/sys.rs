@@ -2,6 +2,7 @@ use std::ffi::{CStr, CString, NulError, c_char, c_int, c_void};
 use std::io;
 
 pub const RTLD_NOW: c_int = 2;
+pub const RTLD_NOLOAD: c_int = 0x04;
 
 pub const RTLD_DEFAULT: *mut c_void = std::ptr::null_mut();
 
