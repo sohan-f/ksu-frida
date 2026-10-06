@@ -47,6 +47,12 @@ jobs:
         with:
           workspaces: module/src/rust -> target
 
+      - name: Install cargo-ndk
+        # Not covered by the rust cache on a cold job namespace
+        # (add-job-id-key): without this `cargo ndk` fails with
+        # "no such command". Matches README prerequisites.
+        run: cargo install cargo-ndk
+
       - name: Stamp nightly version
         id: nightly-version
         run: |
