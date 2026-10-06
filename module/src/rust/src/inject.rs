@@ -659,8 +659,9 @@ fn verify_hiding(lib_path: &str, log_context: &str, hide_maps: bool) {
         return;
     }
     let base = basename(lib_path);
-    // Linker first (in-memory walk), maps second (file scan); scrub stops at
-    // the first match, so only a full walk catches a surviving duplicate.
+    // Linker first (in-memory walk), maps second (file scan), threads last
+    // (directory walk); scrub stops at the first match, so only a full walk
+    // catches a surviving duplicate.
     if crate::linkmap::is_linker_visible(lib_path, false) {
         loge_fmt(format_args!(
             "{log_context}Hide verify LEAK (linker) for {base}"
@@ -668,6 +669,10 @@ fn verify_hiding(lib_path: &str, log_context: &str, hide_maps: bool) {
     } else if crate::remap::maps_show(base) {
         loge_fmt(format_args!(
             "{log_context}Hide verify LEAK (maps) for {base}"
+        ));
+    } else if let Some(name) = crate::thread_names::first_blocked_thread_name() {
+        loge_fmt(format_args!(
+            "{log_context}Hide verify LEAK (threads) for {base}: {name}"
         ));
     } else {
         logi_fmt(format_args!("{log_context}Hide verify clean for {base}"));
@@ -701,6 +706,10 @@ fn verify_hiding_memfd(log_context: &str, hide_maps: bool) {
     } else if crate::remap::maps_show(crate::sys::MEMFD_NAME) {
         loge_fmt(format_args!(
             "{log_context}Hide verify LEAK (maps) for memfd"
+        ));
+    } else if let Some(name) = crate::thread_names::first_blocked_thread_name() {
+        loge_fmt(format_args!(
+            "{log_context}Hide verify LEAK (threads) for memfd: {name}"
         ));
     } else {
         logi_fmt(format_args!("{log_context}Hide verify clean for memfd"));
@@ -877,6 +886,10 @@ fn inject_libs(cfg: &TargetConfig, pid: libc::pid_t) {
         ));
         return;
     }
+
+    // Sanitize thread names before any library loads: gadget threads are
+    // named at creation, and the hook below is what renames them.
+    crate::thread_names::enable_thread_name_sanitizing();
 
     if cfg.child_gating.enabled {
         enable_child_gating(&cfg.child_gating, &cfg.app_name);

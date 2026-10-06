@@ -9,6 +9,7 @@ mod linkmap;
 mod log;
 mod remap;
 mod sys;
+mod thread_names;
 mod xdl;
 
 pub use jni::ksufrida_handle_app;
