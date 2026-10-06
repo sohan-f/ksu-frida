@@ -1,3 +1,10 @@
+# v2.11.0
+- Verified hiding after every injection and reported any leftover traces in verbose logs
+- Renamed injected thread names to blend in with system threads
+- Adopted Frida gadget 17.22.2 with hash-verified downloads
+- Named hidden memory mappings so they blend with the system JIT instead of staying blank
+- Hardened the linker-table cleanup against malformed entries
+
 # v2.10.0
 - Pinned the Frida gadget version with SHA-256 verification at build time and on-device updates
 - Required explicit confirmation before installing unverified gadget downloads

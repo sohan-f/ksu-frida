@@ -1,6 +1,6 @@
 {
-    "version": "v2.10.0",
-    "versionCode": 50,
-    "zipUrl": "https://github.com/sohan-f/ksu-frida/releases/download/v2.10.0/KsuFrida-v2.10.0.zip",
+    "version": "v2.11.0",
+    "versionCode": 51,
+    "zipUrl": "https://github.com/sohan-f/ksu-frida/releases/download/v2.11.0/KsuFrida-v2.11.0.zip",
     "changelog": "https://raw.githubusercontent.com/sohan-f/ksu-frida/main/changelog.md"
 }
