@@ -49,11 +49,12 @@ test(
     device((dev) => {
         const body = '{"targets":[]}';
         const out = dev.exec(
-            `{ rm -f /data/local/tmp/libsec/config.json; printf '%s\\n' ${shQuote(body)} > /data/local/tmp/libsec/config.json && chmod 644 /data/local/tmp/libsec/config.json && echo SAVED; } 2>&1`,
+            `{ rm -f /data/local/tmp/libsec/config.json.tmp; printf '%s\\n' ${shQuote(body)} > /data/local/tmp/libsec/config.json.tmp && chmod 644 /data/local/tmp/libsec/config.json.tmp && mv -f /data/local/tmp/libsec/config.json.tmp /data/local/tmp/libsec/config.json && echo SAVED; } 2>&1`,
         );
         assert.equal(out.code, 0);
         assert.match(out.stdout, /SAVED/);
         assert.equal(dev.readDevicePath("/data/local/tmp/libsec/config.json").trim(), body);
+        assert.equal(dev.existsDevicePath("/data/local/tmp/libsec/config.json.tmp"), false);
     }),
 );
 

@@ -325,7 +325,10 @@ async function loadStatusNow(frag: DocumentFragment) {
         "if [ -f " + GADGET_PATH + " ]; then " +
         "echo \"GADGETKEY:$(stat -c '%s:%Y' " + GADGET_PATH + " 2>/dev/null)\"; " +
         "else echo 'GADGET:missing'; fi; " +
-        "if [ -f " + VERBOSE_PATH + " ]; then echo 'VERBOSE:on'; else echo 'VERBOSE:off'; fi;";
+        "if [ -f " + VERBOSE_PATH + " ]; then echo 'VERBOSE:on'; else echo 'VERBOSE:off'; fi; " +
+        "hv=$(logcat -d -s KsuFrida 2>/dev/null | grep -a 'Hide verify' | tail -n 20); " +
+        "if echo \"$hv\" | grep -qa LEAK; then echo 'HIDEVERIFY:LEAK'; " +
+        "elif [ -n \"$hv\" ]; then echo 'HIDEVERIFY:clean'; else echo 'HIDEVERIFY:nodata'; fi;";
 
     var rows: Record<string, string> = {};
     var r = await exec(cmd);
@@ -339,6 +342,11 @@ async function loadStatusNow(frag: DocumentFragment) {
             var i = line.indexOf(":");
             if (i > 0) rows[line.slice(0, i)] = line.slice(i + 1).trim();
         });
+    }
+    if (rows.HIDEVERIFY === "LEAK") {
+        appendStatusRow("Hide verify", "LEAK seen — check logs", true, undefined, frag);
+    } else if (rows.HIDEVERIFY === "clean") {
+        appendStatusRow("Hide verify", "clean", false, undefined, frag);
     }
 
     var gad = "unknown";
@@ -1150,6 +1158,7 @@ function renderDetail() {
     settings.className = "settings";
     settings.appendChild(settingRow("Kernel Evasion", makeSwitch(t.kernel_assisted_evasion, "ksie", i)));
     settings.appendChild(settingRow("Hide maps", makeSwitch(t.hide_maps !== false, "hidemaps", i)));
+    settings.appendChild(settingRow("Scrub ELF header", makeSwitch(!!t.scrub_elf_header, "scrubhdr", i)));
     settings.appendChild(settingRow("Child Gating", makeSwitch(!!(t.child_gating && t.child_gating.enabled), "child_enabled", i)));
     body.appendChild(settings);
 
@@ -1238,6 +1247,9 @@ function updateField(i: number, field: string, value: any) {
         case "hidemaps":
             t.hide_maps = value;
             break;
+        case "scrubhdr":
+            t.scrub_elf_header = value;
+            break;
         case "delay":
             // Rust requires u64; a negative would disable every target.
             t.start_up_delay_ms = Math.max(0, parseInt(value, 10) || 0);
@@ -1278,6 +1290,7 @@ function addTarget(pkg: string) {
         enabled: true,
         kernel_assisted_evasion: false,
         hide_maps: true,
+        scrub_elf_header: false,
         start_up_delay_ms: 0,
         injected_libraries: [{ path: "/data/local/tmp/libsec/libsecmon.so" }],
         child_gating: { enabled: false, mode: "freeze", injected_libraries: [] }
@@ -1694,8 +1707,10 @@ async function saveConfig() {
     var ok = false;
     var detail = "";
     try {
-        var r = await exec("{ rm -f " + CONFIG_PATH + "; printf '%s\\n' " + shQuote(json) + " > " + CONFIG_PATH +
-            " && chmod 644 " + CONFIG_PATH + " && echo " + SAVE_MARK + "; } 2>&1");
+        var tmp = CONFIG_PATH + ".tmp";
+        var r = await exec("{ rm -f " + tmp + "; printf '%s\\n' " + shQuote(json) + " > " + tmp +
+            " && chmod 644 " + tmp + " && mv -f " + tmp + " " + CONFIG_PATH +
+            " && echo " + SAVE_MARK + "; } 2>&1");
         if (String(r.stdout).indexOf(SAVE_MARK) !== -1) {
             ok = true;
             dirtyConfig = false;

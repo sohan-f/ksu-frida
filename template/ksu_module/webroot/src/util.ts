@@ -15,6 +15,7 @@ export interface Target {
     kernel_assisted_evasion: boolean;
     start_up_delay_ms: number;
     hide_maps?: boolean;
+    scrub_elf_header?: boolean;
     injected_libraries: GatingLib[];
     child_gating?: ChildGating;
 }
