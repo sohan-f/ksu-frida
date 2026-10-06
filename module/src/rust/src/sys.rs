@@ -57,6 +57,9 @@ pub const MFD_EXEC: c_int = 0x0010;
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub const MEMFD_NAME: &str = "dalvik-jit-cache";
 
+#[cfg(any(target_os = "android", test))]
+pub const MEMFD_CSTR: &CStr = c"dalvik-jit-cache";
+
 // pidfd_open(2): race-free liveness check. Bionic exposes it since API 31;
 // GKI 6.6 always has syscall 434. No safe libc wrapper on all targets,
 // so raw syscall with immediate error capture.

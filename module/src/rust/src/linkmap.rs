@@ -16,6 +16,7 @@ struct ScrubSearch {
 /// `buf` must point to a live NUL-terminated string with at least `len + 1`
 /// writable bytes (i.e. `len == strlen(buf)` of a heap string we own the
 /// reference to, like the linker's `dlpi_name` copy).
+#[inline(always)]
 unsafe fn overwrite_in_place(buf: *mut c_char, len: usize, replacement: &[u8]) {
     // SAFETY: bounded by the caller's footprint contract; every write below
     // lands at `buf[..=len]`.
@@ -70,6 +71,7 @@ unsafe extern "C" fn scrub_callback(
     1
 }
 
+#[inline(always)]
 fn entry_matches(current: &[u8], target: &[u8], substring: bool) -> bool {
     if substring {
         // `windows(0)` panics; a longer needle yields no windows.
@@ -395,6 +397,7 @@ use self::{Dyn64 as Dyn, Phdr64 as Phdr, Sym64 as Sym};
 
 /// # Safety
 /// `ptr[..max]` must be readable.
+#[inline(always)]
 unsafe fn bounded_strlen(ptr: *const u8, max: usize) -> Option<usize> {
     // SAFETY: the caller bounds the scan; each read lands inside `ptr[..max]`.
     unsafe {
@@ -407,6 +410,7 @@ unsafe fn bounded_strlen(ptr: *const u8, max: usize) -> Option<usize> {
     None
 }
 
+#[inline(always)]
 fn contains_frida(name: &[u8]) -> bool {
     name.windows(5)
         .any(|window| window.eq_ignore_ascii_case(b"frida"))
@@ -689,6 +693,7 @@ fn run_scrub(search: &mut ScrubSearch) {
 
 /// # Safety
 /// Logs every dlpi name; `info` comes from the linker.
+#[cold]
 unsafe extern "C" fn log_names_callback(
     info: *mut DlPhdrInfo,
     _size: usize,
@@ -702,6 +707,7 @@ unsafe extern "C" fn log_names_callback(
     0
 }
 
+#[cold]
 fn log_all_names() {
     // SAFETY: logging-only walk, no mutation.
     unsafe { dl_iterate_phdr(log_names_callback as DlIterateCb, std::ptr::null_mut()) };

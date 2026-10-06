@@ -67,6 +67,26 @@ pub(crate) fn current_app_name() -> String {
         .unwrap_or_default()
 }
 
+fn current_app_matches(expected: &str) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let Ok(f) = File::open("/proc/self/cmdline") else {
+        return false;
+    };
+    // Long names fall back to the allocating read; common names stay stack-only.
+    if expected.len() > 256 {
+        return current_app_name() == expected;
+    }
+    let mut buf = [0u8; 256];
+    // SAFETY: `read` into our own stack buffer; return checked below.
+    let n = unsafe { libc::read(f.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+    if n <= 0 {
+        return false;
+    }
+    let n = n as usize;
+    let end = buf[..n].iter().position(|&b| b == 0).unwrap_or(n);
+    buf[..end] == *expected.as_bytes()
+}
+
 fn package_of(app_name: &str) -> &str {
     app_name.split(':').next().unwrap_or(app_name)
 }
@@ -82,7 +102,7 @@ fn wait_for_init_within(app_name: &str, timeout: Duration) -> bool {
 
     let deadline = std::time::Instant::now() + timeout;
     // Exact match; a substring test confuses com.foo with com.foobar.
-    while current_app_name() != app_name {
+    while !current_app_matches(app_name) {
         if std::time::Instant::now() >= deadline {
             loge_fmt(format_args!(
                 "Timed out waiting for process init: {app_name}"
@@ -720,19 +740,15 @@ fn verify_hiding_memfd(log_context: &str, hide_maps: bool) {
 fn write_memfd(src_lib_path: &str) -> Option<c_int> {
     use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 
-    let c_name = match cstring(crate::sys::MEMFD_NAME) {
-        Ok(c_name) => c_name,
-        Err(_) => return None,
-    };
-    // SAFETY: static name above; the fd is checked below and owned here.
+    // SAFETY: static literal; the fd is checked below and owned here.
     // MFD_EXEC first: vm.memfd_noexec=1 forces NX and =2 rejects flagless.
     let mut fd = crate::sys::memfd_create(
-        c_name.as_ptr(),
+        crate::sys::MEMFD_CSTR.as_ptr(),
         crate::sys::MFD_CLOEXEC | crate::sys::MFD_ALLOW_SEALING | crate::sys::MFD_EXEC,
     );
     if fd < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) {
         fd = crate::sys::memfd_create(
-            c_name.as_ptr(),
+            crate::sys::MEMFD_CSTR.as_ptr(),
             crate::sys::MFD_CLOEXEC | crate::sys::MFD_ALLOW_SEALING,
         );
     }

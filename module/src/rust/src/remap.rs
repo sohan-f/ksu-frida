@@ -34,11 +34,29 @@ struct ProcMapsInfo {
     path: String,
 }
 
+#[inline]
 fn is_private_mapping(perms: &str) -> bool {
     // 4th char is p/s: shared mappings must keep sharing, never convert to private anon.
     perms.as_bytes().get(3) != Some(&b's')
 }
 
+#[inline]
+fn prot_from_perms(perms: &str) -> c_int {
+    let p = perms.as_bytes();
+    let mut prot = 0;
+    if p.first() == Some(&b'r') {
+        prot |= libc::PROT_READ;
+    }
+    if p.get(1) == Some(&b'w') {
+        prot |= libc::PROT_WRITE;
+    }
+    if p.get(2) == Some(&b'x') {
+        prot |= libc::PROT_EXEC;
+    }
+    prot
+}
+
+#[inline]
 fn parse_maps_line(line: &str) -> Option<ProcMapsInfo> {
     // The kernel separates the five fixed fields with single spaces, but the
     // pathname itself may contain spaces (shown unescaped), so split 6 ways.
@@ -60,16 +78,7 @@ fn parse_maps_line(line: &str) -> Option<ProcMapsInfo> {
         return None;
     };
 
-    let mut prot = 0;
-    if perms.contains('r') {
-        prot |= libc::PROT_READ;
-    }
-    if perms.contains('w') {
-        prot |= libc::PROT_WRITE;
-    }
-    if perms.contains('x') {
-        prot |= libc::PROT_EXEC;
-    }
+    let prot = prot_from_perms(perms);
     // 4th char is p/s: shared mappings must keep sharing, never convert to private anon.
     let private = is_private_mapping(perms);
 
@@ -82,6 +91,18 @@ fn parse_maps_line(line: &str) -> Option<ProcMapsInfo> {
     })
 }
 
+#[inline]
+fn parse_maps_range(line: &str) -> Option<(usize, usize, c_int)> {
+    // Same splitn(6,' ') contract as parse_maps_line, without the path alloc.
+    let mut parts = line.trim_start().splitn(6, ' ');
+    let (range, perms) = (parts.next()?, parts.next()?);
+    let (s, e) = range.split_once('-')?;
+    let (Ok(start), Ok(end)) = (usize::from_str_radix(s, 16), usize::from_str_radix(e, 16)) else {
+        return None;
+    };
+    Some((start, end, prot_from_perms(perms)))
+}
+
 fn get_modules_by_name(m_name: &str) -> Vec<ProcMapsInfo> {
     let mut maps = Vec::new();
 
@@ -89,14 +110,18 @@ fn get_modules_by_name(m_name: &str) -> Vec<ProcMapsInfo> {
         return maps;
     };
 
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
+    let mut reader = BufReader::new(file);
+    let mut line = String::with_capacity(256);
+    while reader.read_line(&mut line).unwrap_or(0) > 0 {
         if !line.contains(m_name) {
+            line.clear();
             continue;
         }
 
         if let Some(info) = parse_maps_line(&line) {
             maps.push(info);
         }
+        line.clear();
     }
 
     maps
@@ -266,11 +291,13 @@ pub(crate) fn after_fork() {
     REBUILD_LOCK.store(false, Ordering::Release);
 }
 
+#[inline]
 fn begin_rebuild(start: usize, size: usize) {
     IN_FLIGHT_END.store(start + size, Ordering::Relaxed);
     IN_FLIGHT_START.store(start, Ordering::Release);
 }
 
+#[inline]
 fn end_rebuild() {
     IN_FLIGHT_START.store(0, Ordering::Release);
 }
@@ -283,6 +310,7 @@ enum RelocateError {
     Restore(io::Error),
 }
 
+#[inline]
 fn copy_prot_for(perms: c_int) -> c_int {
     // Freeze writers during the copy: drop WRITE so concurrent writes fault
     // into park_or_forward instead of being lost. Restored after commit.
@@ -405,13 +433,16 @@ pub(crate) fn mapped_perms(start: usize, end: usize) -> Option<c_int> {
     let Ok(file) = File::open("/proc/self/maps") else {
         return None;
     };
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
-        let Some(info) = parse_maps_line(&line) else {
-            continue;
-        };
-        if info.start <= start && end <= info.end {
-            return Some(info.perms);
+    let mut reader = BufReader::new(file);
+    let mut line = String::with_capacity(256);
+    while reader.read_line(&mut line).unwrap_or(0) > 0 {
+        if let Some((s, e, prot)) = parse_maps_range(&line)
+            && s <= start
+            && end <= e
+        {
+            return Some(prot);
         }
+        line.clear();
     }
     None
 }

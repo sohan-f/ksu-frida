@@ -369,3 +369,188 @@ fn scrub_scan_naive(bencher: divan::Bencher, nsyms: usize) {
     assert_eq!(scan_windows(&strtab, &offs), scan_naive(&strtab, &offs));
     bencher.bench(|| black_box(scan_naive(black_box(&strtab), black_box(&offs))));
 }
+
+// Zero-cost proof for applied opts: old vs new on the same fixture ---------
+
+fn prot_old(perms: &str) -> i32 {
+    let mut prot = 0;
+    if perms.contains('r') {
+        prot |= libc::PROT_READ;
+    }
+    if perms.contains('w') {
+        prot |= libc::PROT_WRITE;
+    }
+    if perms.contains('x') {
+        prot |= libc::PROT_EXEC;
+    }
+    prot
+}
+
+fn prot_new(perms: &str) -> i32 {
+    let p = perms.as_bytes();
+    let mut prot = 0;
+    if p.first() == Some(&b'r') {
+        prot |= libc::PROT_READ;
+    }
+    if p.get(1) == Some(&b'w') {
+        prot |= libc::PROT_WRITE;
+    }
+    if p.get(2) == Some(&b'x') {
+        prot |= libc::PROT_EXEC;
+    }
+    prot
+}
+
+const PERMS_FIXTURE: [&str; 8] = [
+    "r--p", "rw-p", "r-xp", "rwxp", "---p", "r--s", "rw-s", "r-xs",
+];
+
+#[divan::bench]
+fn prot_contains_old(bencher: divan::Bencher) {
+    for p in PERMS_FIXTURE {
+        assert_eq!(prot_old(p), prot_new(p));
+    }
+    bencher.bench(|| {
+        let mut acc = 0;
+        for p in PERMS_FIXTURE {
+            acc += black_box(prot_old(black_box(p)));
+        }
+        black_box(acc)
+    });
+}
+
+#[divan::bench]
+fn prot_bytes_new(bencher: divan::Bencher) {
+    for p in PERMS_FIXTURE {
+        assert_eq!(prot_old(p), prot_new(p));
+    }
+    bencher.bench(|| {
+        let mut acc = 0;
+        for p in PERMS_FIXTURE {
+            acc += black_box(prot_new(black_box(p)));
+        }
+        black_box(acc)
+    });
+}
+
+fn parse_alloc_old(line: &str) -> Option<(usize, usize, i32)> {
+    let mut parts = line.trim_start().splitn(6, ' ');
+    let (range, perms, _, _, _, path) = (
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+    );
+    let (s, e) = range.split_once('-')?;
+    let (Ok(start), Ok(end)) = (usize::from_str_radix(s, 16), usize::from_str_radix(e, 16)) else {
+        return None;
+    };
+    let _owned: String = path.trim().to_string();
+    Some((start, end, prot_new(perms)))
+}
+
+fn parse_range_new(line: &str) -> Option<(usize, usize, i32)> {
+    let mut parts = line.trim_start().splitn(6, ' ');
+    let (range, perms) = (parts.next()?, parts.next()?);
+    let (s, e) = range.split_once('-')?;
+    let (Ok(start), Ok(end)) = (usize::from_str_radix(s, 16), usize::from_str_radix(e, 16)) else {
+        return None;
+    };
+    Some((start, end, prot_new(perms)))
+}
+
+#[divan::bench]
+fn maps_parse_alloc_old(bencher: divan::Bencher) {
+    let lines: Vec<String> = fs::read_to_string("/proc/self/maps")
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let old: Vec<_> = lines.iter().map(|l| parse_alloc_old(l)).collect();
+    let new: Vec<_> = lines.iter().map(|l| parse_range_new(l)).collect();
+    assert_eq!(old, new);
+    bencher.bench(|| black_box(lines.iter().filter_map(|l| parse_alloc_old(l)).count()));
+}
+
+#[divan::bench]
+fn maps_parse_range_new(bencher: divan::Bencher) {
+    let lines: Vec<String> = fs::read_to_string("/proc/self/maps")
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let old: Vec<_> = lines.iter().map(|l| parse_alloc_old(l)).collect();
+    let new: Vec<_> = lines.iter().map(|l| parse_range_new(l)).collect();
+    assert_eq!(old, new);
+    bencher.bench(|| black_box(lines.iter().filter_map(|l| parse_range_new(l)).count()));
+}
+
+fn cmdline_string_old(expected: &str) -> bool {
+    let name: String = fs::read("/proc/self/cmdline")
+        .ok()
+        .and_then(|bytes| {
+            bytes
+                .split(|b| *b == 0)
+                .next()
+                .map(|arg| String::from_utf8_lossy(arg).into_owned())
+        })
+        .unwrap_or_default();
+    name == expected
+}
+
+fn cmdline_stack_new(expected: &str) -> bool {
+    let Ok(f) = File::open("/proc/self/cmdline") else {
+        return false;
+    };
+    if expected.len() > 256 {
+        return cmdline_string_old(expected);
+    }
+    let mut buf = [0u8; 256];
+    // SAFETY: `read` into our own stack buffer; return checked below.
+    let n = unsafe { libc::read(f.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+    if n <= 0 {
+        return false;
+    }
+    let n = n as usize;
+    let end = buf[..n].iter().position(|&b| b == 0).unwrap_or(n);
+    buf[..end] == *expected.as_bytes()
+}
+
+#[divan::bench]
+fn cmdline_string_old_bench(bencher: divan::Bencher) {
+    let expect = fs::read("/proc/self/cmdline").unwrap();
+    let end = expect.iter().position(|&b| b == 0).unwrap_or(expect.len());
+    let expect_str = String::from_utf8_lossy(&expect[..end]).into_owned();
+    assert_eq!(
+        cmdline_string_old(&expect_str),
+        cmdline_stack_new(&expect_str)
+    );
+    bencher.bench(|| black_box(cmdline_string_old(black_box(&expect_str))));
+}
+
+#[divan::bench]
+fn cmdline_stack_new_bench(bencher: divan::Bencher) {
+    let expect = fs::read("/proc/self/cmdline").unwrap();
+    let end = expect.iter().position(|&b| b == 0).unwrap_or(expect.len());
+    let expect_str = String::from_utf8_lossy(&expect[..end]).into_owned();
+    assert_eq!(
+        cmdline_string_old(&expect_str),
+        cmdline_stack_new(&expect_str)
+    );
+    bencher.bench(|| black_box(cmdline_stack_new(black_box(&expect_str))));
+}
+
+#[divan::bench]
+fn memfd_cstring_alloc(bencher: divan::Bencher) {
+    use std::ffi::CString;
+    bencher.bench(|| black_box(CString::new(black_box("dalvik-jit-cache")).unwrap()));
+}
+
+#[divan::bench]
+fn memfd_cstr_literal(bencher: divan::Bencher) {
+    let lit: &std::ffi::CStr = c"dalvik-jit-cache";
+    assert_eq!(lit.to_bytes(), b"dalvik-jit-cache");
+    bencher.bench(|| black_box(lit.as_ptr()));
+}
