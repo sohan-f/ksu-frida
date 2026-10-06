@@ -1,0 +1,102 @@
+name: Nightly release
+
+# Rolling prerelease from main. Manual install only: update.json stays on
+# the stable channel, so stable users are never offered nightly builds.
+on:
+  schedule:
+    - cron: "30 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+jobs:
+  nightly:
+    name: Build and publish nightly
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: gradle
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: template/ksu_module/webroot/package-lock.json
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: module/src/rust -> target
+
+      - name: Stamp nightly version
+        id: nightly-version
+        run: |
+          set -euo pipefail
+
+          BASE_VERSION=$(grep 'moduleVersion =' module.gradle | awk -F'"' '{print $2}')
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          DATE=$(date -u +%Y%m%d)
+
+          NIGHTLY_VERSION="${BASE_VERSION}-nightly.${DATE}.${SHORT_SHA}"
+          echo "base=${BASE_VERSION} nightly=${NIGHTLY_VERSION}"
+
+          # Ephemeral workspace patch only: module.prop shows the nightly
+          # version, versionCode stays on the base so the stable OTA channel
+          # (update.json) never offers or downgrades nightlies.
+          BASE_ESCAPED=$(printf '%s' "$BASE_VERSION" | sed 's/\./\\./g')
+          sed -i "s/moduleVersion = \"${BASE_ESCAPED}\"/moduleVersion = \"${NIGHTLY_VERSION}\"/" module.gradle
+          grep 'moduleVersion =' module.gradle
+
+          echo "version=${NIGHTLY_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "date=${DATE}" >> "$GITHUB_OUTPUT"
+          echo "sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :module:assembleRelease
+
+      - name: Create nightly ZIP
+        run: |
+          set -euo pipefail
+          cd out/ksu_module_zygisk_release
+          # Fixed filename so the rolling `nightly` release holds a single
+          # asset with a stable download URL; date+sha live in the version.
+          zip -r ../KsuFrida-nightly.zip .
+
+      - name: Publish nightly release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: nightly
+          name: Nightly ${{ steps.nightly-version.outputs.version }}
+          body: |
+            Automated nightly build from `main`.
+
+            - base: `${{ steps.nightly-version.outputs.version }}`
+            - commit: `${{ github.sha }}`
+            - date (UTC): `${{ steps.nightly-version.outputs.date }}`
+
+            Manual install only — stable OTA (`update.json`) is untouched.
+          prerelease: true
+          make_latest: false
+          generate_release_notes: true
+          files: out/KsuFrida-nightly.zip
