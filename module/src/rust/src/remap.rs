@@ -435,15 +435,16 @@ fn remap_matches(query: &str, scrub_header: bool) {
 
     let _retry = install_fault_retry();
 
-    let mut seen_start = std::collections::HashSet::new();
+    let mut seen_start = Vec::with_capacity(maps.len());
     for info in &maps {
         if !info.private {
             logi_fmt(format_args!("Skipping shared mapping {}", info.path));
             continue;
         }
-        if !seen_start.insert(info.start) {
+        if seen_start.contains(&info.start) {
             continue;
         }
+        seen_start.push(info.start);
         let address = info.start as *mut c_void;
         let size = info.end - info.start;
 

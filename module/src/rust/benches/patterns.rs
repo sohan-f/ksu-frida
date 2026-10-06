@@ -282,7 +282,7 @@ unsafe fn unmap_pair(src: *mut u8, dst: *mut u8, size: usize) {
     }
 }
 
-#[divan::bench(args = [4096, 2097152])]
+#[divan::bench(args = [4096, 65536, 1048576, 8388608])]
 fn relocate_ptr_copy(bencher: divan::Bencher, size: usize) {
     let (src, dst) = anon_pair(size);
     // SAFETY: scratch-to-live shape from `relocate_segment`; non-overlapping.
@@ -294,7 +294,7 @@ fn relocate_ptr_copy(bencher: divan::Bencher, size: usize) {
     unsafe { unmap_pair(src, dst, size) };
 }
 
-#[divan::bench(args = [4096, 2097152])]
+#[divan::bench(args = [4096, 65536, 1048576, 8388608])]
 fn relocate_copy_nonoverlapping(bencher: divan::Bencher, size: usize) {
     let (src, dst) = anon_pair(size);
     // SAFETY: as above.

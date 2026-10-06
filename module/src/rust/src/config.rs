@@ -81,7 +81,7 @@ fn deserialize_libraries(value: &Value) -> Option<Vec<String>> {
         return None;
     };
 
-    let mut result = Vec::new();
+    let mut result = Vec::with_capacity(arr.len());
     for library in arr {
         let Some(obj) = library.as_object() else {
             loge("invalid config: expected injected_libraries members to be objects");

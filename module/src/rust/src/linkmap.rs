@@ -424,11 +424,13 @@ impl WritableWindow {
     /// `[addr, addr + len)` must name readable memory we own (our own
     /// tables); flipping it writable is safe exactly then.
     unsafe fn open(addr: usize, len: usize, label: &'static str) -> Option<Self> {
+        // Page size is fixed for the process lifetime; one syscall total.
+        static PAGE_SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         // SAFETY: `sysconf(3)` takes a constant and reports errors via -1.
-        let page = unsafe {
+        let page = *PAGE_SIZE.get_or_init(|| unsafe {
             let ps = libc::sysconf(libc::_SC_PAGESIZE);
             if ps <= 0 { 4096 } else { ps as usize }
-        };
+        });
         debug_assert!(page.is_power_of_two());
         if len == 0 {
             return None;
