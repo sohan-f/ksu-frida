@@ -554,3 +554,97 @@ fn memfd_cstr_literal(bencher: divan::Bencher) {
     assert_eq!(lit.to_bytes(), b"dalvik-jit-cache");
     bencher.bench(|| black_box(lit.as_ptr()));
 }
+
+// Item 6: first-byte pre-filter on the per-symbol frida scan ---------------
+
+fn scan_prefilter(strtab: &[u8], offs: &[u32]) -> usize {
+    offs.iter()
+        .filter(|&&o| {
+            let name = name_of(strtab, o);
+            name.len() >= 5
+                && name
+                    .windows(5)
+                    .any(|w| (w[0] | 32) == b'f' && w.eq_ignore_ascii_case(b"frida"))
+        })
+        .count()
+}
+
+#[divan::bench(args = [512, 8192])]
+fn scrub_scan_prefilter(bencher: divan::Bencher, nsyms: usize) {
+    let (strtab, offs) = build_dynstr(nsyms);
+    assert_eq!(scan_windows(&strtab, &offs), scan_prefilter(&strtab, &offs));
+    bencher.bench(|| black_box(scan_prefilter(black_box(&strtab), black_box(&offs))));
+}
+
+// Item 7: sweep per-entry string handling (syscalls excluded) ---------------
+
+fn sweep_path_old(cache_dir: &str, file_name: &std::ffi::OsStr) -> Option<(String, String)> {
+    let name = file_name.to_string_lossy().into_owned();
+    let _pid: libc::pid_t = name.parse().ok()?;
+    let dir = format!("{cache_dir}/{name}");
+    let marker = std::path::Path::new(&dir)
+        .join(".staging")
+        .to_string_lossy()
+        .into_owned();
+    Some((dir, marker))
+}
+
+fn sweep_path_new(
+    cache_dir: &str,
+    file_name: &std::ffi::OsStr,
+    dir: &mut String,
+    marker: &mut String,
+) -> Option<()> {
+    let s = file_name.to_str()?;
+    let _pid: libc::pid_t = s.parse().ok()?;
+    dir.clear();
+    dir.push_str(cache_dir);
+    dir.push('/');
+    dir.push_str(s);
+    marker.clear();
+    marker.push_str(dir);
+    marker.push('/');
+    marker.push_str(".staging");
+    Some(())
+}
+
+#[divan::bench]
+fn sweep_path_alloc_old(bencher: divan::Bencher) {
+    let names: Vec<std::ffi::OsString> = (0..64)
+        .map(|i| std::ffi::OsString::from(i.to_string()))
+        .collect();
+    let olds: Vec<_> = names.iter().map(|n| sweep_path_old("/c", n)).collect();
+    let mut dir = String::new();
+    let mut marker = String::new();
+    let news: Vec<_> = names
+        .iter()
+        .map(|n| {
+            sweep_path_new("/c", n, &mut dir, &mut marker).map(|()| (dir.clone(), marker.clone()))
+        })
+        .collect();
+    assert_eq!(olds, news);
+    bencher.bench(|| {
+        for n in &names {
+            black_box(sweep_path_old(black_box("/c"), black_box(n)));
+        }
+    });
+}
+
+#[divan::bench]
+fn sweep_path_reuse_new(bencher: divan::Bencher) {
+    let names: Vec<std::ffi::OsString> = (0..64)
+        .map(|i| std::ffi::OsString::from(i.to_string()))
+        .collect();
+    bencher.bench(|| {
+        let mut dir = String::new();
+        let mut marker = String::new();
+        for n in &names {
+            black_box(sweep_path_new(
+                black_box("/c"),
+                black_box(n),
+                &mut dir,
+                &mut marker,
+            ));
+        }
+    });
+}

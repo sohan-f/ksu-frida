@@ -523,9 +523,14 @@ fn sweep_stale_stage_dirs(cache_dir: &str) {
     };
     // SAFETY: `getpid(2)` cannot fail.
     let own_pid = unsafe { libc::getpid() };
+    let mut dir = String::new();
+    let mut marker = String::new();
     for entry in entries.map_while(Result::ok) {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let Ok(pid) = name.parse::<libc::pid_t>() else {
+        let name = entry.file_name();
+        let Some(s) = name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = s.parse::<libc::pid_t>() else {
             continue;
         };
         if pid == own_pid {
@@ -534,9 +539,16 @@ fn sweep_stale_stage_dirs(cache_dir: &str) {
         if pid_is_alive(pid) {
             continue;
         }
-        let dir = format!("{cache_dir}/{name}");
+        dir.clear();
+        dir.push_str(cache_dir);
+        dir.push('/');
+        dir.push_str(s);
+        marker.clear();
+        marker.push_str(&dir);
+        marker.push('/');
+        marker.push_str(STAGE_MARKER);
         // Only our stage dirs carry the marker; app-owned numeric dirs stay untouched.
-        if !std::path::Path::new(&dir).join(STAGE_MARKER).exists() {
+        if !std::path::Path::new(&marker).exists() {
             continue;
         }
         remove_stage_dir_contents(&dir);

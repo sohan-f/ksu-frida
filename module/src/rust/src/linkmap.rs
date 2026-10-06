@@ -412,8 +412,11 @@ unsafe fn bounded_strlen(ptr: *const u8, max: usize) -> Option<usize> {
 
 #[inline(always)]
 fn contains_frida(name: &[u8]) -> bool {
+    if name.len() < 5 {
+        return false;
+    }
     name.windows(5)
-        .any(|window| window.eq_ignore_ascii_case(b"frida"))
+        .any(|w| (w[0] | 32) == b'f' && w.eq_ignore_ascii_case(b"frida"))
 }
 
 struct WritableWindow {
