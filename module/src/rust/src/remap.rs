@@ -391,8 +391,8 @@ fn tag_anon(address: *mut c_void, size: usize) {
     }
 }
 
-pub fn remap_lib(lib_path: &str) {
-    remap_matches(basename(lib_path));
+pub fn remap_lib(lib_path: &str, scrub_header: bool) {
+    remap_matches(basename(lib_path), scrub_header);
 }
 
 pub(crate) fn maps_show(query: &str) -> bool {
@@ -418,14 +418,14 @@ pub(crate) fn mapped_perms(start: usize, end: usize) -> Option<c_int> {
 /// Remap memfd segments (`/memfd:dalvik-jit-cache`). The linker does not keep the
 /// source path for fd loads, so basename matching misses them.
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
-pub fn remap_memfd() {
+pub fn remap_memfd(scrub_header: bool) {
     #[cfg(any(target_os = "android", test))]
-    remap_matches(crate::sys::MEMFD_NAME);
+    remap_matches(crate::sys::MEMFD_NAME, scrub_header);
     #[cfg(not(any(target_os = "android", test)))]
-    remap_matches("dalvik-jit-cache");
+    remap_matches("dalvik-jit-cache", scrub_header);
 }
 
-fn remap_matches(query: &str) {
+fn remap_matches(query: &str, scrub_header: bool) {
     let maps = get_modules_by_name(query);
     if maps.is_empty() {
         return;
@@ -474,11 +474,125 @@ fn remap_matches(query: &str) {
     }
 
     logi("Remapped");
+
+    if scrub_header {
+        scrub_elf_magic(query);
+    }
+}
+
+/// Overwrites the ELF identification bytes of the lowest private mapping.
+/// The header always sits at the base of a standard shared object, and the
+/// loader is done with it by the time we run, so nothing reads it back.
+fn scrub_elf_magic(query: &str) {
+    let mut target: Option<(usize, c_int)> = None;
+    for info in get_modules_by_name(query) {
+        if !info.private {
+            continue;
+        }
+        match target {
+            Some((base, _)) if info.start >= base => {}
+            _ => target = Some((info.start, info.perms)),
+        }
+    }
+
+    let Some((base, perms)) = target else {
+        return;
+    };
+    // SAFETY: `base` is the page-aligned start of a live mapping from the
+    // scan above; only its first 16 bytes are touched below.
+    if unsafe { wipe_elf_magic_at(base as *mut c_void, perms) } {
+        logi_fmt(format_args!("Scrubbed ELF header for {query}"));
+    }
+}
+
+/// Zeroes the 16 identification bytes at a mapping base, restoring protections.
+unsafe fn wipe_elf_magic_at(base: *mut c_void, perms: c_int) -> bool {
+    const IDENT_LEN: usize = 16;
+    let rw = perms | libc::PROT_WRITE;
+    if rw != perms {
+        // SAFETY: `base` is page aligned with at least `IDENT_LEN` mapped bytes.
+        if unsafe { libc::mprotect(base, IDENT_LEN, rw) } != 0 {
+            loge_fmt(format_args!(
+                "scrub: cannot unprotect ELF header: {}",
+                io::Error::last_os_error()
+            ));
+            return false;
+        }
+    }
+    // SAFETY: same bounded range, now writable by construction above.
+    unsafe {
+        std::ptr::write_bytes(base as *mut u8, 0, IDENT_LEN);
+    }
+    if rw != perms {
+        // SAFETY: range from the successful call above; best-effort restore.
+        if unsafe { libc::mprotect(base, IDENT_LEN, perms) } != 0 {
+            loge_fmt(format_args!(
+                "scrub: cannot re-protect ELF header: {}",
+                io::Error::last_os_error()
+            ));
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // mmap(2)/mprotect(2) have no Miri shims
+    fn elf_magic_wipe_zeroes_ident_and_keeps_perms() {
+        const SIZE: usize = 4096;
+        const HEADER: &[u8; 16] = b"\x7fELF mock header";
+        // SAFETY: fresh anonymous mapping owned by this test.
+        let addr = unsafe {
+            let addr = libc::mmap(
+                std::ptr::null_mut(),
+                SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                -1,
+                0,
+            );
+            assert_ne!(
+                addr,
+                libc::MAP_FAILED,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+            addr
+        };
+        // SAFETY: `addr` is our live mapping; the wipe keeps its protections.
+        unsafe {
+            std::ptr::copy_nonoverlapping(HEADER.as_ptr(), addr as *mut u8, HEADER.len());
+            assert!(wipe_elf_magic_at(addr, libc::PROT_READ | libc::PROT_WRITE));
+            assert_eq!(
+                std::slice::from_raw_parts(addr as *const u8, HEADER.len()),
+                &[0u8; 16]
+            );
+            assert_eq!(
+                prot_at(addr as usize),
+                (libc::PROT_READ | libc::PROT_WRITE, true)
+            );
+        }
+        // SAFETY: same mapping, still writable: rewrite the header, then drop
+        // to read-only to exercise the mprotect path below.
+        unsafe {
+            std::ptr::copy_nonoverlapping(HEADER.as_ptr(), addr as *mut u8, HEADER.len());
+            assert_eq!(libc::mprotect(addr, SIZE, libc::PROT_READ), 0);
+        }
+        // SAFETY: `addr` is our live read-only mapping.
+        unsafe {
+            assert!(wipe_elf_magic_at(addr, libc::PROT_READ));
+            assert_eq!(
+                std::slice::from_raw_parts(addr as *const u8, HEADER.len()),
+                &[0u8; 16]
+            );
+            assert_eq!(prot_at(addr as usize), (libc::PROT_READ, true));
+            assert_eq!(libc::munmap(addr, SIZE), 0);
+        }
+    }
 
     #[test]
     fn maps_line_with_spaced_path_parses() {

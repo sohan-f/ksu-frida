@@ -597,7 +597,7 @@ fn unlink_staged(staged_lib_path: &str) {
     }
 }
 
-pub fn inject_lib(lib_path: &str, log_context: &str, hide_maps: bool) {
+pub fn inject_lib(lib_path: &str, log_context: &str, hide_maps: bool, scrub_header: bool) {
     let base = basename(lib_path);
     let c_path = match cstring(lib_path) {
         Ok(c_path) => c_path,
@@ -615,7 +615,7 @@ pub fn inject_lib(lib_path: &str, log_context: &str, hide_maps: bool) {
         logi_fmt(format_args!(
             "{log_context}Injected {base} with handle {handle:p}"
         ));
-        hide_or_show(lib_path, log_context, hide_maps);
+        hide_or_show(lib_path, log_context, hide_maps, scrub_header);
         return;
     }
     let xdl_err = dlerror_string();
@@ -626,7 +626,7 @@ pub fn inject_lib(lib_path: &str, log_context: &str, hide_maps: bool) {
         logi_fmt(format_args!(
             "{log_context}Injected {base} with handle {handle:p} (dlopen fallback)"
         ));
-        hide_or_show(lib_path, log_context, hide_maps);
+        hide_or_show(lib_path, log_context, hide_maps, scrub_header);
         return;
     }
     let dlopen_err = dlerror_string();
@@ -639,9 +639,9 @@ pub fn inject_lib(lib_path: &str, log_context: &str, hide_maps: bool) {
     ));
 }
 
-fn hide_or_show(lib_path: &str, log_context: &str, hide_maps: bool) {
+fn hide_or_show(lib_path: &str, log_context: &str, hide_maps: bool, scrub_header: bool) {
     if hide_maps {
-        remap_lib(lib_path);
+        remap_lib(lib_path, scrub_header);
     } else {
         logi_fmt(format_args!(
             "{log_context}Map hiding disabled for {}",
@@ -681,11 +681,11 @@ fn verify_hiding(lib_path: &str, log_context: &str, hide_maps: bool) {
 
 #[cfg(any(target_os = "android", test))]
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
-fn hide_or_show_memfd(log_context: &str, hide_maps: bool) {
+fn hide_or_show_memfd(log_context: &str, hide_maps: bool, scrub_header: bool) {
     use crate::linkmap::scrub_memfd;
     use crate::remap::remap_memfd;
     if hide_maps {
-        remap_memfd();
+        remap_memfd(scrub_header);
     } else {
         logi_fmt(format_args!("{log_context}Map hiding disabled for memfd"));
     }
@@ -787,7 +787,12 @@ fn write_memfd(src_lib_path: &str) -> Option<c_int> {
 }
 
 #[cfg(target_os = "android")]
-fn try_memfd_inject(src_lib_path: &str, log_context: &str, hide_maps: bool) -> bool {
+fn try_memfd_inject(
+    src_lib_path: &str,
+    log_context: &str,
+    hide_maps: bool,
+    scrub_header: bool,
+) -> bool {
     use crate::sys::{ANDROID_DLEXT_FORCE_LOAD, ANDROID_DLEXT_USE_LIBRARY_FD};
 
     let Some(fd) = write_memfd(src_lib_path) else {
@@ -830,16 +835,21 @@ fn try_memfd_inject(src_lib_path: &str, log_context: &str, hide_maps: bool) -> b
     logi_fmt(format_args!(
         "{log_context}Injected {src_lib_path} from memfd with handle {handle:p}"
     ));
-    hide_or_show_memfd(log_context, hide_maps);
+    hide_or_show_memfd(log_context, hide_maps, scrub_header);
     true
 }
 
 #[cfg(not(any(target_os = "android", test)))]
 #[allow(dead_code)]
-fn hide_or_show_memfd(_log_context: &str, _hide_maps: bool) {}
+fn hide_or_show_memfd(_log_context: &str, _hide_maps: bool, _scrub_header: bool) {}
 
 #[cfg(not(target_os = "android"))]
-fn try_memfd_inject(_src_lib_path: &str, _log_context: &str, _hide_maps: bool) -> bool {
+fn try_memfd_inject(
+    _src_lib_path: &str,
+    _log_context: &str,
+    _hide_maps: bool,
+    _scrub_header: bool,
+) -> bool {
     false
 }
 
@@ -849,9 +859,10 @@ pub(crate) fn stage_and_inject(
     app_name: &str,
     log_context: &str,
     hide_maps: bool,
+    scrub_header: bool,
     stage: bool,
 ) {
-    if try_memfd_inject(lib_path, log_context, hide_maps) {
+    if try_memfd_inject(lib_path, log_context, hide_maps, scrub_header) {
         return;
     }
     let staged: Option<String> = if stage {
@@ -872,7 +883,7 @@ pub(crate) fn stage_and_inject(
         "{log_context}Injecting {}",
         basename(inject_path)
     ));
-    inject_lib(inject_path, log_context, hide_maps);
+    inject_lib(inject_path, log_context, hide_maps, scrub_header);
 
     if let Some(staged) = staged.as_deref() {
         unlink_staged(staged);
@@ -892,7 +903,7 @@ fn inject_libs(cfg: &TargetConfig, pid: libc::pid_t) {
     crate::thread_names::enable_thread_name_sanitizing();
 
     if cfg.child_gating.enabled {
-        enable_child_gating(&cfg.child_gating, &cfg.app_name);
+        enable_child_gating(&cfg.child_gating, &cfg.app_name, cfg.scrub_elf_header);
     }
 
     if cfg.kernel_assisted_evasion {
@@ -908,7 +919,14 @@ fn inject_libs(cfg: &TargetConfig, pid: libc::pid_t) {
     delay_start_up(cfg.start_up_delay_ms);
 
     for lib_path in &cfg.injected_libraries {
-        stage_and_inject(lib_path, &cfg.app_name, "", cfg.hide_maps, false);
+        stage_and_inject(
+            lib_path,
+            &cfg.app_name,
+            "",
+            cfg.hide_maps,
+            cfg.scrub_elf_header,
+            false,
+        );
     }
 }
 
@@ -1356,6 +1374,7 @@ mod tests {
             "com.example.app",
             "[test] ",
             true,
+            false,
             false,
         );
 

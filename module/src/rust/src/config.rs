@@ -51,6 +51,7 @@ pub struct TargetConfig {
     pub start_up_delay_ms: u64,
     pub kernel_assisted_evasion: bool,
     pub hide_maps: bool,
+    pub scrub_elf_header: bool,
     pub injected_libraries: Vec<String>,
     pub child_gating: ChildGatingConfig,
 }
@@ -63,6 +64,7 @@ impl Default for TargetConfig {
             start_up_delay_ms: 0,
             kernel_assisted_evasion: false,
             hide_maps: true,
+            scrub_elf_header: false,
             injected_libraries: Vec::new(),
             child_gating: ChildGatingConfig::default(),
         }
@@ -178,6 +180,10 @@ fn deserialize_target_config(value: &Value) -> Option<TargetConfig> {
 
     if let Some(hide_maps) = opt_bool(obj, "hide_maps")? {
         result.hide_maps = hide_maps;
+    }
+
+    if let Some(scrub_elf_header) = opt_bool(obj, "scrub_elf_header")? {
+        result.scrub_elf_header = scrub_elf_header;
     }
 
     if let Some(libraries) = obj.get("injected_libraries") {
@@ -399,6 +405,41 @@ mod tests {
     }
 
     #[test]
+    fn scrub_elf_header_defaults_to_disabled_and_parses_explicit_values() {
+        let dir = TempDir::new("scrubhdr-default");
+        fs::write(dir.join("config.json"), ADVANCED).unwrap();
+        let cfg = load_config(dir.to_str().unwrap(), "com.example.app").expect("config");
+        assert!(!cfg.scrub_elf_header);
+
+        for (fragment, expected) in [
+            ("\"scrub_elf_header\":true", true),
+            ("\"scrub_elf_header\":false", false),
+        ] {
+            let dir = TempDir::new("scrubhdr-explicit");
+            fs::write(
+                dir.join("config.json"),
+                format!(
+                    r#"{{"targets":[{{"app_name":"a.b","enabled":true,
+                        "kernel_assisted_evasion":false,"start_up_delay_ms":0,
+                        {fragment},"injected_libraries":[]}}]}}"#,
+                ),
+            )
+            .unwrap();
+            let cfg = load_config(dir.to_str().unwrap(), "a.b").expect("config");
+            assert_eq!(cfg.scrub_elf_header, expected);
+        }
+
+        let dir = TempDir::new("scrubhdr-mistype");
+        fs::write(
+            dir.join("config.json"),
+            r#"{"targets":[{"app_name":"a.b","enabled":true,"kernel_assisted_evasion":false,
+                "start_up_delay_ms":0,"scrub_elf_header":"yes","injected_libraries":[]}]}"#,
+        )
+        .unwrap();
+        assert!(load_config(dir.to_str().unwrap(), "a.b").is_none());
+    }
+
+    #[test]
     fn hide_maps_defaults_to_true_and_parses_explicit_values() {
         let dir = TempDir::new("hidemaps-default");
         fs::write(dir.join("config.json"), ADVANCED).unwrap();
@@ -546,6 +587,7 @@ mod tests {
         assert!(!cfg.kernel_assisted_evasion);
         assert_eq!(cfg.start_up_delay_ms, 0);
         assert!(cfg.hide_maps);
+        assert!(!cfg.scrub_elf_header);
         assert!(cfg.injected_libraries.is_empty());
         assert!(!cfg.child_gating.enabled);
         assert_eq!(cfg.child_gating.mode, ChildMode::Pass);

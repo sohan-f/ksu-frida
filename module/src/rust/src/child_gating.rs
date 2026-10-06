@@ -17,6 +17,9 @@ static CHILD_GATING_MODE: std::sync::OnceLock<ChildMode> = std::sync::OnceLock::
 static INJECTED_LIBRARIES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 // Parent cmdline at enable time, COW-visible in fork child: avoids /proc re-read post-fork.
 static GATING_APP_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+// Header scrubbing follows the parent target; atomics only, safe post-fork.
+static GATING_SCRUB_HEADER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(target_os = "android")]
 unsafe extern "C" {
@@ -74,8 +77,9 @@ fn run_child_action(action: ChildMode, libraries: &[String], app_name: &str) -> 
             if libraries.is_empty() {
                 return 0;
             }
+            let scrub = GATING_SCRUB_HEADER.load(Ordering::Relaxed);
             for lib_path in libraries {
-                stage_and_inject(lib_path, app_name, "", true, true);
+                stage_and_inject(lib_path, app_name, "", true, scrub, true);
             }
             0
         }
@@ -176,13 +180,14 @@ fn lookup_hook_target(name: &CStr) -> Option<*mut c_void> {
     Some(addr)
 }
 
-pub fn enable_child_gating(cfg: &ChildGatingConfig, app_name: &str) {
+pub fn enable_child_gating(cfg: &ChildGatingConfig, app_name: &str, scrub_header: bool) {
     if CHILD_GATING_MODE.set(cfg.mode).is_err() {
         loge("child gating already enabled; ignoring second config");
         return;
     }
     let _ = INJECTED_LIBRARIES.set(cfg.injected_libraries.clone());
     let _ = GATING_APP_NAME.set(app_name.to_string());
+    GATING_SCRUB_HEADER.store(scrub_header, Ordering::Relaxed);
 
     if cfg.mode == ChildMode::Pass {
         loge("child_gating mode is pass; children will run ungated");
