@@ -581,7 +581,11 @@ unsafe fn scrub_elf_metadata(info: *mut DlPhdrInfo, replacement: &[u8]) -> (bool
         let p: Phdr =
             unsafe { (phdr.byte_add(i * size_of::<Phdr>()) as *const Phdr).read_unaligned() };
         if p.p_type == PT_DYNAMIC {
-            dyn_addr = base.wrapping_add(p.p_vaddr as usize);
+            // Fail closed on wrap: a wrapped base would scrub the wrong object.
+            let Some(addr) = base.checked_add(p.p_vaddr as usize) else {
+                return (false, 0);
+            };
+            dyn_addr = addr;
             break;
         }
     }
@@ -614,10 +618,15 @@ unsafe fn scrub_elf_metadata(info: *mut DlPhdrInfo, replacement: &[u8]) -> (bool
     if strtab == 0 || strsz == 0 {
         return (false, 0);
     }
-    let strtab = base.wrapping_add(strtab);
-    let symtab = base.wrapping_add(symtab);
-    let hash = base.wrapping_add(hash);
-    let gnu_hash = base.wrapping_add(gnu_hash);
+    // Fail closed on wrap; zero offsets resolve to `base` (absent-table sentinel below).
+    let (Some(strtab), Some(symtab), Some(hash), Some(gnu_hash)) = (
+        base.checked_add(strtab),
+        base.checked_add(symtab),
+        base.checked_add(hash),
+        base.checked_add(gnu_hash),
+    ) else {
+        return (false, 0);
+    };
 
     let nsyms = if hash != base {
         // SAFETY: `hash` names our own read-only table; unaligned-safe `u32` reads.
