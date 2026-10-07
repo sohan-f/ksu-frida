@@ -103,6 +103,14 @@ fn parse_maps_range(line: &str) -> Option<(usize, usize, c_int)> {
     Some((start, end, prot_from_perms(perms)))
 }
 
+fn maps_path_matches(path: &str, query: &str) -> bool {
+    let path = path.strip_suffix(" (deleted)").unwrap_or(path);
+    path.rsplit_once('/').map_or(path, |(_, base)| base) == query
+        || path
+            .strip_prefix("/memfd:")
+            .is_some_and(|name| name == query)
+}
+
 fn get_modules_by_name(m_name: &str) -> Vec<ProcMapsInfo> {
     let mut maps = Vec::new();
 
@@ -113,12 +121,16 @@ fn get_modules_by_name(m_name: &str) -> Vec<ProcMapsInfo> {
     let mut reader = BufReader::new(file);
     let mut line = String::with_capacity(256);
     while reader.read_line(&mut line).unwrap_or(0) > 0 {
+        // An exact match always contains the query, so this pre-screen is sound.
         if !line.contains(m_name) {
             line.clear();
             continue;
         }
-
-        if let Some(info) = parse_maps_line(&line) {
+        let Some(info) = parse_maps_line(&line) else {
+            line.clear();
+            continue;
+        };
+        if maps_path_matches(&info.path, m_name) {
             maps.push(info);
         }
         line.clear();
@@ -159,7 +171,14 @@ unsafe fn forward_fault(sig: c_int, info: *mut libc::siginfo_t, context: *mut c_
     };
 
     let handler = PREVIOUS_HANDLER[index].load(Ordering::Relaxed);
-    if handler.addr() == libc::SIG_DFL || handler.addr() == libc::SIG_IGN {
+    if handler.addr() == libc::SIG_IGN {
+        // Preserve an explicitly ignored signal. In particular, SIGBUS can
+        // be raised asynchronously; converting SIG_IGN to SIG_DFL would
+        // unexpectedly terminate the process during a remap window.
+        return;
+    }
+
+    if handler.addr() == libc::SIG_DFL {
         // SAFETY: plain `signal(2)`/`raise(2)` on the faulting thread; the pending signal is delivered before we return to it.
         unsafe {
             libc::signal(sig, libc::SIG_DFL);
@@ -640,6 +659,24 @@ mod tests {
         assert!(parse_maps_line("").is_none());
         assert!(parse_maps_line("7ac49c2000-7ac4a26000 r--p").is_none());
         assert!(parse_maps_line("zz-top r--p 0 00:00 0 /a").is_none());
+    }
+
+    #[test]
+    fn maps_path_match_is_exact_and_handles_memfd_names() {
+        assert!(maps_path_matches("/data/app/libfoo.so", "libfoo.so"));
+        assert!(maps_path_matches(
+            "/data/app/libfoo.so (deleted)",
+            "libfoo.so"
+        ));
+        assert!(!maps_path_matches("/data/app/libfoo.so.1", "libfoo.so"));
+        assert!(!maps_path_matches(
+            "/data/app/prefix-libfoo.so",
+            "libfoo.so"
+        ));
+        assert!(maps_path_matches(
+            "/memfd:dalvik-jit-cache (deleted)",
+            "dalvik-jit-cache"
+        ));
     }
 
     #[test]

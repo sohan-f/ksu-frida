@@ -147,7 +147,8 @@ fn open_dst_hardened(dst: &str) -> Option<File> {
         let how = crate::sys::OpenHow {
             flags: (libc::O_WRONLY
                 | libc::O_CREAT
-                | libc::O_TRUNC
+                // Never truncate a planted hard link or reuse stale stage files.
+                | libc::O_EXCL
                 | libc::O_CLOEXEC
                 | libc::O_NOFOLLOW
                 | libc::O_NONBLOCK) as u64,
@@ -169,8 +170,7 @@ fn open_dst_hardened(dst: &str) -> Option<File> {
     }
     fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o700)
         // Refuses symlink plants and keeps fifo plants from hanging the open.
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -581,7 +581,7 @@ fn stage_gadget(app_name: &str, src_lib_path: &str) -> Option<String> {
     if !ensure_dir(&stage_dir, 0o700) {
         return None;
     }
-    // Hardened empty file: symlink plants fail the open, anything else fails the sweep gate below.
+    // Exclusive creation prevents a planted marker or hard link from being truncated.
     if open_dst_hardened(&format!("{stage_dir}/{STAGE_MARKER}")).is_none() {
         remove_dir(&stage_dir);
         return None;
