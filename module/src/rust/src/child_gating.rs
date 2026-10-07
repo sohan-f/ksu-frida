@@ -153,16 +153,22 @@ fn lookup_hook_target(name: &CStr) -> Option<*mut c_void> {
         if !addr.is_null() {
             return Some(addr);
         }
-        loge_fmt(format_args!(
-            "[child_gating] libc-scoped lookup failed for {}: {}",
-            name.to_string_lossy(),
-            dlerror_string()
-        ));
+        // Gated: `dlerror_string()` allocates even when quiet.
+        if crate::log::verbose() {
+            loge_fmt(format_args!(
+                "[child_gating] libc-scoped lookup failed for {}: {}",
+                name.to_string_lossy(),
+                dlerror_string()
+            ));
+        }
     } else {
-        loge_fmt(format_args!(
-            "[child_gating] libc handle lookup failed: {}",
-            dlerror_string()
-        ));
+        // Gated: `dlerror_string()` allocates even when quiet.
+        if crate::log::verbose() {
+            loge_fmt(format_args!(
+                "[child_gating] libc handle lookup failed: {}",
+                dlerror_string()
+            ));
+        }
     }
     // Fallback: default scope covers non-libc targets and loaders where
     // the explicit handle does not resolve.
@@ -170,11 +176,14 @@ fn lookup_hook_target(name: &CStr) -> Option<*mut c_void> {
     // return only skips the hook below.
     let addr = unsafe { dlsym(RTLD_DEFAULT, name.as_ptr()) };
     if addr.is_null() {
-        loge_fmt(format_args!(
-            "[child_gating] default-namespace lookup failed for {}: {}",
-            name.to_string_lossy(),
-            dlerror_string()
-        ));
+        // Gated: `dlerror_string()` allocates even when quiet.
+        if crate::log::verbose() {
+            loge_fmt(format_args!(
+                "[child_gating] default-namespace lookup failed for {}: {}",
+                name.to_string_lossy(),
+                dlerror_string()
+            ));
+        }
         return None;
     }
     Some(addr)
