@@ -10,6 +10,7 @@ import {
     parseJson,
     parseLabelLines,
     parsePorts,
+    pairsFromPackagesInfo,
     shQuote,
     splitMarked,
     targetStatusCmd,
@@ -70,6 +71,23 @@ test("parseLabelLines skips marks and malformed rows", () => {
     assert.equal(m.get("com.a"), "Label A");
     assert.equal(m.get("com.b"), "B");
     assert.equal(m.has("broken"), false);
+});
+
+test("pairsFromPackagesInfo skips errors, falls back to package", () => {
+    const m = pairsFromPackagesInfo([
+        { packageName: "com.a", appLabel: "A" },
+        { packageName: "com.b" },
+        { packageName: "com.c", appLabel: "", error: "x" },
+        { packageName: "com.d", appLabel: "D", error: "x" },
+        null,
+        "junk",
+    ]);
+    assert.equal(m.get("com.a"), "A");
+    assert.equal(m.get("com.b"), "com.b");
+    assert.equal(m.has("com.c"), false);
+    assert.equal(m.has("com.d"), false);
+    assert.equal(pairsFromPackagesInfo(null).size, 0);
+    assert.equal(pairsFromPackagesInfo("[]").size, 0);
 });
 
 test("parsePorts keeps valid ports only", () => {

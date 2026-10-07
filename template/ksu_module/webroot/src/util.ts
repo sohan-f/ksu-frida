@@ -71,6 +71,26 @@ export function parseLabelLines(body: string) {
     return pairs;
 }
 
+export interface PackagesInfoRow {
+    packageName?: unknown;
+    appLabel?: unknown;
+    error?: unknown;
+}
+
+// Native getPackagesInfo rows to label pairs. Error rows stay missing
+// so the caller retries them; labels fall back to the package name.
+export function pairsFromPackagesInfo(info: unknown) {
+    var pairs = new Map<string, string>();
+    if (!Array.isArray(info)) return pairs;
+    (info as PackagesInfoRow[]).forEach(function (it) {
+        if (!it || typeof it !== "object" || it.error) return;
+        if (typeof it.packageName !== "string" || !it.packageName) return;
+        pairs.set(it.packageName,
+            typeof it.appLabel === "string" && it.appLabel ? it.appLabel : it.packageName);
+    });
+    return pairs;
+}
+
 export function splitMarked(text: string, marks: string[]): Record<string, string[]> {
     var parts: Record<string, string[]> = {};
     var cur: string | null = null;

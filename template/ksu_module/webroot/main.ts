@@ -32,6 +32,7 @@ import {
     parseJson,
     parseLabelLines,
     parsePorts,
+    pairsFromPackagesInfo,
     shQuote,
     splitMarked,
     targetStatusCmd,
@@ -619,12 +620,16 @@ function sortApps() {
     });
 }
 
-function nativeListPackages(): string[] | null {
+function nativeListFn(): (() => unknown) | null {
     if (typeof ksu === "undefined") return null;
-    try {
-        if (typeof ksu.listPackages === "function") return parseJson<string[] | null>(ksu.listPackages("user"), null);
-        if (typeof ksu.listUserPackages === "function") return parseJson<string[] | null>(ksu.listUserPackages(), null);
-    } catch (_) {}
+    if (typeof ksu.listPackages === "function") {
+        const list: (scope: string) => unknown = ksu.listPackages;
+        return function () { return list("user"); };
+    }
+    if (typeof ksu.listUserPackages === "function") {
+        const listUser: () => unknown = ksu.listUserPackages;
+        return function () { return listUser(); };
+    }
     return null;
 }
 
@@ -633,9 +638,20 @@ function nativeLabelsAvailable() {
 }
 
 async function listPackageNames(): Promise<string[]> {
-    var names = nativeListPackages();
-    if (names === null) { await delay(250); names = nativeListPackages(); }
-    if (Array.isArray(names) && names.length > 0) return names;
+    // Cold WebViews answer empty at first; retry before shell fallback.
+    var fn = nativeListFn();
+    if (fn) {
+        for (var attempt = 0; attempt < 6; attempt++) {
+            var names: string[] | null = null;
+            try {
+                names = parseJson<string[] | null>(fn(), null);
+            } catch (_) {
+                names = null;
+            }
+            if (Array.isArray(names) && names.length > 0) return names;
+            await delay(400);
+        }
+    }
 
     var out = "";
     await runDetached("pm list packages -3", PKGS_FILE, function (body: string) { out = body; },
@@ -676,6 +692,22 @@ async function resolveLabels(pkgs: string[], allowShell: boolean, fullSweep?: bo
     return labelsChain;
 }
 
+// One native label chunk; null on any bridge failure so the caller
+// retries it instead of silently keeping the package name.
+function nativeLabelChunk(chunk: string[]): Map<string, string> | null {
+    try {
+        var getInfo = ksu.getPackagesInfo;
+        if (!getInfo) return null;
+        return pairsFromPackagesInfo(parseJson(getInfo(JSON.stringify(chunk)), null));
+    } catch (_) {
+        return null;
+    }
+}
+
+function labeledCount(pkgs: string[]) {
+    return pkgs.filter(function (p) { return !!appLabels[p]; }).length;
+}
+
 async function resolveLabelsNow(pkgs: string[], allowShell: boolean, fullSweep?: boolean) {
     var missing = pkgs.filter(function (p) { return p && !appLabels[p]; });
     if (missing.length === 0) return;
@@ -684,16 +716,15 @@ async function resolveLabelsNow(pkgs: string[], allowShell: boolean, fullSweep?:
         labelsPending = true;
         updateAppHint();
         try {
-            for (var i = 0; i < missing.length; i += LABEL_CHUNK) {
-                var getInfo = ksu.getPackagesInfo; var info = getInfo ? parseJson<Array<{ packageName?: string; appLabel?: string; error?: unknown }> | null>(getInfo(JSON.stringify(missing.slice(i, i + LABEL_CHUNK))), null) : null;
-                var pairs = new Map<string, string>();
-                if (Array.isArray(info)) {
-                    info.forEach(function (it) {
-                        if (it && it.packageName && !it.error) pairs.set(it.packageName, it.appLabel || it.packageName);
-                    });
+            // Two passes: the second retries errored chunks once.
+            for (var pass = 0; pass < 2; pass++) {
+                var todo = missing.filter(function (p) { return !appLabels[p]; });
+                if (todo.length === 0) break;
+                for (var i = 0; i < todo.length; i += LABEL_CHUNK) {
+                    var pairs = nativeLabelChunk(todo.slice(i, i + LABEL_CHUNK));
+                    if (pairs) applyLabels(pairs);
+                    if (i + LABEL_CHUNK < todo.length) await delay(120);
                 }
-                applyLabels(pairs);
-                if (i + LABEL_CHUNK < missing.length) await delay(120);
             }
         } finally {
             labelsPending = false;
@@ -701,11 +732,15 @@ async function resolveLabelsNow(pkgs: string[], allowShell: boolean, fullSweep?:
             updateAppHint();
             if (isAppModalOpen()) renderAppList();
         }
-        return;
+        // Native resolved something: done. Total native failure falls
+        // through to shell below instead of stranding package names.
+        if (labeledCount(missing) > 0) return;
     }
 
     if (!allowShell) return;
 
+    // Best effort: dumpsys omits labels on stock ROMs, so this tier only
+    // helps where the native bridge is absent but the dump differs.
     labelsPending = true;
     updateAppHint();
     var script = "for p in " + missing.map(shQuote).join(" ") + "; do " +
