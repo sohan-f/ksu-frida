@@ -90,6 +90,7 @@ let reloadArmTimer: ReturnType<typeof setTimeout> | null = null;
 let searchQuery = "";
 let connectKey = "";
 let connectTimer: ReturnType<typeof setTimeout> | null = null;
+let targetsRenderedOnce = false;
 
 const APPS_CACHE_KEY = "ksufrida.apps.v1";
 const GADGET_VERSION_KEY = "ksufrida.gadgetver.v1";
@@ -418,13 +419,17 @@ function updateStatusPills() {
         if (!pill) return;
         var pids = targetStatus[name];
         if (pids && pids.length > 0) {
-            pill.textContent = "running · pid " + pids[0] + (pids.length > 1 ? " +" + (pids.length - 1) : "");
-            pill.className = "pill pill-on";
+            setPill(pill, "running · pid " + pids[0] + (pids.length > 1 ? " +" + (pids.length - 1) : ""), "pill pill-on");
         } else {
-            pill.textContent = "stopped";
-            pill.className = "pill";
+            setPill(pill, "stopped", "pill");
         }
     });
+}
+
+// Same-value writes restart CSS animations; write only on change.
+function setPill(pill: HTMLElement, text: string, cls: string) {
+    if (pill.textContent !== text) pill.textContent = text;
+    if (pill.className !== cls) pill.className = cls;
 }
 
 function stopApp(i: number) {
@@ -794,6 +799,12 @@ function patchAppLabels() {
     }
 }
 
+function skelHtml(n: number) {
+    var html = "";
+    for (var i = 0; i < n; i++) html += '<div class="skel"></div>';
+    return html;
+}
+
 function mkBtn(text: string, cls: string, onclick: () => void) {
     var b = document.createElement("button");
     b.className = cls;
@@ -928,7 +939,7 @@ function removeLibPath(i: number, field: LibField, path: string, row?: HTMLEleme
     };
     if (row && row.isConnected) {
         row.classList.add("leaving");
-        setTimeout(done, 180);
+        setTimeout(done, 210);
     } else {
         done();
     }
@@ -976,7 +987,7 @@ function renderTargets() {
             list.forEach(function (t) {
                 var i = config.targets.indexOf(t);
                 var row = document.createElement("div");
-                row.className = "target-row";
+                row.className = targetsRenderedOnce ? "target-row settled" : "target-row";
                 row.insertAdjacentHTML("afterbegin", appIconHtml(t.app_name, false, true));
                 var left = document.createElement("div");
                 left.className = "grow";
@@ -1005,6 +1016,9 @@ function renderTargets() {
     }
 
     updateStatusPills();
+    // Entrance stagger plays on first paint only; later re-renders
+    // (filtering, label arrival) snap so typing stays responsive.
+    targetsRenderedOnce = true;
     if (detailIndex !== null) {
         if (!config.targets[detailIndex]) closeDetail();
         else renderDetail();
@@ -1014,12 +1028,55 @@ function renderTargets() {
 function openDetail(i: number) {
     detailIndex = i;
     renderDetail();
-    getEl("target-modal").style.display = "flex";
+    openModal("target-modal");
 }
 
 function closeDetail() {
     detailIndex = null;
-    getEl("target-modal").style.display = "none";
+    closeModal("target-modal");
+}
+
+let modalTimers: Record<string, ReturnType<typeof setTimeout> | null> = {};
+
+function reducedMotion() {
+    return typeof window !== "undefined" && typeof window.matchMedia === "function" &&
+        window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
+
+function openModal(id: string) {
+    var m = getEl(id);
+    var pending = modalTimers[id];
+    if (pending !== null) {
+        clearTimeout(pending);
+        modalTimers[id] = null;
+    }
+    m.classList.remove("closing");
+    m.style.display = "flex";
+}
+
+// Exit plays first, then the overlay hides; reopening mid-exit wins.
+function closeModal(id: string, after?: () => void) {
+    var m = getEl(id);
+    if (m.style.display !== "flex") {
+        if (after) after();
+        return;
+    }
+    var pending = modalTimers[id];
+    if (pending !== null) clearTimeout(pending);
+    if (reducedMotion()) {
+        m.classList.remove("closing");
+        m.style.display = "none";
+        modalTimers[id] = null;
+        if (after) after();
+        return;
+    }
+    m.classList.add("closing");
+    modalTimers[id] = setTimeout(function () {
+        modalTimers[id] = null;
+        m.classList.remove("closing");
+        m.style.display = "none";
+        if (after) after();
+    }, 210);
 }
 
 type LibField = "libs" | "child_libs";
@@ -1032,19 +1089,20 @@ function openLibPicker(i: number, field: LibField) {
     pickerTarget = i;
     pickerField = field;
     pickerDir = "/data/local/tmp/libsec";
-    getEl("lib-modal").style.display = "flex";
+    openModal("lib-modal");
     browseLibDir();
 }
 
 function closeLibPicker() {
-    getEl("lib-modal").style.display = "none";
-    if (detailIndex !== null) renderDetail();
+    closeModal("lib-modal", function () {
+        if (detailIndex !== null) renderDetail();
+    });
 }
 
 async function browseLibDir() {
     var list = getEl("lib-list");
     getEl("lib-path").textContent = pickerDir;
-    list.innerHTML = '<div class="empty"><span class="spinner"></span>Loading…</div>';
+    list.innerHTML = skelHtml(5);
     var r = await exec("ls -a -p " + shQuote(pickerDir) + " 2>/dev/null");
     list.innerHTML = "";
     if (r.errno !== 0) {
@@ -1299,7 +1357,7 @@ function addTarget(pkg: string) {
 }
 
 function showAppList() {
-    getEl("app-modal").style.display = "flex";
+    openModal("app-modal");
     textEl("app-search").value = "";
     fetchApps();
     renderAppList();
@@ -1309,7 +1367,7 @@ function showAppList() {
 }
 
 function closeAppModal() {
-    getEl("app-modal").style.display = "none";
+    closeModal("app-modal");
     if (appListObserver) { appListObserver.disconnect(); appListObserver = null; }
 }
 
@@ -1363,8 +1421,7 @@ function renderAppList() {
     appListRenderIndex = 0;
 
     if (appListFiltered.length === 0) {
-        list.innerHTML = '<div class="empty">' +
-            (appsLoading ? "Loading…" : "No apps found") + "</div>";
+        list.innerHTML = appsLoading ? skelHtml(6) : '<div class="empty">No apps found</div>';
         updateAppHint();
         return;
     }
@@ -1374,6 +1431,7 @@ function renderAppList() {
     }, { root: list, rootMargin: "300px" });
 
     renderAppBatch();
+    list.classList.add("settled");
     updateAppHint();
 }
 
@@ -1416,6 +1474,10 @@ window.onload = function () {
     getEl("btn-download-gadget").onclick = downloadGadgetUpdate;
     getEl("btn-refresh-gadget").onclick = refreshGadget;
     getEl("btn-close-modal").onclick = closeAppModal;
+    getEl("app-modal").onclick = function (e) {
+        var el = e.target as HTMLElement | null;
+        if (el && el.id === "app-modal") closeAppModal();
+    };
     getEl("btn-close-detail").onclick = closeDetail;
     getEl("btn-remove-detail").onclick = function () {
         if (detailIndex !== null) removeTarget(detailIndex);
@@ -2086,4 +2148,3 @@ async function checkGadgetUpdate() {
         setBusy("btn-check-gadget", false);
     }
 }
-

@@ -21,11 +21,18 @@
         :root {
             --font-sans: "Roboto Flex", "Roboto", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
             --font-mono: "Roboto Mono", ui-monospace, "Droid Sans Mono", SFMono-Regular, Menlo, Consolas, monospace;
-            --primary: #e2604f;
             --accent: #e2604f;
+            --accent-pressed: #c9503f;
+            --accent-focus: rgba(226,96,79,.55);
             --accent-ink: #2b100c;
             --danger: #cd6f5e;
+            --danger-ink: #e09583;
+            --danger-container: rgba(205,111,94,.13);
+            --danger-border: rgba(205,111,94,.45);
             --success: #549b7a;
+            --success-ink: #82c79e;
+            --success-container: rgba(84,155,122,.15);
+            --success-border: rgba(84,155,122,.5);
             --warn: #c79a48;
             --bg: #141013;
             --surface: #1c181d;
@@ -36,13 +43,14 @@
             --faint: #6f6367;
             --border: rgba(241,236,236,.09);
             --border-strong: rgba(241,236,236,.20);
-            /* M3 Expressive motion (web fallback curves). Spatial moves/
-               resizes (bounces, y1>1); effects carries color/opacity
-               (damping 1.0, never overshoots). Fast = small parts,
-               default = most, slow = full-screen. */
-            --ease-spatial-fast: cubic-bezier(0.42, 1.67, 0.21, 0.90);
-            --ease-spatial-default: cubic-bezier(0.38, 1.21, 0.22, 1.00);
-            --ease-spatial-slow: cubic-bezier(0.39, 1.29, 0.35, 0.98);
+            --scrim: rgba(0,0,0,.7);
+            --shadow-strong: 0 8px 28px rgba(0,0,0,.6);
+            /* M3 Standard motion (web fallback curves). Spatial carries
+               moves/resizes (damping 0.9, barely overshoots); effects
+               carries color/opacity (damping 1.0, never overshoots).
+               Fast = small parts, default = most. */
+            --ease-spatial-fast: cubic-bezier(0.27, 1.06, 0.18, 1.00);
+            --ease-spatial-default: cubic-bezier(0.27, 1.06, 0.18, 1.00);
             --ease-effects-fast: cubic-bezier(0.31, 0.94, 0.34, 1.00);
             --ease-effects-default: cubic-bezier(0.34, 0.80, 0.34, 1.00);
             --ease-effects-slow: cubic-bezier(0.34, 0.88, 0.34, 1.00);
@@ -53,6 +61,7 @@
             --dur-effects-default: 200ms;
             --dur-effects-slow: 300ms;
             --stagger-step: 35ms;
+            color-scheme: dark;
         }
 
         * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -80,7 +89,7 @@
             user-select: text;
         }
 
-        .container { width: 100%; max-width: 600px; }
+        .container { width: 100%; max-width: 600px; padding-bottom: 80px; /* clears the fixed save pill */ }
 
         .header { margin: 2px 2px 12px; border-bottom: 1px solid var(--border); padding-bottom: 12px; }
         .header h1 { font-size: 17px; letter-spacing: .18em; font-weight: 700; line-height: 1.3; }
@@ -174,12 +183,12 @@
             min-height: 58px;
             cursor: pointer;
             transition: border-color var(--dur-effects-default) var(--ease-effects-default),
-                background-color var(--dur-effects-default) var(--ease-effects-default),
-                transform var(--dur-spatial-fast) var(--ease-spatial-fast);
+                background-color var(--dur-effects-default) var(--ease-effects-default);
             animation: row-in var(--dur-spatial-fast) var(--ease-spatial-fast) backwards;
         }
 
-        /* Stagger caps at 8 so long lists settle under ~600ms. */
+        /* Stagger caps at 8 so long lists settle under ~600ms.
+           JS marks rows from later renders .settled to skip animation. */
         #targets .target-row:nth-child(2) { animation-delay: calc(var(--stagger-step) * 1); }
         #targets .target-row:nth-child(3) { animation-delay: calc(var(--stagger-step) * 2); }
         #targets .target-row:nth-child(4) { animation-delay: calc(var(--stagger-step) * 3); }
@@ -188,11 +197,13 @@
         #targets .target-row:nth-child(7) { animation-delay: calc(var(--stagger-step) * 6); }
         #targets .target-row:nth-child(8) { animation-delay: calc(var(--stagger-step) * 7); }
 
+        #targets .target-row.settled { animation: none; }
+
         @keyframes row-in {
             from { opacity: 0; transform: translateY(8px) scale(.985); }
         }
 
-        .target-row:active { border-color: var(--border-strong); transform: scale(.98); }
+        .target-row:active { border-color: var(--border-strong); background: var(--surface); }
 
         .target-row:last-child { margin-bottom: 0; }
 
@@ -228,7 +239,7 @@
             color: var(--text2);
             font-size: 13px;
             font-weight: 600;
-            padding: 7px 0;
+            padding: 10px 0;
             cursor: pointer;
             white-space: nowrap;
             transition: background-color var(--dur-effects-default) var(--ease-effects-default),
@@ -236,7 +247,7 @@
                 transform var(--dur-spatial-fast) var(--ease-spatial-fast);
         }
 
-        .seg-btn:focus-visible { outline: 2px solid rgba(226,96,79,.55); outline-offset: -2px; }
+        .seg-btn:focus-visible { outline: 2px solid var(--accent-focus); outline-offset: -2px; }
 
         .seg-on { background: var(--accent); color: var(--accent-ink); }
 
@@ -254,10 +265,12 @@
             padding: 6px 6px 6px 12px;
             transition: opacity var(--dur-effects-fast) var(--ease-effects-fast),
                 transform var(--dur-effects-default) var(--ease-exit);
-            animation: row-in var(--dur-spatial-fast) var(--ease-spatial-fast) backwards;
+            animation: lib-row-in var(--dur-spatial-fast) var(--ease-spatial-fast) backwards;
         }
 
         .lib-row.leaving { opacity: 0; transform: translateX(16px); }
+
+        @keyframes lib-row-in { from { opacity: 0; } }
 
         .lib-path {
             flex: 1;
@@ -308,6 +321,7 @@
             border: 1px solid var(--border-strong);
             border-radius: 8px;
             padding: 8px 16px;
+            min-height: 40px;
             font-size: 13px;
             font-weight: 600;
             cursor: pointer;
@@ -324,38 +338,49 @@
         }
 
         .btn:active { background: rgba(241,236,236,.06); transform: scale(.96); }
-        .btn:focus-visible { outline: 2px solid rgba(226,96,79,.55); outline-offset: 1px; }
+        .btn:focus-visible { outline: 2px solid var(--accent-focus); outline-offset: 1px; }
 
-        .btn-sm { padding: 4px 12px; font-size: 12px; }
+        .btn-sm { padding: 4px 12px; font-size: 12px; min-height: 32px; }
         .btn-primary { background: var(--accent); border-color: transparent; color: var(--accent-ink); }
-        .btn-primary:active { background: #c9503f; }
-        .btn-danger { background: rgba(207,111,94,.13); border-color: rgba(207,111,94,.45); color: #e09583; }
-        .btn-success { background: rgba(78,164,124,.15); border-color: rgba(78,164,124,.5); color: #82c79e; }
+        .btn-primary:active { background: var(--accent-pressed); }
+        .btn-danger { background: var(--danger-container); border-color: var(--danger-border); color: var(--danger-ink); }
+        .btn-success { background: var(--success-container); border-color: var(--success-border); color: var(--success-ink); }
         .btn:disabled { opacity: .55; cursor: wait; }
 
-        @keyframes slideup {
-            from { opacity: 0; transform: translate(-50%, 12px) scale(.96); }
-        }
-
+        /* Visibility (not display) keeps dismiss animatable. */
         .savepill {
             position: fixed;
             left: 50%;
             bottom: calc(16px + env(safe-area-inset-bottom, 0px));
-            transform: translateX(-50%);
-            display: none;
+            transform: translate(-50%, 8px) scale(.96);
+            display: flex;
+            opacity: 0;
+            visibility: hidden;
+            pointer-events: none;
             gap: 12px;
             align-items: center;
-            background: #20252d;
+            background: var(--surface2);
             border: 1px solid var(--border-strong);
             border-radius: 999px;
             padding: 8px 8px 8px 16px;
             z-index: 1500;
             max-width: 92vw;
             white-space: nowrap;
-            box-shadow: 0 8px 28px rgba(0,0,0,.6);
+            box-shadow: var(--shadow-strong);
+            transition: opacity var(--dur-effects-fast) var(--ease-effects-fast),
+                transform var(--dur-spatial-fast) var(--ease-spatial-fast),
+                visibility 0s var(--dur-spatial-fast);
         }
 
-        .savepill.show { display: flex; animation: slideup var(--dur-spatial-fast) var(--ease-spatial-fast); }
+        .savepill.show {
+            opacity: 1;
+            visibility: visible;
+            pointer-events: auto;
+            transform: translate(-50%, 0);
+            transition: opacity var(--dur-effects-fast) var(--ease-effects-fast),
+                transform var(--dur-spatial-fast) var(--ease-spatial-fast),
+                visibility 0s 0s;
+        }
 
         @keyframes spin { to { transform: rotate(360deg); } }
 
@@ -371,13 +396,13 @@
             margin: -7px 0 0 -7px;
             border-radius: 50%;
             border: 2px solid rgba(241,236,236,.35);
-            border-top-color: #f1ecec;
+            border-top-color: var(--text);
             animation: spin .7s linear infinite;
         }
 
         .btn-primary.busy::before {
             border-color: rgba(43,16,12,.28);
-            border-top-color: #2b100c;
+            border-top-color: var(--accent-ink);
         }
 
         .spinner {
@@ -403,14 +428,22 @@
             from { opacity: 0; transform: translateY(12px) scale(.96); }
         }
 
-        /* Dialog container rides spatial, scrim rides effects. */
+        /* Dialog container rides spatial, scrim rides effects.
+           .closing (set by JS before hiding) plays the exit. */
         .modal { animation: rise var(--dur-spatial-default) var(--ease-spatial-default); }
 
         .modal-overlay { animation: fade var(--dur-effects-default) var(--ease-effects-default); }
 
+        @keyframes fade-out { to { opacity: 0; } }
+
+        @keyframes sink { to { opacity: 0; transform: translateY(8px) scale(.98); } }
+
+        .modal-overlay.closing { animation: fade-out var(--dur-effects-fast) var(--ease-exit); }
+
+        .modal-overlay.closing .modal { animation: sink var(--dur-effects-default) var(--ease-exit); }
+
         @keyframes pill-pop {
-            0% { transform: scale(.92); }
-            60% { transform: scale(1.06); }
+            from { opacity: .4; transform: scale(.94); }
         }
 
         @keyframes pulse-soft {
@@ -434,6 +467,7 @@
             color: var(--text);
             font-size: 13px;
             font-family: inherit;
+            transition: border-color var(--dur-effects-default) var(--ease-effects-default);
         }
 
         input:focus, select:focus, textarea:focus {
@@ -459,7 +493,7 @@
             position: absolute;
             cursor: pointer;
             inset: 0;
-            background: #3a3f47;
+            background: #484047;
             border-radius: 20px;
             transition: background-color var(--dur-effects-default) var(--ease-effects-default);
         }
@@ -484,7 +518,7 @@
             display: none;
             position: fixed;
             inset: 0;
-            background: rgba(0,0,0,0.7);
+            background: var(--scrim);
             justify-content: center;
             align-items: center;
             z-index: 1000;
@@ -496,15 +530,47 @@
             width: 90%;
             max-width: 480px;
             max-height: 75vh;
+            max-height: 75dvh;
             border-radius: 12px;
             padding: 16px;
             display: flex;
             flex-direction: column;
         }
 
+        /* Compact phones: dialogs dock to a bottom sheet (M3: modal
+           sheets are mobile-only, 28dp top radius, scrim dismisses). */
+        @keyframes sheet-in {
+            from { opacity: 0; transform: translateY(48px); }
+        }
+
+        @keyframes sheet-out {
+            to { opacity: 0; transform: translateY(48px); }
+        }
+
+        @media (max-width: 520px) {
+            .modal-overlay {
+                align-items: flex-end;
+                justify-content: center;
+            }
+            .modal-overlay .modal {
+                width: 100%;
+                max-width: 640px;
+                max-height: 85vh;
+                max-height: 85dvh;
+                border-radius: 28px 28px 0 0;
+                border-left: none;
+                border-right: none;
+                border-bottom: none;
+                padding-bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+                animation: sheet-in var(--dur-spatial-fast) var(--ease-spatial-fast);
+            }
+            .modal-overlay.closing .modal { animation: sheet-out var(--dur-effects-default) var(--ease-exit); }
+        }
+
         .modal-body {
             overflow-y: auto;
             overscroll-behavior: contain;
+            scrollbar-width: thin;
             flex: 1;
             margin-top: 12px;
             -webkit-overflow-scrolling: touch;
@@ -512,7 +578,10 @@
 
         .modal > .row { margin-bottom: 12px; }
 
-        #detail-body { margin-top: 0; }
+        #detail-body {
+            margin-top: 0;
+            animation: fade var(--dur-effects-fast) var(--ease-effects-fast);
+        }
 
         .app-row {
             display: flex;
@@ -530,6 +599,30 @@
 
         .app-row:hover { background: var(--surface2); }
         .app-row:active { transform: scale(.98); }
+
+        /* Long package lists skip off-screen rendering; intrinsic size
+           keeps the scrollbar stable. Unsupported WebViews ignore it. */
+        #app-list .app-row {
+            content-visibility: auto;
+            contain-intrinsic-size: auto 53px;
+        }
+
+        /* Full rebuilds (search, label arrival) snap; scroll-appended
+           batches after first paint do too — entrance is open-only. */
+        #app-list.settled .app-row { animation: none; }
+
+        /* Skeleton rows hold layout while labels/packages load. */
+        @keyframes shimmer { to { background-position: -200% 0; } }
+
+        .skel {
+            height: 53px;
+            border-radius: 6px;
+            margin-bottom: 4px;
+            background: linear-gradient(90deg, var(--surface2) 25%, var(--surface) 50%, var(--surface2) 75%);
+            background-size: 200% 100%;
+            animation: shimmer 1.2s linear infinite;
+        }
+
         .app-row .app-label { font-size: 12px; color: var(--text2); word-break: break-all; }
         .app-row-text { min-width: 0; }
         .app-row-text strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -553,7 +646,13 @@
 
         #target-modal .row { gap: 12px; }
 
-        .empty { color: var(--faint); text-align: center; padding: 12px 0; font-size: 12px; }
+        .empty {
+            color: var(--faint);
+            text-align: center;
+            padding: 12px 0;
+            font-size: 12px;
+            animation: fade var(--dur-effects-default) var(--ease-effects-default);
+        }
 
         .status-ok { color: var(--success); }
         .status-err { color: var(--danger); }
@@ -584,7 +683,7 @@
             flex: 0 0 auto;
         }
 
-        .pill-on { color: var(--success); animation: pill-pop var(--dur-spatial-fast) var(--ease-spatial-fast); }
+        .pill-on { color: var(--success); animation: pill-pop var(--dur-effects-default) var(--ease-effects-default); }
         .pill-on::before { background: var(--success); box-shadow: 0 0 4px var(--success); }
 
         .pill, .pill::before {
@@ -640,7 +739,7 @@
             margin-top: 8px;
             white-space: pre;
             overflow-x: auto;
-            color: #d8d2c2;
+            color: var(--text2);
         }
 
     </style>
