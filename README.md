@@ -27,6 +27,12 @@ saving, copy the exact connect commands for the ports your gadgets picked, refre
 binary from the bundled payload, and check for gadget updates from the knox-frida-patcher
 releases (the gadget ships separately from this module).
 
+Each target can optionally have its own gadget port and Frida Gadget JSON config. Set a dedicated
+port in that target's details to give it an isolated gadget config; edit the JSON there to use a
+different script or interaction mode. Targets without a dedicated port keep using the shared
+`libsecmon.so` gadget and its default config. Dedicated ports must be unique across targets.
+Targets that inject the 32-bit gadget (`libsecmon32.so`) get a matching 32-bit pair on save.
+
 ### Option B: Manual config
 
 ```shell
@@ -42,6 +48,9 @@ The default gadget config uses **listen mode** on port 27042. After opening the 
 adb forward tcp:27042 tcp:27042
 frida -H 127.0.0.1:27042 -n Gadget -l your_script.js
 ```
+
+For a target with its own port, use the connect command shown in that target's details. Each app can
+then run at the same time and listen on its own port.
 
 ## Configuration
 

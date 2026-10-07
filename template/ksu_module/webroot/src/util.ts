@@ -17,6 +17,8 @@ export interface Target {
     scrub_elf_header?: boolean;
     injected_libraries: GatingLib[];
     child_gating?: ChildGating;
+    gadget_port?: number;
+    gadget_config?: string;
 }
 
 export interface AppConfig {
@@ -196,3 +198,120 @@ export function parsePorts(lines: string[]) {
     return ports;
 }
 
+// Per-target gadget pairs: a dedicated basename (plus sibling `.config.so`)
+// so Frida loads an isolated config per app. Names are built only with
+// `targetGadgetSo`, which keeps them inside `[A-Za-z0-9_.-]`.
+export const GADGET_PAIR_PREFIX = "libsecmon_";
+
+export function sanitizeGadgetStem(appName: unknown) {
+    return String(appName ?? "").replace(/[^A-Za-z0-9_.-]/g, "_");
+}
+
+// Full app name (including any `:process` suffix) so `com.foo` and
+// `com.foo:push` get distinct files. `arch32` mirrors the `libsecmon32.so`
+// house convention for targets that inject the 32-bit gadget.
+export function targetGadgetSo(appName: unknown, arch32?: boolean) {
+    return GADGET_PAIR_PREFIX + sanitizeGadgetStem(appName) + (arch32 ? "32" : "") + ".so";
+}
+
+export function targetGadgetCfg(soName: string) {
+    return String(soName).replace(/\.so$/, ".config.so");
+}
+
+export function parseGadgetPort(value: unknown): number | null {
+    var p = typeof value === "number" ? value : parseInt(String(value ?? ""), 10);
+    if (typeof p !== "number" || !isFinite(p) || Math.floor(p) !== p) return null;
+    if (p < 1 || p > 65535) return null;
+    return p;
+}
+
+// Null when the per-target JSON is acceptable: a JSON object whose listen
+// port matches the dedicated port. Script/connect modes carry no such
+// requirement, so only listen configs are pinned.
+export function validateTargetGadgetJson(text: string, port: number): string | null {
+    var parsed: unknown = null;
+    try { parsed = JSON.parse(text); } catch (_) { return "Invalid JSON"; }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return "Expected a JSON object";
+    var ic = (parsed as { interaction?: unknown }).interaction;
+    if (ic == null || typeof ic !== "object") return "Missing interaction: listen port must be " + port;
+    var typed = ic as { type?: unknown; port?: unknown };
+    if (typed.type == null || typed.type === "listen") {
+        if (parseGadgetPort(typed.port) !== port) return "Listen port must be " + port + " (dedicated port)";
+    }
+    return null;
+}
+
+export function findDuplicateGadgetPorts(targets: Array<{ gadget_port?: unknown }>): number[] {
+    var seen: Record<number, number> = {};
+    var dups: number[] = [];
+    (targets || []).forEach(function (t) {
+        var p = parseGadgetPort(t && t.gadget_port);
+        if (p === null) return;
+        seen[p] = (seen[p] || 0) + 1;
+        if (seen[p] === 2) dups.push(p);
+    });
+    dups.sort(function (a, b) { return a - b; });
+    return dups;
+}
+
+// Distinct app names sanitizing to one pair basename (e.g. `a:b` vs `a_b`).
+// Only port-enabled targets materialize pair files, so only they can clash.
+export function pairStemCollisions(targets: Array<{ app_name?: unknown; gadget_port?: unknown }>): string[] {
+    var bySo: Record<string, Record<string, number>> = {};
+    (targets || []).forEach(function (t) {
+        if (!t || parseGadgetPort(t.gadget_port) === null) return;
+        var app = String(t.app_name || "");
+        if (!app) return;
+        [targetGadgetSo(app), targetGadgetSo(app, true)].forEach(function (name) {
+            bySo[name] = bySo[name] || {};
+            bySo[name][app] = 1;
+        });
+    });
+    return Object.keys(bySo).filter(function (so) { return Object.keys(bySo[so]).length > 1; }).sort();
+}
+
+export interface PairEntry {
+    so: string;
+    src: string;
+    cfg: string;
+    content: string;
+}
+
+// One pair: fork the arch binary (rm-before-write defeats symlink plants),
+// then write the sibling config via tmp+rename. Callers pass names built by
+// `targetGadgetSo` and `src` of `libsecmon.so`/`libsecmon32.so` only.
+export function pairSetupCmd(dir: string, entry: PairEntry) {
+    var so = dir + "/" + entry.so;
+    var src = dir + "/" + entry.src;
+    var cfg = dir + "/" + entry.cfg;
+    var tmp = cfg + ".tmp";
+    return "{ if [ -f " + shQuote(src) + " ]; then rm -f " + shQuote(so) +
+        " && (ln " + shQuote(src) + " " + shQuote(so) + " 2>/dev/null || cp -f " + shQuote(src) + " " + shQuote(so) + ")" +
+        " && chmod 644 " + shQuote(so) + " || OK=0; fi; " +
+        "rm -f " + shQuote(tmp) + "; " +
+        "printf '%s\\n' " + shQuote(entry.content) + " > " + shQuote(tmp) +
+        " && chmod 644 " + shQuote(tmp) + " && rm -f " + shQuote(cfg) +
+        " && mv -f " + shQuote(tmp) + " " + shQuote(cfg) + " || OK=0; }";
+}
+
+// Removes pair files no longer referenced. `keepSo`/`keepCfg` must be
+// basenames from `targetGadgetSo`/`targetGadgetCfg` (charset-safe, no spaces).
+export function pairSweepCmd(dir: string, keepSo: string[], keepCfg: string[]) {
+    return "{ for f in " + shQuote(dir) + "/libsecmon_*.so; do [ -e \"$f\" ] || continue; " +
+        "case \"$f\" in " + shQuote(dir + "/libsecmon.so") + "|" + shQuote(dir + "/libsecmon32.so") + "|*.config.so) continue;; esac; " +
+        "b=${f##*/}; case \" " + keepSo.join(" ") + " \" in *\" $b \"*) ;; *) rm -f \"$f\" \"${f%.so}.config.so\";; esac; done; " +
+        "for f in " + shQuote(dir) + "/libsecmon_*.config.so; do [ -e \"$f\" ] || continue; " +
+        "b=${f##*/}; case \" " + keepCfg.join(" ") + " \" in *\" $b \"*) ;; *) rm -f \"$f\";; esac; done; } || OK=0";
+}
+
+// Boot manifest: `<so> <src>` per line so service.sh never infers the arch
+// from the name. Empty set removes the manifest.
+export function pairManifestCmd(pairsPath: string, entries: Array<{ so: string; src: string }>) {
+    if (entries.length === 0) return "rm -f " + shQuote(pairsPath) + " || OK=0";
+    var body = entries.map(function (e) { return e.so + " " + e.src; }).join("\n") + "\n";
+    return "rm -f " + shQuote(pairsPath + ".tmp") + "; " +
+        "printf '%s' " + shQuote(body) + " > " + shQuote(pairsPath + ".tmp") +
+        " && chmod 644 " + shQuote(pairsPath + ".tmp") +
+        " && rm -f " + shQuote(pairsPath) +
+        " && mv -f " + shQuote(pairsPath + ".tmp") + " " + shQuote(pairsPath) + " || OK=0";
+}

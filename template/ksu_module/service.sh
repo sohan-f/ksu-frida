@@ -41,6 +41,35 @@ refresh_gadget() {
 refresh_gadget "libsecmon.so.xz" "libsecmon.so"
 refresh_gadget "libsecmon32.so.xz" "libsecmon32.so"
 
+# Per-target gadgets use distinct basenames so Frida loads each sibling config.
+# Manifest lines are "<so> <src>"; only binaries refresh here, user configs
+# in libsec persist across boots.
+if [ -f "$SEC_DIR/gadget-pairs" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in *" "*) ;; *) continue ;; esac
+    so_name=${line%% *}
+    src_name=${line##* }
+    case "$so_name" in
+      libsecmon_*.so) ;;
+      *) continue ;;
+    esac
+    case "$src_name" in
+      libsecmon.so|libsecmon32.so) ;;
+      *) continue ;;
+    esac
+    case "$so_name" in
+      *[!A-Za-z0-9_.-]*) continue ;;
+    esac
+    [ -f "$SEC_DIR/$src_name" ] || continue
+    rm -f "$SEC_DIR/$so_name"
+    if ln "$SEC_DIR/$src_name" "$SEC_DIR/$so_name" 2>/dev/null || cp -f "$SEC_DIR/$src_name" "$SEC_DIR/$so_name"; then
+      chmod 0644 "$SEC_DIR/$so_name"
+    else
+      echo "KsuFrida: failed to refresh $so_name" >&2
+    fi
+  done < "$SEC_DIR/gadget-pairs"
+fi
+
 if [ ! -e "$SEC_DIR/config.json" ] && [ ! -L "$SEC_DIR/config.json" ] && [ -f "$MODDIR/gadget/config.json.example" ]; then
   rm -f "$SEC_DIR/config.json"
   cp "$MODDIR/gadget/config.json.example" "$SEC_DIR/config.json"

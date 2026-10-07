@@ -1,5 +1,6 @@
 const CONFIG_PATH = "/data/local/tmp/libsec/config.json";
 const GADGET_CONFIG_PATH = "/data/local/tmp/libsec/libsecmon.config.so";
+const GADGET_PAIRS_PATH = "/data/local/tmp/libsec/gadget-pairs";
 const MODULE_PROP = "/data/adb/modules/ksufrida/module.prop";
 const MODDIR = "/data/adb/modules/ksufrida";
 const GADGET_SRC = MODDIR + "/gadget/libsecmon.so.xz";
@@ -12,6 +13,8 @@ const GADGET_API_URL = "https://api.github.com/repos/sohan-f/knox-frida-patcher/
 const GADGET_DL_DIR = "/data/local/tmp/libsec/.webui-gadget-dl";
 const GADGET_DL_LOG = "/data/local/tmp/libsec/.webui-gadget-dl.tmp";
 const VERBOSE_PATH = "/data/local/tmp/libsec/verbose";
+const LIBSEC_DIR = "/data/local/tmp/libsec";
+const GADGET32_PATH = "/data/local/tmp/libsec/libsecmon32.so";
 const DEFAULT_GADGET = '{"interaction":{"type":"listen","address":"127.0.0.1","port":27042,"on_port_conflict":"pick-next"}}';
 
 // KernelSU WebUI bridge (injected by the manager app, absent in plain browsers).
@@ -26,16 +29,25 @@ import {
     blockField,
     cmpVersions,
     escHtml,
+    findDuplicateGadgetPorts,
     gadgetUrlsForAbi,
     hashCheckSnippet,
+    pairManifestCmd,
+    pairSetupCmd,
+    pairStemCollisions,
+    pairSweepCmd,
     parseGadgetMeta,
+    parseGadgetPort,
     parseJson,
     parseLabelLines,
     parsePorts,
     pairsFromPackagesInfo,
     shQuote,
     splitMarked,
+    targetGadgetCfg,
+    targetGadgetSo,
     targetStatusCmd,
+    validateTargetGadgetJson,
     validReleaseUrl,
     validSha256,
     validVersion,
@@ -1263,8 +1275,120 @@ function renderDetail() {
     delayInput.onchange = function () { updateField(i, "delay", delayInput.value); };
     body.appendChild(fieldBlock("Delay (ms)", delayInput));
 
+    var gadgetPort = document.createElement("input");
+    gadgetPort.type = "number";
+    gadgetPort.min = "1";
+    gadgetPort.max = "65535";
+    gadgetPort.placeholder = "27042 (shared default)";
+    gadgetPort.value = t.gadget_port ? String(t.gadget_port) : "";
+    gadgetPort.onchange = function () {
+        if (!gadgetPort.value.trim()) {
+            delete t.gadget_port;
+            delete t.gadget_config;
+            (t.injected_libraries || []).forEach(function (lib) {
+                if (lib.path === LIBSEC_DIR + "/" + targetGadgetSo(t.app_name)) lib.path = GADGET_PATH;
+                else if (lib.path === LIBSEC_DIR + "/" + targetGadgetSo(t.app_name, true)) lib.path = GADGET32_PATH;
+            });
+        } else {
+            var p = parseGadgetPort(gadgetPort.value);
+            if (p === null) {
+                setSlotStatus("detail-status", "Port must be between 1 and 65535", { cls: "status-err" });
+                gadgetPort.value = t.gadget_port ? String(t.gadget_port) : "";
+                return;
+            }
+            var taken = findDuplicateGadgetPorts(config.targets.filter(function (o) { return o !== t; }));
+            if (taken.indexOf(p) !== -1) {
+                setSlotStatus("detail-status", "Port " + p + " is already used by another target", { cls: "status-err" });
+                gadgetPort.value = t.gadget_port ? String(t.gadget_port) : "";
+                return;
+            }
+            t.gadget_port = p;
+            if (!t.gadget_config) t.gadget_config = defaultTargetGadget(p);
+            else {
+                try {
+                    var current = JSON.parse(t.gadget_config);
+                    if (current.interaction && current.interaction.type === "listen") current.interaction.port = p;
+                    t.gadget_config = JSON.stringify(current, null, 2);
+                } catch (_) {}
+            }
+            (t.injected_libraries || []).forEach(function (lib) {
+                if (lib.path === GADGET_PATH) lib.path = LIBSEC_DIR + "/" + targetGadgetSo(t.app_name);
+                else if (lib.path === GADGET32_PATH) lib.path = LIBSEC_DIR + "/" + targetGadgetSo(t.app_name, true);
+            });
+        }
+        markDirty("cfg");
+        renderDetail();
+    };
+    body.appendChild(fieldBlock("Dedicated gadget port (optional)", gadgetPort));
+
+    if (t.gadget_port) {
+        var myPort: number = t.gadget_port;
+        var dupNow = findDuplicateGadgetPorts(config.targets);
+        if (dupNow.indexOf(myPort) !== -1) {
+            var dupNote = document.createElement("div");
+            dupNote.className = "warn";
+            dupNote.textContent = "Port " + myPort + " is used by another target; saving is blocked until it is unique.";
+            body.appendChild(dupNote);
+        } else {
+            var clashNow = pairStemCollisions(config.targets);
+            var mine = [targetGadgetSo(t.app_name), targetGadgetSo(t.app_name, true)];
+            if (clashNow.some(function (n) { return mine.indexOf(n) !== -1; })) {
+                var clashNote = document.createElement("div");
+                clashNote.className = "warn";
+                clashNote.textContent = "This target shares its gadget file with another target; saving is blocked.";
+                body.appendChild(clashNote);
+            }
+        }
+        var interactionType = "listen";
+        try {
+            var targetCfg = JSON.parse(t.gadget_config || defaultTargetGadget(myPort));
+            interactionType = targetCfg.interaction && targetCfg.interaction.type || "listen";
+        } catch (_) {}
+        if (interactionType === "listen") {
+            var connectText = "adb forward tcp:" + myPort + " tcp:" + myPort + "\n" +
+                "frida -H 127.0.0.1:" + myPort + " -n Gadget -l your_script.js";
+            var connectBlock = document.createElement("div");
+            connectBlock.className = "connect-block";
+            var connectCmd = document.createElement("div");
+            connectCmd.className = "cmd";
+            connectCmd.textContent = connectText;
+            connectBlock.appendChild(connectCmd);
+            var copyConnect = document.createElement("button");
+            copyConnect.className = "btn btn-sm";
+            copyConnect.textContent = "Copy connect command";
+            copyConnect.onclick = function () { copyText(connectText, copyConnect); };
+            connectBlock.appendChild(copyConnect);
+            body.appendChild(fieldBlock("Connect to this target", connectBlock));
+        } else if (interactionType === "script") {
+            var scriptNote = document.createElement("div");
+            scriptNote.className = "sub";
+            scriptNote.textContent = "Script interaction runs the configured script automatically and does not open a connect port.";
+            body.appendChild(fieldBlock("Script mode", scriptNote));
+        }
+
+        var gadgetConfig = document.createElement("textarea");
+        gadgetConfig.className = "mono";
+        gadgetConfig.rows = 6;
+        gadgetConfig.value = t.gadget_config || defaultTargetGadget(myPort);
+        gadgetConfig.onchange = function () {
+            var err = validateTargetGadgetJson(gadgetConfig.value, myPort);
+            if (err) {
+                setSlotStatus("detail-status", err, { cls: "status-err" });
+                gadgetConfig.value = t.gadget_config || defaultTargetGadget(myPort);
+                return;
+            }
+            t.gadget_config = gadgetConfig.value;
+            markDirty("cfg");
+        };
+        body.appendChild(fieldBlock("Gadget config (JSON; supports listen or script mode)", gadgetConfig));
+    }
+
     body.appendChild(buildLibEditor(t, i, "libs"));
     body.scrollTop = top;
+}
+
+function defaultTargetGadget(port: number) {
+    return JSON.stringify({ interaction: { type: "listen", address: "127.0.0.1", port: port, on_port_conflict: "pick-next" } }, null, 2);
 }
 
 function settingRow(labelText: string, control: HTMLElement) {
@@ -1785,6 +1909,20 @@ function applyConfigText(text: string) {
         }
     }
     if (!config.targets || !Array.isArray(config.targets)) config.targets = [];
+    config.targets.forEach(function (t) {
+        var p = parseGadgetPort(t.gadget_port);
+        if (p === null) {
+            delete t.gadget_port;
+            delete t.gadget_config;
+            return;
+        }
+        t.gadget_port = p;
+        if (typeof t.gadget_config !== "string" || !t.gadget_config) t.gadget_config = defaultTargetGadget(p);
+        (t.injected_libraries || []).forEach(function (lib) {
+            if (lib.path === GADGET_PATH) lib.path = LIBSEC_DIR + "/" + targetGadgetSo(t.app_name);
+            else if (lib.path === GADGET32_PATH) lib.path = LIBSEC_DIR + "/" + targetGadgetSo(t.app_name, true);
+        });
+    });
     dirtyConfig = false;
     updateDirtyBadge();
     renderTargets();
@@ -1794,15 +1932,64 @@ function applyConfigText(text: string) {
 }
 
 async function saveConfig() {
+    var dupPorts = findDuplicateGadgetPorts(config.targets);
+    if (dupPorts.length > 0) {
+        setSlotStatus("targets-status", "Duplicate gadget port " + dupPorts[0] + ": give each target its own port", { cls: "status-err", tag: "save", retry: saveConfig });
+        return;
+    }
+    var collisions = pairStemCollisions(config.targets);
+    if (collisions.length > 0) {
+        setSlotStatus("targets-status", "Gadget file clash on " + collisions[0] + ": drop one dedicated port", { cls: "status-err", tag: "save", retry: saveConfig });
+        return;
+    }
+    var bad = "";
+    config.targets.forEach(function (t) {
+        if (bad) return;
+        var p = parseGadgetPort(t.gadget_port);
+        if (p === null) return;
+        var err = validateTargetGadgetJson(t.gadget_config || defaultTargetGadget(p), p);
+        if (err) bad = (t.app_name || "target") + ": " + err;
+    });
+    if (bad) {
+        setSlotStatus("targets-status", "Invalid gadget config: " + bad, { cls: "status-err", tag: "save", retry: saveConfig });
+        return;
+    }
     var json = JSON.stringify(config, null, 4);
     setBusy("btn-save", true);
     var ok = false;
     var detail = "";
     try {
         var tmp = CONFIG_PATH + ".tmp";
-        var r = await exec("{ rm -f " + tmp + "; printf '%s\\n' " + shQuote(json) + " > " + tmp +
-            " && chmod 644 " + tmp + " && mv -f " + tmp + " " + CONFIG_PATH +
-            " && echo " + SAVE_MARK + "; } 2>&1");
+        // A port always forks the 64-bit binary; the 32-bit fork follows only
+        // targets that actually inject the 32-bit gadget.
+        var entries: Array<{ so: string; src: string; cfg: string; content: string }> = [];
+        config.targets.forEach(function (t) {
+            var p = parseGadgetPort(t.gadget_port);
+            if (p === null) return;
+            var content = t.gadget_config || defaultTargetGadget(p);
+            var so64 = targetGadgetSo(t.app_name);
+            entries.push({ so: so64, src: "libsecmon.so", cfg: targetGadgetCfg(so64), content: content });
+            var uses32 = (t.injected_libraries || []).some(function (lib) {
+                var base = (lib.path || "").split("/").pop() || "";
+                return base === "libsecmon32.so" || base === targetGadgetSo(t.app_name, true);
+            });
+            if (uses32) {
+                var so32 = targetGadgetSo(t.app_name, true);
+                entries.push({ so: so32, src: "libsecmon32.so", cfg: targetGadgetCfg(so32), content: content });
+            }
+        });
+        var keepSo = entries.map(function (e) { return e.so; });
+        var keepCfg = entries.map(function (e) { return e.cfg; });
+        var setup = entries.map(function (e) { return pairSetupCmd(LIBSEC_DIR, e); }).join("; ");
+        // Pairs and manifest land before the config commit, so a committed
+        // config never references pair files that were not written.
+        var r = await exec("{ OK=1; rm -f " + tmp + "; printf '%s\\n' " + shQuote(json) + " > " + tmp +
+            " && chmod 644 " + tmp + " || OK=0; " +
+            (setup ? setup + "; " : "") +
+            pairSweepCmd(LIBSEC_DIR, keepSo, keepCfg) + "; " +
+            "if [ \"$OK\" = 1 ]; then mv -f " + tmp + " " + CONFIG_PATH + " || OK=0; fi; " +
+            "if [ \"$OK\" = 1 ]; then " + pairManifestCmd(GADGET_PAIRS_PATH, entries) + "; fi; " +
+            "if [ \"$OK\" = 1 ]; then echo " + SAVE_MARK + "; fi; } 2>&1");
         if (String(r.stdout).indexOf(SAVE_MARK) !== -1) {
             ok = true;
             dirtyConfig = false;
@@ -1911,8 +2098,9 @@ async function saveGadgetConfig() {
     var ok = false;
     var detail = "";
     try {
-        var r = await exec("{ rm -f " + GADGET_CONFIG_PATH + "; printf '%s\\n' " + shQuote(content) + " > " + GADGET_CONFIG_PATH +
-            " && chmod 644 " + GADGET_CONFIG_PATH + " && echo " + SAVE_MARK + "; } 2>&1");
+        var gadgetTmp = GADGET_CONFIG_PATH + ".tmp";
+        var r = await exec("{ rm -f " + shQuote(gadgetTmp) + "; printf '%s\\n' " + shQuote(content) + " > " + gadgetTmp +
+            " && chmod 644 " + gadgetTmp + " && rm -f " + shQuote(GADGET_CONFIG_PATH) + " && mv -f " + gadgetTmp + " " + GADGET_CONFIG_PATH + " && echo " + SAVE_MARK + "; } 2>&1");
         if (String(r.stdout).indexOf(SAVE_MARK) !== -1) {
             ok = true;
             gadgetFileOk = true;
