@@ -48,7 +48,8 @@ pub fn memfd_create(name: *const c_char, flags: c_int) -> c_int {
 pub const MFD_CLOEXEC: c_int = 0x0001;
 #[cfg(any(target_os = "android", test))]
 pub const MFD_ALLOW_SEALING: c_int = 0x0002;
-// Kernel 6.3+: explicit X so vm.memfd_noexec=1/2 cannot force NX or reject.
+// Kernel 6.3+: explicit MFD_EXEC defeats vm.memfd_noexec=1 (forced NX);
+// at =2 explicit EXEC fails with EACCES and falls safe to file staging.
 #[cfg(any(target_os = "android", test))]
 pub const MFD_EXEC: c_int = 0x0010;
 

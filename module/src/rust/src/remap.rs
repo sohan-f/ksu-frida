@@ -401,6 +401,9 @@ unsafe fn relocate_segment(
         );
         if moved == libc::MAP_FAILED {
             let err = io::Error::last_os_error();
+            if copy_prot != perms {
+                libc::mprotect(address, size, perms);
+            }
             end_rebuild();
             libc::munmap(map, size);
             return Err(RelocateError::Commit(err));

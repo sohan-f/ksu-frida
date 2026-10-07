@@ -41,6 +41,10 @@ unsafe extern "C" fn scrub_callback(
     if size < size_of::<DlPhdrInfo>() {
         return 0;
     }
+    // SAFETY: linker entry is valid for a field read; null precedes any string deref.
+    if unsafe { (*info).name.is_null() } {
+        return 0;
+    }
     // SAFETY: the linker hands the callback a valid entry; `data` is our
     // search struct, alive for the whole synchronous walk.
     let (current, search) = unsafe {
@@ -102,6 +106,10 @@ unsafe extern "C" fn verify_callback(
 ) -> c_int {
     // Only `dlpi_name` is read; it predates every later field.
     if size < std::mem::offset_of!(DlPhdrInfo, name) + size_of::<*const c_char>() {
+        return 0;
+    }
+    // SAFETY: linker entry is valid for a field read; null precedes any string deref.
+    if unsafe { (*info).name.is_null() } {
         return 0;
     }
     // SAFETY: the linker hands the callback a valid entry; `data` is our
@@ -712,6 +720,10 @@ unsafe extern "C" fn log_names_callback(
     _size: usize,
     _data: *mut c_void,
 ) -> c_int {
+    // SAFETY: linker entry is valid for a field read; null precedes any string deref.
+    if unsafe { (*info).name.is_null() } {
+        return 0;
+    }
     // SAFETY: linker-provided entry, read-only copy for logging.
     unsafe {
         let name = CStr::from_ptr((*info).name).to_string_lossy();
@@ -756,7 +768,7 @@ pub fn scrub_dlpi_name(staged_path: &str) {
     }
 }
 
-/// Scrub the memfd entry (`/memfd:jit-cache`) created by `try_memfd_inject`.
+/// Scrub the memfd entry (`/memfd:dalvik-jit-cache`) created by `try_memfd_inject`.
 /// The linker does not use the source path for fd loads, so exact matching fails.
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub fn scrub_memfd() {
@@ -930,6 +942,35 @@ mod tests {
             free_cstring(only, 43);
         }
         assert!(!search.found);
+    }
+
+    #[test]
+    fn null_dlpi_name_is_ignored() {
+        let mut null_entry = entry(std::ptr::null());
+        let mut search = ScrubSearch {
+            target: b"/a.so".to_vec(),
+            replacement: b"libnative_1.so".to_vec(),
+            found: false,
+            soname: false,
+            symbols: 0,
+            substring: false,
+        };
+        // SAFETY: null name must return before any string read.
+        unsafe {
+            assert_eq!(
+                scrub_callback(
+                    &raw mut null_entry,
+                    entry_size(),
+                    (&raw mut search).cast::<c_void>()
+                ),
+                0
+            );
+        }
+        assert!(!search.found);
+        assert!(!is_linker_visible(
+            "definitely-absent-ksufrida-xyz-null",
+            false
+        ));
     }
 
     #[test]

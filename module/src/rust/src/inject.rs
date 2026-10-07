@@ -753,7 +753,7 @@ fn write_memfd(src_lib_path: &str) -> Option<c_int> {
     use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 
     // SAFETY: static literal; the fd is checked below and owned here.
-    // MFD_EXEC first: vm.memfd_noexec=1 forces NX and =2 rejects flagless.
+    // MFD_EXEC first: vm.memfd_noexec=1 forces NX, =2 rejects explicit EXEC.
     let mut fd = crate::sys::memfd_create(
         crate::sys::MEMFD_CSTR.as_ptr(),
         crate::sys::MFD_CLOEXEC | crate::sys::MFD_ALLOW_SEALING | crate::sys::MFD_EXEC,
