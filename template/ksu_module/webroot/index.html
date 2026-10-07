@@ -36,6 +36,23 @@
             --faint: #6f6367;
             --border: rgba(241,236,236,.09);
             --border-strong: rgba(241,236,236,.20);
+            /* M3 Expressive motion (web fallback curves). Spatial moves/
+               resizes (bounces, y1>1); effects carries color/opacity
+               (damping 1.0, never overshoots). Fast = small parts,
+               default = most, slow = full-screen. */
+            --ease-spatial-fast: cubic-bezier(0.42, 1.67, 0.21, 0.90);
+            --ease-spatial-default: cubic-bezier(0.38, 1.21, 0.22, 1.00);
+            --ease-spatial-slow: cubic-bezier(0.39, 1.29, 0.35, 0.98);
+            --ease-effects-fast: cubic-bezier(0.31, 0.94, 0.34, 1.00);
+            --ease-effects-default: cubic-bezier(0.34, 0.80, 0.34, 1.00);
+            --ease-effects-slow: cubic-bezier(0.34, 0.88, 0.34, 1.00);
+            --ease-exit: cubic-bezier(0.30, 0.00, 0.80, 0.15);
+            --dur-spatial-fast: 350ms;
+            --dur-spatial-default: 500ms;
+            --dur-effects-fast: 150ms;
+            --dur-effects-default: 200ms;
+            --dur-effects-slow: 300ms;
+            --stagger-step: 35ms;
         }
 
         * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -79,14 +96,18 @@
         /* Zero footprint when empty: grid rows animate 0fr to 1fr, else snap.
            Single wrapper child required: extra grid items open implicit
            auto rows that no setting can close.
-           Visibility flips discretely so hidden controls stay unfocusable. */
+           Visibility flips discretely so hidden controls stay unfocusable.
+           Resize rides the spatial spring; opacity rides effects. */
         .collapse {
             display: grid;
             grid-template-rows: 0fr;
             opacity: 0;
             visibility: hidden;
             overflow: hidden;
-            transition: grid-template-rows .3s ease, opacity .25s ease, margin-top .3s ease, visibility 0s .3s;
+            transition: grid-template-rows var(--dur-spatial-fast) var(--ease-spatial-fast),
+                opacity var(--dur-effects-fast) var(--ease-effects-fast),
+                margin-top var(--dur-spatial-fast) var(--ease-spatial-fast),
+                visibility 0s var(--dur-spatial-fast);
         }
 
         .collapse.show {
@@ -94,7 +115,10 @@
             opacity: 1;
             visibility: visible;
             margin-top: 8px;
-            transition: grid-template-rows .3s ease, opacity .25s ease, margin-top .3s ease, visibility 0s 0s;
+            transition: grid-template-rows var(--dur-spatial-fast) var(--ease-spatial-fast),
+                opacity var(--dur-effects-fast) var(--ease-effects-fast),
+                margin-top var(--dur-spatial-fast) var(--ease-spatial-fast),
+                visibility 0s 0s;
         }
 
         .collapse > * { overflow: hidden; min-height: 0; }
@@ -108,7 +132,18 @@
             padding: 16px;
             margin-bottom: 16px;
             box-shadow: 0 1px 0 rgba(0,0,0,.45);
+            animation: card-in var(--dur-spatial-default) var(--ease-spatial-default) backwards;
         }
+
+        /* One hero entrance per load: cards cascade, rows follow inside. */
+        @keyframes card-in {
+            from { opacity: 0; transform: translateY(12px) scale(.985); }
+        }
+
+        .container > .card:nth-child(2) { animation-delay: 0ms; }
+        .container > .card:nth-child(3) { animation-delay: 60ms; }
+        .container > .card:nth-child(4) { animation-delay: 120ms; }
+        .container > .card:nth-child(5) { animation-delay: 180ms; }
 
         /* Status only reads out, so it stays chromeless; workflows keep cards. */
         .card.quiet {
@@ -138,10 +173,26 @@
             margin-bottom: 8px;
             min-height: 58px;
             cursor: pointer;
-            transition: border-color .15s ease, background-color .15s ease;
+            transition: border-color var(--dur-effects-default) var(--ease-effects-default),
+                background-color var(--dur-effects-default) var(--ease-effects-default),
+                transform var(--dur-spatial-fast) var(--ease-spatial-fast);
+            animation: row-in var(--dur-spatial-fast) var(--ease-spatial-fast) backwards;
         }
 
-        .target-row:active { border-color: var(--border-strong); }
+        /* Stagger caps at 8 so long lists settle under ~600ms. */
+        #targets .target-row:nth-child(2) { animation-delay: calc(var(--stagger-step) * 1); }
+        #targets .target-row:nth-child(3) { animation-delay: calc(var(--stagger-step) * 2); }
+        #targets .target-row:nth-child(4) { animation-delay: calc(var(--stagger-step) * 3); }
+        #targets .target-row:nth-child(5) { animation-delay: calc(var(--stagger-step) * 4); }
+        #targets .target-row:nth-child(6) { animation-delay: calc(var(--stagger-step) * 5); }
+        #targets .target-row:nth-child(7) { animation-delay: calc(var(--stagger-step) * 6); }
+        #targets .target-row:nth-child(8) { animation-delay: calc(var(--stagger-step) * 7); }
+
+        @keyframes row-in {
+            from { opacity: 0; transform: translateY(8px) scale(.985); }
+        }
+
+        .target-row:active { border-color: var(--border-strong); transform: scale(.98); }
 
         .target-row:last-child { margin-bottom: 0; }
 
@@ -180,14 +231,16 @@
             padding: 7px 0;
             cursor: pointer;
             white-space: nowrap;
-            transition: background-color .15s ease, color .15s ease;
+            transition: background-color var(--dur-effects-default) var(--ease-effects-default),
+                color var(--dur-effects-default) var(--ease-effects-default),
+                transform var(--dur-spatial-fast) var(--ease-spatial-fast);
         }
 
         .seg-btn:focus-visible { outline: 2px solid rgba(226,96,79,.55); outline-offset: -2px; }
 
         .seg-on { background: var(--accent); color: var(--accent-ink); }
 
-        .seg-btn:not(.seg-on):active { background: rgba(241,236,236,.07); }
+        .seg-btn:not(.seg-on):active { background: rgba(241,236,236,.07); transform: scale(.96); }
 
         .lib-list { display: flex; flex-direction: column; gap: 8px; }
 
@@ -199,7 +252,9 @@
             border: 1px solid var(--border);
             border-radius: 8px;
             padding: 6px 6px 6px 12px;
-            transition: opacity .18s ease, transform .18s ease;
+            transition: opacity var(--dur-effects-fast) var(--ease-effects-fast),
+                transform var(--dur-effects-default) var(--ease-exit);
+            animation: row-in var(--dur-spatial-fast) var(--ease-spatial-fast) backwards;
         }
 
         .lib-row.leaving { opacity: 0; transform: translateX(16px); }
@@ -262,10 +317,13 @@
             overflow: hidden;
             text-overflow: ellipsis;
             position: relative;
-            transition: background-color .15s ease, opacity .15s ease, border-color .15s ease;
+            transition: background-color var(--dur-effects-default) var(--ease-effects-default),
+                opacity var(--dur-effects-default) var(--ease-effects-default),
+                border-color var(--dur-effects-default) var(--ease-effects-default),
+                transform var(--dur-spatial-fast) var(--ease-spatial-fast);
         }
 
-        .btn:active { background: rgba(241,236,236,.06); }
+        .btn:active { background: rgba(241,236,236,.06); transform: scale(.96); }
         .btn:focus-visible { outline: 2px solid rgba(226,96,79,.55); outline-offset: 1px; }
 
         .btn-sm { padding: 4px 12px; font-size: 12px; }
@@ -276,8 +334,7 @@
         .btn:disabled { opacity: .55; cursor: wait; }
 
         @keyframes slideup {
-            from { opacity: 0; transform: translate(-50%, 8px); }
-            to { opacity: 1; transform: translate(-50%, 0); }
+            from { opacity: 0; transform: translate(-50%, 12px) scale(.96); }
         }
 
         .savepill {
@@ -298,7 +355,7 @@
             box-shadow: 0 8px 28px rgba(0,0,0,.6);
         }
 
-        .savepill.show { display: flex; animation: slideup .22s ease-out; }
+        .savepill.show { display: flex; animation: slideup var(--dur-spatial-fast) var(--ease-spatial-fast); }
 
         @keyframes spin { to { transform: rotate(360deg); } }
 
@@ -343,13 +400,26 @@
         @keyframes fade { from { opacity: 0; } }
 
         @keyframes rise {
-            from { opacity: 0; transform: translateY(10px) scale(.985); }
-            to { opacity: 1; transform: none; }
+            from { opacity: 0; transform: translateY(12px) scale(.96); }
         }
 
-        .modal { animation: rise .22s ease-out; }
+        /* Dialog container rides spatial, scrim rides effects. */
+        .modal { animation: rise var(--dur-spatial-default) var(--ease-spatial-default); }
 
-        .modal-overlay { animation: fade .18s ease-out; }
+        .modal-overlay { animation: fade var(--dur-effects-default) var(--ease-effects-default); }
+
+        @keyframes pill-pop {
+            0% { transform: scale(.92); }
+            60% { transform: scale(1.06); }
+        }
+
+        @keyframes pulse-soft {
+            0%, 100% { opacity: 1; }
+            50% { opacity: .55; }
+        }
+
+        /* Loading placeholders breathe; spinners keep linear rotation. */
+        .empty:has(.spinner) { animation: pulse-soft var(--dur-effects-slow) var(--ease-effects-slow) infinite; }
 
         @media (prefers-reduced-motion: reduce) {
             *, *::before, *::after { transition: none !important; animation: none !important; }
@@ -391,7 +461,7 @@
             inset: 0;
             background: #3a3f47;
             border-radius: 20px;
-            transition: .2s;
+            transition: background-color var(--dur-effects-default) var(--ease-effects-default);
         }
 
         .slider:before {
@@ -403,7 +473,8 @@
             bottom: 3px;
             background: #c9c4b8;
             border-radius: 50%;
-            transition: .2s;
+            transition: transform var(--dur-spatial-fast) var(--ease-spatial-fast),
+                background-color var(--dur-effects-default) var(--ease-effects-default);
         }
 
         input:checked + .slider { background: var(--accent); }
@@ -452,10 +523,13 @@
             cursor: pointer;
             font-size: 13px;
             border-radius: 6px;
-            transition: background-color .15s ease;
+            transition: background-color var(--dur-effects-default) var(--ease-effects-default),
+                transform var(--dur-spatial-fast) var(--ease-spatial-fast);
+            animation: row-in var(--dur-spatial-fast) var(--ease-spatial-fast) backwards;
         }
 
         .app-row:hover { background: var(--surface2); }
+        .app-row:active { transform: scale(.98); }
         .app-row .app-label { font-size: 12px; color: var(--text2); word-break: break-all; }
         .app-row-text { min-width: 0; }
         .app-row-text strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -510,10 +584,15 @@
             flex: 0 0 auto;
         }
 
-        .pill-on { color: var(--success); }
+        .pill-on { color: var(--success); animation: pill-pop var(--dur-spatial-fast) var(--ease-spatial-fast); }
         .pill-on::before { background: var(--success); box-shadow: 0 0 4px var(--success); }
 
-        .pill, .pill::before { transition: color .2s ease, background-color .2s ease, border-color .2s ease, box-shadow .2s ease; }
+        .pill, .pill::before {
+            transition: color var(--dur-effects-default) var(--ease-effects-default),
+                background-color var(--dur-effects-default) var(--ease-effects-default),
+                border-color var(--dur-effects-default) var(--ease-effects-default),
+                box-shadow var(--dur-effects-default) var(--ease-effects-default);
+        }
 
         .btnbar { display: flex; gap: 8px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
 
