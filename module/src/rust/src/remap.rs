@@ -139,6 +139,14 @@ fn get_modules_by_name(m_name: &str) -> Vec<ProcMapsInfo> {
     maps
 }
 
+/// Kernel predicate from `asm-generic/siginfo.h` (`SI_FROMKERNEL`):
+/// codes <= 0 (`SI_TKILL`, `SI_USER`, ...) are kill-delivered with garbage
+/// in the `si_addr` slot; only positive codes name a real fault address.
+#[inline]
+fn is_synchronous_fault(code: c_int) -> bool {
+    code > 0
+}
+
 /// # Safety
 /// Installed only by [`install_fault_retry`]; `info` comes from the kernel.
 unsafe extern "C" fn park_or_forward(sig: c_int, info: *mut libc::siginfo_t, context: *mut c_void) {
@@ -146,15 +154,19 @@ unsafe extern "C" fn park_or_forward(sig: c_int, info: *mut libc::siginfo_t, con
     // SAFETY: `gettid(2)` takes no arguments, cannot fail and allocates nothing — safe inside a signal handler.
     let tid = unsafe { libc::gettid() };
     if start != 0 && tid != REBUILDER_TID.load(Ordering::Relaxed) as c_int {
-        let end = IN_FLIGHT_END.load(Ordering::Relaxed);
-        // SAFETY: the kernel hands SA_SIGINFO handlers a non-null `siginfo_t`; `si_addr` is defined for SIGSEGV/SIGBUS.
-        let fault = unsafe { (*info).si_addr() } as usize;
-        if (start..end).contains(&fault) {
-            for _ in 0..PARK_SPIN_LIMIT {
-                if IN_FLIGHT_START.load(Ordering::Acquire) == 0 {
-                    return;
+        // SAFETY: plain `c_int` field read of the kernel-provided `siginfo_t`.
+        let code = unsafe { (*info).si_code };
+        if is_synchronous_fault(code) {
+            let end = IN_FLIGHT_END.load(Ordering::Relaxed);
+            // SAFETY: the kernel hands SA_SIGINFO handlers a non-null `siginfo_t`; `si_addr` is defined for SIGSEGV/SIGBUS.
+            let fault = unsafe { (*info).si_addr() } as usize;
+            if (start..end).contains(&fault) {
+                for _ in 0..PARK_SPIN_LIMIT {
+                    if IN_FLIGHT_START.load(Ordering::Acquire) == 0 {
+                        return;
+                    }
+                    std::hint::spin_loop();
                 }
-                std::hint::spin_loop();
             }
         }
     }
@@ -680,6 +692,14 @@ mod tests {
             "/memfd:dalvik-jit-cache (deleted)",
             "dalvik-jit-cache"
         ));
+    }
+
+    #[test]
+    fn only_kernel_faults_park() {
+        assert!(is_synchronous_fault(1)); // SEGV_MAPERR / BUS_ADRALN
+        assert!(is_synchronous_fault(2)); // SEGV_ACCERR / BUS_ADRERR
+        assert!(!is_synchronous_fault(0)); // SI_USER
+        assert!(!is_synchronous_fault(-6)); // SI_TKILL
     }
 
     #[test]
