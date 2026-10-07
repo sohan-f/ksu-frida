@@ -392,6 +392,8 @@ unsafe fn relocate_segment(
         // SAFETY: `address`/`size` describe a live mapping from `/proc/self/maps`; the result is checked immediately.
         if unsafe { libc::mprotect(address, size, copy_prot) } != 0 {
             let err = io::Error::last_os_error();
+            // SAFETY: same range frozen above; best-effort repair of a partial apply.
+            unsafe { libc::mprotect(address, size, perms) };
             end_rebuild();
             // SAFETY: `map`/`size` are ours from the `mmap` above; best-effort cleanup, result deliberately ignored.
             unsafe { libc::munmap(map, size) };
