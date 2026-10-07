@@ -27,6 +27,9 @@ class MyModule : public zygisk::ModuleBase {
 
     void postServerSpecialize(const ServerSpecializeArgs *args) override {
         (void)args;
+        if (this->api == nullptr) {
+            return;
+        }
         this->api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
     }
 
