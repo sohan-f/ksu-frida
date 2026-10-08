@@ -10,6 +10,7 @@ struct ScrubSearch {
     soname: bool,
     symbols: usize,
     substring: bool,
+    memfd: bool,
 }
 
 /// # Safety
@@ -51,7 +52,11 @@ unsafe extern "C" fn scrub_callback(
         let name = CStr::from_ptr((*info).name);
         (name.to_bytes(), &mut *(data.cast::<ScrubSearch>()))
     };
-    let matched = entry_matches(current, &search.target, search.substring);
+    let matched = if search.memfd {
+        entry_matches_memfd(current, &search.target)
+    } else {
+        entry_matches(current, &search.target, search.substring)
+    };
     if !matched {
         return 0;
     }
@@ -91,9 +96,24 @@ fn entry_matches(current: &[u8], target: &[u8], substring: bool) -> bool {
     }
 }
 
+// Memfd linker names take exactly one form (`/memfd:<name>`, plus an
+// optional ` (deleted)` suffix); a plain substring also hits file
+// libraries that merely contain the name.
+#[inline(always)]
+fn entry_matches_memfd(current: &[u8], name: &[u8]) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let Some(rest) = current.strip_prefix(b"/memfd:") else {
+        return false;
+    };
+    rest.strip_suffix(b" (deleted)").unwrap_or(rest) == name
+}
+
 struct VisibleSearch {
     target: Vec<u8>,
     substring: bool,
+    memfd: bool,
     leaked: bool,
 }
 
@@ -118,7 +138,12 @@ unsafe extern "C" fn verify_callback(
         let name = CStr::from_ptr((*info).name);
         (name.to_bytes(), &mut *(data.cast::<VisibleSearch>()))
     };
-    if entry_matches(current, &search.target, search.substring) {
+    let matched = if search.memfd {
+        entry_matches_memfd(current, &search.target)
+    } else {
+        entry_matches(current, &search.target, search.substring)
+    };
+    if matched {
         search.leaked = true;
     }
     0
@@ -129,10 +154,30 @@ pub fn is_linker_visible(target: &str, substring: bool) -> bool {
     let mut search = VisibleSearch {
         target: target.as_bytes().to_vec(),
         substring,
+        memfd: false,
         leaked: false,
     };
     // SAFETY: `verify_callback` matches the `DlIterateCb` signature; `search`
     // outlives the synchronous walk.
+    unsafe {
+        dl_iterate_phdr(
+            verify_callback as DlIterateCb,
+            std::ptr::from_mut(&mut search).cast::<c_void>(),
+        );
+    }
+    search.leaked
+}
+
+/// Reports whether our memfd entry is still visible under its exact name form.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn is_memfd_linker_visible() -> bool {
+    let mut search = VisibleSearch {
+        target: crate::sys::MEMFD_NAME.as_bytes().to_vec(),
+        substring: false,
+        memfd: true,
+        leaked: false,
+    };
+    // SAFETY: as above.
     unsafe {
         dl_iterate_phdr(
             verify_callback as DlIterateCb,
@@ -771,6 +816,7 @@ pub fn scrub_dlpi_name(staged_path: &str) {
         soname: false,
         symbols: 0,
         substring: false,
+        memfd: false,
     };
 
     run_scrub(&mut search);
@@ -803,7 +849,8 @@ pub fn scrub_memfd() {
         found: false,
         soname: false,
         symbols: 0,
-        substring: true,
+        substring: false,
+        memfd: true,
     };
 
     run_scrub(&mut search);
@@ -871,6 +918,7 @@ mod tests {
             soname: false,
             symbols: 0,
             substring: false,
+            memfd: false,
         };
         let data = (&raw mut search).cast::<c_void>();
 
@@ -904,6 +952,7 @@ mod tests {
             soname: false,
             symbols: 0,
             substring: false,
+            memfd: false,
         };
         let data = (&raw mut search).cast::<c_void>();
         // SAFETY: both entries are live owned strings; `search` outlives them.
@@ -947,6 +996,7 @@ mod tests {
             soname: false,
             symbols: 0,
             substring: false,
+            memfd: false,
         };
         // SAFETY: as above.
         unsafe {
@@ -977,6 +1027,7 @@ mod tests {
             soname: false,
             symbols: 0,
             substring: false,
+            memfd: false,
         };
         // SAFETY: live owned string; undersized `size` must stop before touching it.
         unsafe {
@@ -1008,6 +1059,7 @@ mod tests {
             soname: false,
             symbols: 0,
             substring: false,
+            memfd: false,
         };
         // SAFETY: null name must return before any string read.
         unsafe {
@@ -1025,6 +1077,30 @@ mod tests {
             "definitely-absent-ksufrida-xyz-null",
             false
         ));
+    }
+
+    #[test]
+    fn memfd_match_is_exact_name_form() {
+        assert!(entry_matches_memfd(
+            b"/memfd:dalvik-jit-cache",
+            b"dalvik-jit-cache"
+        ));
+        assert!(entry_matches_memfd(
+            b"/memfd:dalvik-jit-cache (deleted)",
+            b"dalvik-jit-cache"
+        ));
+        // File libraries merely containing the name must never match.
+        assert!(!entry_matches_memfd(
+            b"/data/app/libdalvik-jit-cache-helper.so",
+            b"dalvik-jit-cache"
+        ));
+        // The real ART neighbor is a different name, not a suffix variant.
+        assert!(!entry_matches_memfd(
+            b"/memfd:dalvik-jit-code-cache",
+            b"dalvik-jit-cache"
+        ));
+        assert!(!entry_matches_memfd(b"/memfd:dalvik-jit-cache", b""));
+        assert!(!entry_matches_memfd(b"", b"dalvik-jit-cache"));
     }
 
     #[test]
@@ -1140,7 +1216,8 @@ mod tests {
             found: false,
             soname: false,
             symbols: 0,
-            substring: true,
+            substring: false,
+            memfd: true,
         };
         // SAFETY: entry is a live owned string; `search` outlives the call.
         unsafe {

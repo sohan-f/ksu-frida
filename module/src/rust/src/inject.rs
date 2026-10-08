@@ -858,7 +858,7 @@ fn verify_hiding_memfd(log_context: &str, hide_maps: bool) {
     if !hide_maps || !crate::log::verbose() {
         return;
     }
-    if crate::linkmap::is_linker_visible(crate::sys::MEMFD_NAME, true) {
+    if crate::linkmap::is_memfd_linker_visible() {
         loge_fmt(format_args!(
             "{log_context}Hide verify LEAK (linker) for memfd"
         ));
