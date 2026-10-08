@@ -15,6 +15,11 @@ fn log_enabled_for(path: &std::path::Path) -> bool {
 
 #[cfg(target_os = "android")]
 pub(crate) fn verbose() -> bool {
+    // Fork children stay silent: every log line would malloc and take
+    // liblog locks inherited from dead threads (POSIX fork constraints).
+    if FORK_CHILD_QUIET.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
     // First-log wins: caching avoids a filesystem probe on every log line.
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| log_enabled_for(std::path::Path::new(VERBOSE_PATH)))
@@ -22,8 +27,15 @@ pub(crate) fn verbose() -> bool {
 
 #[cfg(not(target_os = "android"))]
 pub(crate) fn verbose() -> bool {
-    true
+    !FORK_CHILD_QUIET.load(std::sync::atomic::Ordering::Relaxed)
 }
+
+// Set once in the fork-child branch; the child stays silent for life.
+pub(crate) fn set_fork_child_quiet(quiet: bool) {
+    FORK_CHILD_QUIET.store(quiet, std::sync::atomic::Ordering::Relaxed);
+}
+
+static FORK_CHILD_QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn logi(msg: impl AsRef<str>) {
     if verbose() {
@@ -79,6 +91,15 @@ mod tests {
         assert!(!log_enabled_for(&flag));
         std::fs::write(&flag, b"").unwrap();
         assert!(log_enabled_for(&flag));
+    }
+
+    #[test]
+    fn fork_child_quiet_suppresses_verbose() {
+        let before = verbose();
+        set_fork_child_quiet(true);
+        assert!(!verbose());
+        set_fork_child_quiet(false);
+        assert_eq!(verbose(), before);
     }
 
     #[test]

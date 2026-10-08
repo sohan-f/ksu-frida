@@ -66,7 +66,8 @@ fn enable_atfork_reset() {
 }
 
 // Kill/Freeze/Pass allocate nothing and log nothing: the child inherits every lock held at fork time.
-// Inject reuses parent-prepared strings but still stages, logs, and dlopens, so it stays best-effort.
+// Inject reuses parent-prepared strings and stays silent (child-quiet logs cover
+// every verbose gate); staging allocs and dlopen remain, so it stays best-effort.
 fn run_child_action(action: ChildMode, libraries: &[String], app_name: &str) -> libc::pid_t {
     match action {
         ChildMode::Kill => {
@@ -130,6 +131,9 @@ fn fork_inner() -> libc::pid_t {
     }
 
     crate::remap::after_fork();
+
+    // Silence first: every log line below would malloc and take liblog locks.
+    crate::log::set_fork_child_quiet(true);
 
     let libraries = INJECTED_LIBRARIES
         .get()
