@@ -700,10 +700,7 @@ fn stage_gadget(app_name: &str, src_lib_path: &str) -> Option<String> {
     }
 
     let (src_dir, lib_name) = split_lib_path(src_lib_path);
-    let cfg_name = with_config_suffix(lib_name);
-    let src_cfg = format!("{src_dir}/{cfg_name}");
     let dst_lib = format!("{stage_dir}/{lib_name}");
-    let dst_cfg = format!("{stage_dir}/{cfg_name}");
 
     logi_fmt(format_args!(
         "Staging gadget {} -> {dst_lib}",
@@ -712,15 +709,34 @@ fn stage_gadget(app_name: &str, src_lib_path: &str) -> Option<String> {
 
     if !copy_file(src_lib_path, &dst_lib) {
         remove_file(&dst_lib);
-        remove_file(&dst_cfg);
+        remove_file(&with_config_suffix(&dst_lib));
         remove_dir(&stage_dir);
         return None;
     }
 
-    if !copy_file(&src_cfg, &dst_cfg) {
+    if let Some((src_cfg, dst_cfg)) = sibling_config_paths(src_dir, &stage_dir, lib_name)
+        && !copy_file(&src_cfg, &dst_cfg)
+    {
         remove_file(&dst_cfg);
     }
     Some(dst_lib)
+}
+
+// Sibling config (source, staged) unless the library name holds no `.so` —
+// then the "sibling" is the library itself and copying must be skipped.
+fn sibling_config_paths(
+    src_dir: &str,
+    stage_dir: &str,
+    lib_name: &str,
+) -> Option<(String, String)> {
+    let cfg_name = with_config_suffix(lib_name);
+    if cfg_name == lib_name {
+        return None;
+    }
+    Some((
+        format!("{src_dir}/{cfg_name}"),
+        format!("{stage_dir}/{cfg_name}"),
+    ))
 }
 
 fn unlink_staged(staged_lib_path: &str) {
@@ -1085,6 +1101,21 @@ mod tests {
             "/dir.so/libx.config.so"
         );
         assert_eq!(with_config_suffix("./libx.so"), "./libx.config.so");
+    }
+
+    #[test]
+    fn sibling_config_paths_skip_names_without_so() {
+        assert_eq!(
+            sibling_config_paths("/s", "/d", "libx.so"),
+            Some((
+                "/s/libx.config.so".to_string(),
+                "/d/libx.config.so".to_string()
+            ))
+        );
+        // No `.so`: the "sibling" is the library itself; copying would
+        // exclusive-create over the staged file, fail, and unlink it.
+        assert_eq!(sibling_config_paths("/s", "/d", "mylib"), None);
+        assert_eq!(sibling_config_paths("/s", "/d", "no_suffix"), None);
     }
 
     #[test]
