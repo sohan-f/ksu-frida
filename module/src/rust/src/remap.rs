@@ -83,6 +83,9 @@ fn prot_from_perms(perms: &str) -> c_int {
 fn parse_maps_line(line: &str) -> Option<ProcMapsInfo> {
     // The kernel separates the five fixed fields with single spaces, but the
     // pathname itself may contain spaces (shown unescaped), so split 6 ways.
+    // Only the line terminator is stripped: newlines arrive octal-escaped,
+    // so a literal `\n` here is never pathname content.
+    let line = line.strip_suffix('\n').unwrap_or(line);
     let mut parts = line.trim_start().splitn(6, ' ');
     let (range, perms, _, _, _, path) = (
         parts.next()?,
@@ -110,7 +113,7 @@ fn parse_maps_line(line: &str) -> Option<ProcMapsInfo> {
         end,
         perms: prot,
         private,
-        path: path.trim().to_string(),
+        path: path.to_string(),
     })
 }
 
@@ -1215,6 +1218,19 @@ mod tests {
             assert_eq!(prot_at(addr as usize), (libc::PROT_READ, true));
             assert_eq!(libc::munmap(addr, SIZE), 0);
         }
+    }
+
+    #[test]
+    fn maps_line_preserves_trailing_space_in_path() {
+        let info =
+            parse_maps_line("7ac49c2000-7ac4a26000 r--p 00000000 00:00 0 /data/x/libfoo.so \n")
+                .expect("line");
+        assert_eq!(info.path, "/data/x/libfoo.so ");
+
+        let info =
+            parse_maps_line("7ac49c2000-7ac4a26000 r--p 00000000 00:00 0 /data/x/libfoo.so\n")
+                .expect("line");
+        assert_eq!(info.path, "/data/x/libfoo.so");
     }
 
     #[test]
