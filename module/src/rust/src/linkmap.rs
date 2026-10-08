@@ -898,12 +898,12 @@ mod tests {
             assert_eq!(scrub_callback(&raw mut second_entry, entry_size(), data), 0);
         }
         assert!(search.found);
-        // SAFETY: read-only checks, then freed with original lengths (17 each).
+        // SAFETY: read-only checks, then freed with original lengths (18 each).
         unsafe {
             assert_eq!(CStr::from_ptr(first).to_bytes(), b"libnative_1.so");
             assert_eq!(CStr::from_ptr(second).to_bytes(), b"libnative_1.so");
-            free_cstring(first, 17);
-            free_cstring(second, 17);
+            free_cstring(first, 18);
+            free_cstring(second, 18);
         }
     }
 
