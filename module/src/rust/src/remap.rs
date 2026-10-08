@@ -434,6 +434,8 @@ fn install_fault_retry() -> FaultRetry {
 impl Drop for FaultRetry {
     fn drop(&mut self) {
         for (index, &sig) in GUARDED_SIGNALS.iter().enumerate() {
+            // Consume first: a replaced app action must not leave a stale reset behind.
+            let fired = RESETHAND_FIRED[index].swap(false, Ordering::AcqRel);
             if !self.installed[index] {
                 continue;
             }
@@ -448,7 +450,7 @@ impl Drop for FaultRetry {
                 continue;
             }
 
-            if RESETHAND_FIRED[index].swap(false, Ordering::AcqRel) {
+            if fired {
                 // Emulate the kernel reset: leave DFL, not the one-shot handler.
                 // SAFETY: zeroed action is DFL (NULL handler).
                 let dfl: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -979,6 +981,87 @@ mod tests {
             libc::pthread_sigmask(libc::SIG_SETMASK, &saved_mask, std::ptr::null_mut());
             libc::close(fds[0]);
             libc::close(fds[1]);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // real sigaction(2)/raise(2); no Miri shims
+    fn drop_clears_reset_when_app_replaces_handler() {
+        use std::sync::atomic::AtomicBool;
+
+        static RAN_A: AtomicBool = AtomicBool::new(false);
+        static RAN_B: AtomicBool = AtomicBool::new(false);
+
+        unsafe extern "C" fn probe_a(_sig: c_int, _info: *mut libc::siginfo_t, _ctx: *mut c_void) {
+            RAN_A.store(true, Ordering::Relaxed);
+        }
+
+        unsafe extern "C" fn probe_b(_sig: c_int, _info: *mut libc::siginfo_t, _ctx: *mut c_void) {
+            RAN_B.store(true, Ordering::Relaxed);
+        }
+
+        let _state = lock_state();
+        RAN_A.store(false, Ordering::Relaxed);
+        RAN_B.store(false, Ordering::Relaxed);
+
+        // SAFETY: output buffer for the query below; restored at the end.
+        let mut saved_action: libc::sigaction = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            // SAFETY: query-only call (`act == NULL`).
+            unsafe { libc::sigaction(libc::SIGSEGV, std::ptr::null(), &mut saved_action) },
+            0
+        );
+        // SAFETY: fully initialised below; superseded before the end of the test.
+        let mut one_shot: libc::sigaction = unsafe { std::mem::zeroed() };
+        one_shot.sa_sigaction = probe_a as *const () as usize;
+        one_shot.sa_flags = libc::SA_SIGINFO | libc::SA_RESETHAND;
+        // SAFETY: fully initialised replacement below; restored at the end.
+        let mut replacement: libc::sigaction = unsafe { std::mem::zeroed() };
+        replacement.sa_sigaction = probe_b as *const () as usize;
+        replacement.sa_flags = libc::SA_SIGINFO;
+        assert_eq!(
+            // SAFETY: fully initialised one-shot above; superseded below.
+            unsafe { libc::sigaction(libc::SIGSEGV, &one_shot, std::ptr::null_mut(),) },
+            0
+        );
+
+        {
+            let retry = install_fault_retry();
+            // Kill-delivered fault forwards to the one-shot probe.
+            // SAFETY: our handler is installed; the probe only records and returns.
+            unsafe { libc::raise(libc::SIGSEGV) };
+            assert!(RAN_A.load(Ordering::Relaxed));
+            // The one-shot probe replaces itself, like a chaining runtime would.
+            assert_eq!(
+                // SAFETY: fully initialised replacement above.
+                unsafe { libc::sigaction(libc::SIGSEGV, &replacement, std::ptr::null_mut()) },
+                0
+            );
+            drop(retry);
+            // The app action is preserved and no stale reset remains.
+            // SAFETY: output buffer for the query below.
+            let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                // SAFETY: query-only call (`act == NULL`).
+                unsafe { libc::sigaction(libc::SIGSEGV, std::ptr::null(), &mut current) },
+                0
+            );
+            assert_eq!(current.sa_sigaction as usize, probe_b as *const () as usize);
+            assert!(!RESETHAND_FIRED[0].load(Ordering::Relaxed));
+        }
+
+        // A later remap still forwards to the replacement instead of DFL.
+        RAN_B.store(false, Ordering::Relaxed);
+        {
+            let _retry = install_fault_retry();
+            // SAFETY: our handler is installed; the probe only records and returns.
+            unsafe { libc::raise(libc::SIGSEGV) };
+            assert!(RAN_B.load(Ordering::Relaxed));
+        }
+
+        // SAFETY: restores the pre-test disposition.
+        unsafe {
+            libc::sigaction(libc::SIGSEGV, &saved_action, std::ptr::null_mut());
         }
     }
 
