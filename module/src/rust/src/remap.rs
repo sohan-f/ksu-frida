@@ -18,14 +18,19 @@ static PREVIOUS_FLAGS: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new
 // fault landing between the two stores above never transmutes a torn pair.
 static PREVIOUS_VERSION: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
 
-static IN_FLIGHT_START: AtomicUsize = AtomicUsize::new(0);
+#[repr(align(64))]
+struct PaddedUsize(AtomicUsize);
+#[repr(align(64))]
+struct PaddedBool(AtomicBool);
+
+static IN_FLIGHT_START: PaddedUsize = PaddedUsize(AtomicUsize::new(0));
 // END is stored while START is zero, so non-zero START implies a stable END.
-static IN_FLIGHT_END: AtomicUsize = AtomicUsize::new(0);
+static IN_FLIGHT_END: PaddedUsize = PaddedUsize(AtomicUsize::new(0));
 
 // The rebuilding thread must never park on its own fault.
-static REBUILDER_TID: AtomicUsize = AtomicUsize::new(0);
+static REBUILDER_TID: PaddedUsize = PaddedUsize(AtomicUsize::new(0));
 
-static REBUILD_LOCK: AtomicBool = AtomicBool::new(false);
+static REBUILD_LOCK: PaddedBool = PaddedBool(AtomicBool::new(false));
 
 const PARK_SPIN_LIMIT: usize = 100_000_000;
 
@@ -158,7 +163,7 @@ fn is_synchronous_fault(code: c_int) -> bool {
 /// # Safety
 /// Installed only by [`install_fault_retry`]; `info` comes from the kernel.
 unsafe extern "C" fn park_or_forward(sig: c_int, info: *mut libc::siginfo_t, context: *mut c_void) {
-    let start = IN_FLIGHT_START.load(Ordering::Acquire);
+    let start = IN_FLIGHT_START.0.load(Ordering::Acquire);
     if start == 0 {
         // SAFETY: `forward_fault` only chains to actions captured by `install_fault_retry` earlier in this rebuild.
         unsafe { forward_fault(sig, info, context) };
@@ -167,16 +172,18 @@ unsafe extern "C" fn park_or_forward(sig: c_int, info: *mut libc::siginfo_t, con
     // SAFETY: `gettid(2)` takes no arguments, cannot fail and allocates nothing — safe inside a signal handler.
     // After the early-out above so idle faults skip the syscall.
     let tid = unsafe { libc::gettid() };
-    if tid != REBUILDER_TID.load(Ordering::Relaxed) as c_int {
+    if tid != REBUILDER_TID.0.load(Ordering::Relaxed) as c_int {
         // SAFETY: plain `c_int` field read of the kernel-provided `siginfo_t`.
         let code = unsafe { (*info).si_code };
         if is_synchronous_fault(code) {
-            let end = IN_FLIGHT_END.load(Ordering::Relaxed);
+            let end = IN_FLIGHT_END.0.load(Ordering::Relaxed);
             // SAFETY: the kernel hands SA_SIGINFO handlers a non-null `siginfo_t`; `si_addr` is defined for SIGSEGV/SIGBUS.
             let fault = unsafe { (*info).si_addr() } as usize;
             if (start..end).contains(&fault) {
                 for _ in 0..PARK_SPIN_LIMIT {
-                    if IN_FLIGHT_START.load(Ordering::Acquire) == 0 {
+                    // Relaxed poll (`ldr`, not `ldar`); single Acquire on exit.
+                    if IN_FLIGHT_START.0.load(Ordering::Relaxed) == 0 {
+                        IN_FLIGHT_START.0.load(Ordering::Acquire);
                         return;
                     }
                     std::hint::spin_loop();
@@ -280,6 +287,7 @@ fn publish_previous(index: usize, handler: *mut c_void, flags: usize) {
 impl RebuildGuard {
     fn acquire() -> RebuildGuard {
         while REBUILD_LOCK
+            .0
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
@@ -291,7 +299,7 @@ impl RebuildGuard {
 
 impl Drop for RebuildGuard {
     fn drop(&mut self) {
-        REBUILD_LOCK.store(false, Ordering::Release);
+        REBUILD_LOCK.0.store(false, Ordering::Release);
     }
 }
 
@@ -309,7 +317,9 @@ fn install_fault_retry() -> FaultRetry {
         _rebuild: RebuildGuard::acquire(),
     };
     // SAFETY: `gettid(2)` cannot fail.
-    REBUILDER_TID.store(unsafe { libc::gettid() } as usize, Ordering::Relaxed);
+    REBUILDER_TID
+        .0
+        .store(unsafe { libc::gettid() } as usize, Ordering::Relaxed);
 
     for (index, &sig) in GUARDED_SIGNALS.iter().enumerate() {
         // SAFETY: output buffer for the query below; zeroed is valid padding-initialised state.
@@ -373,15 +383,15 @@ impl Drop for FaultRetry {
             // SAFETY: only reached when the current handler is still ours; `previous` was saved at install time for this process.
             unsafe { libc::sigaction(sig, &raw const self.previous[index], std::ptr::null_mut()) };
         }
-        REBUILDER_TID.store(0, Ordering::Relaxed);
+        REBUILDER_TID.0.store(0, Ordering::Relaxed);
     }
 }
 
 pub(crate) fn after_fork() {
-    IN_FLIGHT_START.store(0, Ordering::Release);
-    IN_FLIGHT_END.store(0, Ordering::Relaxed);
-    REBUILDER_TID.store(0, Ordering::Relaxed);
-    REBUILD_LOCK.store(false, Ordering::Release);
+    IN_FLIGHT_START.0.store(0, Ordering::Release);
+    IN_FLIGHT_END.0.store(0, Ordering::Relaxed);
+    REBUILDER_TID.0.store(0, Ordering::Relaxed);
+    REBUILD_LOCK.0.store(false, Ordering::Release);
     // Unstick a publish interrupted mid-store: single bump to even.
     for v in &PREVIOUS_VERSION {
         if v.load(Ordering::Relaxed) & 1 == 1 {
@@ -392,13 +402,13 @@ pub(crate) fn after_fork() {
 
 #[inline]
 fn begin_rebuild(start: usize, size: usize) {
-    IN_FLIGHT_END.store(start + size, Ordering::Relaxed);
-    IN_FLIGHT_START.store(start, Ordering::Release);
+    IN_FLIGHT_END.0.store(start + size, Ordering::Relaxed);
+    IN_FLIGHT_START.0.store(start, Ordering::Release);
 }
 
 #[inline]
 fn end_rebuild() {
-    IN_FLIGHT_START.store(0, Ordering::Release);
+    IN_FLIGHT_START.0.store(0, Ordering::Release);
 }
 
 #[derive(Debug)]
@@ -534,6 +544,11 @@ pub(crate) fn maps_show(query: &str) -> bool {
 
 /// Protections of the single mapping containing `[start, end)`, if any.
 pub(crate) fn mapped_perms(start: usize, end: usize) -> Option<c_int> {
+    mapped_range(start).and_then(|(prot, map_end)| (end <= map_end).then_some(prot))
+}
+
+/// Start-mapped range end, if `start` sits in a live mapping.
+pub(crate) fn mapped_range(start: usize) -> Option<(c_int, usize)> {
     let Ok(file) = File::open("/proc/self/maps") else {
         return None;
     };
@@ -542,9 +557,9 @@ pub(crate) fn mapped_perms(start: usize, end: usize) -> Option<c_int> {
     while reader.read_line(&mut line).unwrap_or(0) > 0 {
         if let Some((s, e, prot)) = parse_maps_range(&line)
             && s <= start
-            && end <= e
+            && start < e
         {
-            return Some(prot);
+            return Some((prot, e));
         }
         line.clear();
     }

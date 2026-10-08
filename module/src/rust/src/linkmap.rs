@@ -426,8 +426,12 @@ fn contains_frida(name: &[u8]) -> bool {
     if name.len() < 5 {
         return false;
     }
-    name.windows(5)
-        .any(|w| (w[0] | 32) == b'f' && w.eq_ignore_ascii_case(b"frida"))
+    // Integer fast path, no over-read (`windows(5)` guarantees len).
+    const FRID: u32 = u32::from_le_bytes(*b"frid");
+    name.windows(5).any(|w| {
+        u32::from_le_bytes([w[0] | 32, w[1] | 32, w[2] | 32, w[3] | 32]) == FRID
+            && (w[4] | 32) == b'a'
+    })
 }
 
 struct WritableWindow {
@@ -668,7 +672,6 @@ unsafe fn gnu_nsyms(table: usize) -> usize {
     if nbuckets == 0 || nbuckets > MAX_SYMBOLS {
         return 0;
     }
-    let limit = symoffset.saturating_add(MAX_SYMBOLS);
     let Some(buckets) = bloom_words
         .checked_mul(size_of::<usize>())
         .and_then(|bloom| table.checked_add(16 + bloom))
@@ -678,9 +681,23 @@ unsafe fn gnu_nsyms(table: usize) -> usize {
     let Some(chain) = nbuckets.checked_mul(4).and_then(|b| buckets.checked_add(b)) else {
         return 0;
     };
+    // Corrupt stop-bit-less chain would read MBs past the table inside
+    // the linker callback with no fault guard; cap the walk to the live
+    // mapping end as well as the symbol budget.
+    let Some((_, map_end)) = crate::remap::mapped_range(chain) else {
+        return 0;
+    };
+    let map_words = map_end.saturating_sub(chain) / 4;
+    let mut budget = MAX_SYMBOLS.min(map_words);
+    if budget == 0 {
+        return 0;
+    }
+    // Individual offsets also stay mapped: cap the top symbol by both.
+    let limit = symoffset
+        .saturating_add(map_words)
+        .min(symoffset.saturating_add(MAX_SYMBOLS));
     // Chains of one bucket run contiguous until the LSB stop bit; total work
     // across buckets is bounded by the shared budget below.
-    let mut budget = MAX_SYMBOLS;
     let mut highest = symoffset;
     for i in 0..nbuckets {
         // Spent budget cannot extend the count; later buckets read nothing new.
