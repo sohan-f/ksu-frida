@@ -56,8 +56,11 @@ fn enable_atfork_reset() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         // SAFETY: handlers are plain fns; child only stores atomics.
-        unsafe {
-            pthread_atfork(None, None, Some(atfork_child));
+        let rc = unsafe { pthread_atfork(None, None, Some(atfork_child)) };
+        if rc != 0 {
+            loge_fmt(format_args!(
+                "[child_gating] pthread_atfork failed: {rc}; fork child keeps parent rebuild state"
+            ));
         }
     });
 }

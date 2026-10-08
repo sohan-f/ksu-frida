@@ -67,26 +67,6 @@ pub(crate) fn current_app_name() -> String {
         .unwrap_or_default()
 }
 
-fn current_app_matches(expected: &str) -> bool {
-    use std::os::unix::io::AsRawFd;
-    let Ok(f) = File::open("/proc/self/cmdline") else {
-        return false;
-    };
-    // Long names fall back to the allocating read; common names stay stack-only.
-    if expected.len() > 256 {
-        return current_app_name() == expected;
-    }
-    let mut buf = [0u8; 256];
-    // SAFETY: `read` into our own stack buffer; return checked below.
-    let n = unsafe { libc::read(f.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-    if n <= 0 {
-        return false;
-    }
-    let n = n as usize;
-    let end = buf[..n].iter().position(|&b| b == 0).unwrap_or(n);
-    buf[..end] == *expected.as_bytes()
-}
-
 fn package_of(app_name: &str) -> &str {
     app_name.split(':').next().unwrap_or(app_name)
 }
@@ -102,14 +82,45 @@ fn wait_for_init_within(app_name: &str, timeout: Duration) -> bool {
 
     let deadline = std::time::Instant::now() + timeout;
     // Exact match; a substring test confuses com.foo with com.foobar.
-    while !current_app_matches(app_name) {
-        if std::time::Instant::now() >= deadline {
-            loge_fmt(format_args!(
-                "Timed out waiting for process init: {app_name}"
-            ));
-            return false;
+    // Open once, reuse the fd per poll: avoids openat+close per 10ms tick.
+    // Long names fall back to the allocating read; common names stay stack-only.
+    if app_name.len() > 256 {
+        while current_app_name() != app_name {
+            if std::time::Instant::now() >= deadline {
+                loge_fmt(format_args!(
+                    "Timed out waiting for process init: {app_name}"
+                ));
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
         }
-        thread::sleep(Duration::from_millis(10));
+    } else if let Ok(f) = File::open("/proc/self/cmdline") {
+        use std::os::unix::io::AsRawFd;
+        let fd = f.as_raw_fd();
+        let mut buf = [0u8; 256];
+        loop {
+            // SAFETY: `lseek` to 0 then `read` into our own stack buffer; returns checked.
+            unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
+            // SAFETY: as above.
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            let matched = n > 0 && {
+                let n = n as usize;
+                let end = buf[..n].iter().position(|&b| b == 0).unwrap_or(n);
+                buf[..end] == *app_name.as_bytes()
+            };
+            if matched {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                loge_fmt(format_args!(
+                    "Timed out waiting for process init: {app_name}"
+                ));
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    } else {
+        return false;
     }
 
     thread::sleep(Duration::from_millis(100));
@@ -536,9 +547,6 @@ fn sweep_stale_stage_dirs(cache_dir: &str) {
         if pid == own_pid {
             continue;
         }
-        if pid_is_alive(pid) {
-            continue;
-        }
         dir.clear();
         dir.push_str(cache_dir);
         dir.push('/');
@@ -549,6 +557,11 @@ fn sweep_stale_stage_dirs(cache_dir: &str) {
         marker.push_str(STAGE_MARKER);
         // Only our stage dirs carry the marker; app-owned numeric dirs stay untouched.
         if !std::path::Path::new(&marker).exists() {
+            continue;
+        }
+        // Liveness last, just before removal: narrows PID-reuse to ns
+        // and skips pidfd/kill for unmarked numeric dirs.
+        if pid_is_alive(pid) {
             continue;
         }
         remove_stage_dir_contents(&dir);
