@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::config::{ChildGatingConfig, ChildMode};
 use crate::inject::stage_and_inject;
 use crate::log::{loge, loge_fmt, logi, logi_fmt};
-use crate::sys::{RTLD_DEFAULT, RTLD_NOLOAD, RTLD_NOW, dlerror_string, dlopen, dlsym, set_errno};
+use crate::sys::{dlerror_string, set_errno};
 
 type ForkFn = unsafe extern "C" fn() -> libc::pid_t;
 
@@ -141,57 +141,20 @@ fn fork_inner() -> libc::pid_t {
 
 /// Address of a hook target by name, if resolvable in any visible scope.
 fn lookup_hook_target(name: &CStr) -> Option<*mut c_void> {
-    // Explicit handle first: the default scope provably misses from this
-    // module, so the known scope leads. The handle is intentionally never
-    // closed; it pins nothing new.
-    // SAFETY: `RTLD_NOLOAD` takes no new reference beyond the
-    // already-loaded library, and every result below is checked for null.
-    let handle = unsafe { dlopen(c"libc.so".as_ptr(), RTLD_NOW | RTLD_NOLOAD) };
-    if !handle.is_null() {
-        // SAFETY: `handle` is live from above; `name` is NUL-terminated.
-        let addr = unsafe { dlsym(handle, name.as_ptr()) };
-        if !addr.is_null() {
-            return Some(addr);
-        }
-        // Gated: `dlerror_string()` allocates even when quiet.
-        if crate::log::verbose() {
-            loge_fmt(format_args!(
-                "[child_gating] libc-scoped lookup failed for {}: {}",
-                name.to_string_lossy(),
-                dlerror_string()
-            ));
-        }
-    } else {
-        // Gated: `dlerror_string()` allocates even when quiet.
-        if crate::log::verbose() {
-            loge_fmt(format_args!(
-                "[child_gating] libc handle lookup failed: {}",
-                dlerror_string()
-            ));
-        }
+    let addr = crate::sys::lookup_symbol(name);
+    if addr.is_none() && crate::log::verbose() {
+        loge_fmt(format_args!(
+            "[child_gating] lookup failed for {}: {}",
+            name.to_string_lossy(),
+            dlerror_string()
+        ));
     }
-    // Fallback: default scope covers non-libc targets and loaders where
-    // the explicit handle does not resolve.
-    // SAFETY: `RTLD_DEFAULT` is the documented sentinel handle; a null
-    // return only skips the hook below.
-    let addr = unsafe { dlsym(RTLD_DEFAULT, name.as_ptr()) };
-    if addr.is_null() {
-        // Gated: `dlerror_string()` allocates even when quiet.
-        if crate::log::verbose() {
-            loge_fmt(format_args!(
-                "[child_gating] default-namespace lookup failed for {}: {}",
-                name.to_string_lossy(),
-                dlerror_string()
-            ));
-        }
-        return None;
-    }
-    Some(addr)
+    addr
 }
 
 pub fn enable_child_gating(cfg: &ChildGatingConfig, app_name: &str, scrub_header: bool) {
     if CHILD_GATING_MODE.set(cfg.mode).is_err() {
-        loge("child gating already enabled; ignoring second config");
+        loge("[child_gating] already enabled; ignoring second config");
         return;
     }
     let _ = INJECTED_LIBRARIES.set(cfg.injected_libraries.clone());
@@ -199,7 +162,7 @@ pub fn enable_child_gating(cfg: &ChildGatingConfig, app_name: &str, scrub_header
     GATING_SCRUB_HEADER.store(scrub_header, Ordering::Relaxed);
 
     if cfg.mode == ChildMode::Pass {
-        loge("child_gating mode is pass; children will run ungated");
+        loge("[child_gating] mode is pass; children will run ungated");
     }
 
     logi("[child_gating] enabling child gating");

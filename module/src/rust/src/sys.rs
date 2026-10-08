@@ -255,6 +255,23 @@ pub fn cstring(s: &str) -> Result<CString, NulError> {
     CString::new(s)
 }
 
+/// Address of a symbol, explicit `libc.so` first then default scope.
+/// The handle is never closed; it pins nothing new.
+pub fn lookup_symbol(name: &CStr) -> Option<*mut c_void> {
+    // SAFETY: `RTLD_NOLOAD` takes no new reference beyond the loaded lib; result checked.
+    let handle = unsafe { dlopen(c"libc.so".as_ptr(), RTLD_NOW | RTLD_NOLOAD) };
+    if !handle.is_null() {
+        // SAFETY: `handle` live from above; `name` NUL-terminated.
+        let addr = unsafe { dlsym(handle, name.as_ptr()) };
+        if !addr.is_null() {
+            return Some(addr);
+        }
+    }
+    // SAFETY: `RTLD_DEFAULT` is the documented sentinel; null only skips the hook.
+    let addr = unsafe { dlsym(RTLD_DEFAULT, name.as_ptr()) };
+    if addr.is_null() { None } else { Some(addr) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

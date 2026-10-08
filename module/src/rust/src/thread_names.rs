@@ -2,7 +2,7 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::log::{loge, loge_fmt, logi};
-use crate::sys::{RTLD_DEFAULT, RTLD_NOLOAD, RTLD_NOW, dlerror_string, dlopen, dlsym};
+use crate::sys::dlerror_string;
 
 #[cfg(target_os = "android")]
 unsafe extern "C" {
@@ -120,50 +120,14 @@ pub fn enable_thread_name_sanitizing() {
 /// Address of `pthread_setname_np` for the Dobby hook below, if resolvable.
 fn lookup_setname() -> Option<*mut c_void> {
     const NAME: &CStr = c"pthread_setname_np";
-    // Explicit handle first: the default scope provably misses from this
-    // module, so the known scope leads. The handle is intentionally never
-    // closed; it pins nothing new.
-    // SAFETY: `RTLD_NOLOAD` takes no new reference beyond the
-    // already-loaded library, and every result below is checked for null.
-    let handle = unsafe { dlopen(c"libc.so".as_ptr(), RTLD_NOW | RTLD_NOLOAD) };
-    if !handle.is_null() {
-        // SAFETY: `handle` is live from above; `NAME` is NUL-terminated.
-        let addr = unsafe { dlsym(handle, NAME.as_ptr()) };
-        if !addr.is_null() {
-            return Some(addr);
-        }
-        // Gated: `dlerror_string()` allocates even when quiet.
-        if crate::log::verbose() {
-            loge_fmt(format_args!(
-                "setname hook: libc-scoped lookup failed: {}",
-                dlerror_string()
-            ));
-        }
-    } else {
-        // Gated: `dlerror_string()` allocates even when quiet.
-        if crate::log::verbose() {
-            loge_fmt(format_args!(
-                "setname hook: libc handle lookup failed: {}",
-                dlerror_string()
-            ));
-        }
+    let addr = crate::sys::lookup_symbol(NAME);
+    if addr.is_none() && crate::log::verbose() {
+        loge_fmt(format_args!(
+            "setname hook: lookup failed: {}",
+            dlerror_string()
+        ));
     }
-    // Fallback: default scope covers non-libc targets and loaders where
-    // the explicit handle does not resolve.
-    // SAFETY: `RTLD_DEFAULT` is the documented sentinel handle; a null
-    // return only skips the hook below.
-    let addr = unsafe { dlsym(RTLD_DEFAULT, NAME.as_ptr()) };
-    if addr.is_null() {
-        // Gated: `dlerror_string()` allocates even when quiet.
-        if crate::log::verbose() {
-            loge_fmt(format_args!(
-                "setname hook: default-namespace lookup failed: {}",
-                dlerror_string()
-            ));
-        }
-        return None;
-    }
-    Some(addr)
+    addr
 }
 
 #[cfg(test)]
