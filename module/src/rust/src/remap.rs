@@ -214,12 +214,26 @@ unsafe extern "C" fn park_or_forward(sig: c_int, info: *mut libc::siginfo_t, con
     unsafe { forward_fault(sig, info, context) };
 }
 
+// Forwards currently inside the wrapper per signal; teardown drains these
+// (bounded) before deciding, so a paused claim settles first.
+static IN_FLIGHT_FORWARD: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
+
 /// # Safety
 /// Called only from [`park_or_forward`].
 unsafe fn forward_fault(sig: c_int, info: *mut libc::siginfo_t, context: *mut c_void) {
     let Some(index) = GUARDED_SIGNALS.iter().position(|&guarded| guarded == sig) else {
         return;
     };
+    struct FlightGuard {
+        index: usize,
+    }
+    impl Drop for FlightGuard {
+        fn drop(&mut self) {
+            IN_FLIGHT_FORWARD[self.index].fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    IN_FLIGHT_FORWARD[index].fetch_add(1, Ordering::Relaxed);
+    let _flight = FlightGuard { index };
 
     // A fired reset stays fired: later faults in this window take DFL.
     if RESETHAND_FIRED[index].load(Ordering::Acquire) {
@@ -277,6 +291,24 @@ unsafe fn forward_fault(sig: c_int, info: *mut libc::siginfo_t, context: *mut c_
     }
     // SAFETY: paired restore of the block above.
     unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
+    if flags & libc::SA_RESETHAND != 0 {
+        // Post-teardown claim: teardown already restored the one-shot and
+        // left, so retire it here or a later fault re-runs it. A live
+        // window shows our wrapper instead and keeps owning the flag.
+        // SAFETY: output buffer for the query below.
+        let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: query-only call (`act == NULL`).
+        let retired = unsafe { libc::sigaction(sig, std::ptr::null(), &mut current) } == 0
+            && current.sa_sigaction as usize != park_or_forward as *const () as usize
+            && current.sa_sigaction as usize == handler.addr();
+        if retired {
+            // SAFETY: retiring the handler just invoked; zeroed action is DFL.
+            let dfl: libc::sigaction = unsafe { std::mem::zeroed() };
+            // SAFETY: queried immediately above; best-effort retire.
+            unsafe { libc::sigaction(sig, &dfl, std::ptr::null_mut()) };
+            RESETHAND_FIRED[index].store(false, Ordering::Release);
+        }
+    }
 }
 
 /// Fail closed via DFL re-raise on the faulting thread.
@@ -348,6 +380,9 @@ fn publish_previous(index: usize, handler: *mut c_void, flags: usize, mask: &lib
     // SAFETY: same single-writer contract; readers are version-gated.
     let dst = unsafe { &mut *PREVIOUS_MASK[index].0.get() };
     dst.copy_from_slice(src);
+    // A firing older than this publish is obsolete: a stale set flag must
+    // not skip the freshly saved handler. The closing bump carries this out.
+    RESETHAND_FIRED[index].store(false, Ordering::Relaxed);
     PREVIOUS_VERSION[index].fetch_add(1, Ordering::Release);
 }
 
@@ -438,8 +473,7 @@ fn install_fault_retry() -> FaultRetry {
 impl Drop for FaultRetry {
     fn drop(&mut self) {
         for (index, &sig) in GUARDED_SIGNALS.iter().enumerate() {
-            // Consume first: a replaced app action must not leave a stale reset behind.
-            let fired = RESETHAND_FIRED[index].swap(false, Ordering::AcqRel);
+            // A replaced app action must not leave a stale reset behind.
             if !self.installed[index] {
                 continue;
             }
@@ -448,23 +482,47 @@ impl Drop for FaultRetry {
             let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
             // SAFETY: query-only call (`act == NULL`).
             if unsafe { libc::sigaction(sig, std::ptr::null(), &raw mut current) } != 0 {
+                RESETHAND_FIRED[index].store(false, Ordering::Relaxed);
                 continue;
             }
             if current.sa_sigaction as usize != park_or_forward as *const () as usize {
+                RESETHAND_FIRED[index].store(false, Ordering::Relaxed);
                 continue;
             }
 
-            if fired {
+            // Drain paused claims first: a forward inside the wrapper must
+            // settle (claim or finish) before teardown decides, or its
+            // invoke escapes the reset. Bounded like the park spin; a
+            // straggler past the bound keeps the previous behavior.
+            for _ in 0..PARK_SPIN_LIMIT {
+                if IN_FLIGHT_FORWARD[index].load(Ordering::Relaxed) == 0 {
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+
+            // The flag stays set until the replacement lands: concurrent
+            // forwards in between must take DFL, never re-invoke.
+            if RESETHAND_FIRED[index].load(Ordering::Acquire) {
                 // Emulate the kernel reset: leave DFL, not the one-shot handler.
                 // SAFETY: zeroed action is DFL (NULL handler).
                 let dfl: libc::sigaction = unsafe { std::mem::zeroed() };
                 // SAFETY: current handler is still ours (checked above).
                 unsafe { libc::sigaction(sig, &dfl, std::ptr::null_mut()) };
+                RESETHAND_FIRED[index].store(false, Ordering::Release);
             } else {
                 // SAFETY: current handler is still ours (checked above); restores the saved action.
                 unsafe {
                     libc::sigaction(sig, &raw const self.previous[index], std::ptr::null_mut())
                 };
+                // A concurrent forward may have claimed the one-shot between
+                // the check above and this install: re-check and correct.
+                if RESETHAND_FIRED[index].swap(false, Ordering::AcqRel) {
+                    // SAFETY: best-effort correction toward the reset state.
+                    let dfl: libc::sigaction = unsafe { std::mem::zeroed() };
+                    // SAFETY: same installed handler as above.
+                    unsafe { libc::sigaction(sig, &dfl, std::ptr::null_mut()) };
+                }
             }
         }
         REBUILDER_TID.0.store(0, Ordering::Relaxed);
@@ -484,6 +542,9 @@ pub(crate) fn after_fork() {
     }
     for fired in &RESETHAND_FIRED {
         fired.store(false, Ordering::Relaxed);
+    }
+    for flight in &IN_FLIGHT_FORWARD {
+        flight.store(0, Ordering::Relaxed);
     }
 }
 
@@ -903,6 +964,7 @@ mod tests {
             0
         );
         assert_eq!(after.sa_sigaction as usize, libc::SIG_DFL);
+        assert!(!RESETHAND_FIRED[0].load(Ordering::Relaxed));
 
         // SAFETY: restores the pre-test disposition and thread mask.
         unsafe {
@@ -1159,6 +1221,222 @@ mod tests {
             unsafe { libc::raise(libc::SIGSEGV) };
             assert!(RAN_B.load(Ordering::Relaxed));
         }
+
+        // SAFETY: restores the pre-test disposition.
+        unsafe {
+            libc::sigaction(libc::SIGSEGV, &saved_action, std::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // real sigaction(2); no Miri shims
+    fn drop_installs_dfl_on_pending_reset() {
+        let _state = lock_state();
+
+        // SAFETY: output buffer for the query below; restored at the end.
+        let mut saved_action: libc::sigaction = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            // SAFETY: query-only call (`act == NULL`).
+            unsafe { libc::sigaction(libc::SIGSEGV, std::ptr::null(), &mut saved_action) },
+            0
+        );
+
+        {
+            let _retry = install_fault_retry();
+            // Simulates a claim that landed without a live forward.
+            RESETHAND_FIRED[0].store(true, Ordering::Relaxed);
+        }
+
+        // Drop honored the pending reset and consumed it.
+        // SAFETY: output buffer for the query below.
+        let mut after: libc::sigaction = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            // SAFETY: query-only call (`act == NULL`).
+            unsafe { libc::sigaction(libc::SIGSEGV, std::ptr::null(), &mut after) },
+            0
+        );
+        assert_eq!(after.sa_sigaction as usize, libc::SIG_DFL);
+        assert!(!RESETHAND_FIRED[0].load(Ordering::Relaxed));
+
+        // SAFETY: restores the pre-test disposition.
+        unsafe {
+            libc::sigaction(libc::SIGSEGV, &saved_action, std::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // real sigaction(2); no Miri shims
+    fn install_clears_stale_reset() {
+        let _state = lock_state();
+
+        // SAFETY: output buffer for the query below; restored at the end.
+        let mut saved_action: libc::sigaction = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            // SAFETY: query-only call (`act == NULL`).
+            unsafe { libc::sigaction(libc::SIGSEGV, std::ptr::null(), &mut saved_action) },
+            0
+        );
+
+        {
+            // A firing older than the publish below is obsolete.
+            RESETHAND_FIRED[0].store(true, Ordering::Relaxed);
+            let _retry = install_fault_retry();
+            // The publish cleared it, so the Drop below takes the
+            // restore path instead of wrongly leaving DFL.
+            assert!(!RESETHAND_FIRED[0].load(Ordering::Relaxed));
+        }
+
+        // SAFETY: output buffer for the query below.
+        let mut after: libc::sigaction = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            // SAFETY: query-only call (`act == NULL`).
+            unsafe { libc::sigaction(libc::SIGSEGV, std::ptr::null(), &mut after) },
+            0
+        );
+        assert_eq!(
+            after.sa_sigaction as usize,
+            saved_action.sa_sigaction as usize
+        );
+
+        // SAFETY: restores the pre-test disposition.
+        unsafe {
+            libc::sigaction(libc::SIGSEGV, &saved_action, std::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // raw sigaction(2); no Miri shims
+    fn post_teardown_claim_retires_handler() {
+        use std::sync::atomic::AtomicBool;
+
+        static RAN: AtomicBool = AtomicBool::new(false);
+
+        unsafe extern "C" fn probe(_sig: c_int, _info: *mut libc::siginfo_t, _ctx: *mut c_void) {
+            RAN.store(true, Ordering::Relaxed);
+        }
+
+        let _state = lock_state();
+        RAN.store(false, Ordering::Relaxed);
+
+        // SAFETY: output buffer for the query below; restored at the end.
+        let mut saved_action: libc::sigaction = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            // SAFETY: query-only call (`act == NULL`).
+            unsafe { libc::sigaction(libc::SIGSEGV, std::ptr::null(), &mut saved_action) },
+            0
+        );
+        // SAFETY: fully initialised below; superseded before the end of the test.
+        let mut one_shot: libc::sigaction = unsafe { std::mem::zeroed() };
+        one_shot.sa_sigaction = probe as *const () as usize;
+        one_shot.sa_flags = libc::SA_SIGINFO | libc::SA_RESETHAND;
+        assert_eq!(
+            // SAFETY: fully initialised one-shot above.
+            unsafe { libc::sigaction(libc::SIGSEGV, &one_shot, std::ptr::null_mut(),) },
+            0
+        );
+
+        {
+            // A full window with no firing; Drop restores the one-shot.
+            let _retry = install_fault_retry();
+        }
+
+        // Models a claim paused before its swap, resuming after teardown:
+        // the kernel never resets (direct call), so the claimer retires it.
+        // SAFETY: scratch info the probe ignores; context unused.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: models a post-teardown claim; installs nothing but DFL below.
+        unsafe { forward_fault(libc::SIGSEGV, &mut info, std::ptr::null_mut()) };
+        assert!(RAN.load(Ordering::Relaxed));
+        // SAFETY: output buffer for the query below.
+        let mut after: libc::sigaction = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            // SAFETY: query-only call (`act == NULL`).
+            unsafe { libc::sigaction(libc::SIGSEGV, std::ptr::null(), &mut after) },
+            0
+        );
+        assert_eq!(after.sa_sigaction as usize, libc::SIG_DFL);
+        assert!(!RESETHAND_FIRED[0].load(Ordering::Relaxed));
+
+        // SAFETY: restores the pre-test disposition.
+        unsafe {
+            libc::sigaction(libc::SIGSEGV, &saved_action, std::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // real sigaction(2)/threads; no Miri shims
+    fn drop_drains_in_flight_forward() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+
+        static ENTERED: AtomicBool = AtomicBool::new(false);
+        static GO: AtomicBool = AtomicBool::new(false);
+
+        unsafe extern "C" fn probe(_sig: c_int, _info: *mut libc::siginfo_t, _ctx: *mut c_void) {
+            ENTERED.store(true, Ordering::Relaxed);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !GO.load(Ordering::Relaxed) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        let _state = lock_state();
+        ENTERED.store(false, Ordering::Relaxed);
+        GO.store(false, Ordering::Relaxed);
+
+        // SAFETY: output buffer for the query below; restored at the end.
+        let mut saved_action: libc::sigaction = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            // SAFETY: query-only call (`act == NULL`).
+            unsafe { libc::sigaction(libc::SIGSEGV, std::ptr::null(), &mut saved_action) },
+            0
+        );
+        // SAFETY: fully initialised below; restored at the end of the test.
+        let mut probe_action: libc::sigaction = unsafe { std::mem::zeroed() };
+        probe_action.sa_sigaction = probe as *const () as usize;
+        probe_action.sa_flags = libc::SA_SIGINFO;
+        assert_eq!(
+            // SAFETY: fully initialised action above.
+            unsafe { libc::sigaction(libc::SIGSEGV, &probe_action, std::ptr::null_mut(),) },
+            0
+        );
+
+        let retry = install_fault_retry();
+        let helper = std::thread::spawn(|| {
+            // SAFETY: directed at this thread; the probe above only gates.
+            unsafe { libc::raise(libc::SIGSEGV) };
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while IN_FLIGHT_FORWARD[0].load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The helper is inside the wrapper; teardown must wait for it.
+        assert_eq!(IN_FLIGHT_FORWARD[0].load(Ordering::Relaxed), 1);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(retry);
+            let _ = done_tx.send(());
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            done_rx.try_recv().is_err(),
+            "teardown must still be draining the in-flight forward"
+        );
+        GO.store(true, Ordering::Relaxed);
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("drained");
+        helper.join().expect("helper thread died");
+        assert_eq!(IN_FLIGHT_FORWARD[0].load(Ordering::Relaxed), 0);
+
+        // SAFETY: output buffer for the query below.
+        let mut after: libc::sigaction = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            // SAFETY: query-only call (`act == NULL`).
+            unsafe { libc::sigaction(libc::SIGSEGV, std::ptr::null(), &mut after) },
+            0
+        );
+        assert_eq!(after.sa_sigaction as usize, probe as *const () as usize);
 
         // SAFETY: restores the pre-test disposition.
         unsafe {
