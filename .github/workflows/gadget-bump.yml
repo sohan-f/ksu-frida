@@ -108,8 +108,13 @@ jobs:
                   fail(f"gadget {arch} digest mismatch: metadata {digest}, got {actual}")
               try:
                   subprocess.run(["xz", "-t", dest], check=True, capture_output=True)
+                  so_path = f"{tmpdir}/{arch}.so"
+                  with open(so_path, "wb") as out:
+                      subprocess.run(
+                          ["xz", "-dc", dest], check=True, stdout=out, stderr=subprocess.PIPE
+                      )
                   soname = subprocess.run(
-                      ["readelf", "-d", dest], check=True, capture_output=True, text=True
+                      ["readelf", "-d", so_path], check=True, capture_output=True, text=True
                   ).stdout
               except Exception as e:
                   fail(f"gadget {arch} failed integrity inspection: {e}")
