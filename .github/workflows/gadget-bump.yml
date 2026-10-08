@@ -149,7 +149,7 @@ jobs:
         if: steps.check.outputs.bump == 'true'
         uses: peter-evans/create-pull-request@v8
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.PAT_PUSH_TOKEN }}
           commit-message: "build: adopt gadget ${{ steps.check.outputs.version }} pins"
           branch: gadget-bump-${{ steps.check.outputs.version }}
           delete-branch: true
