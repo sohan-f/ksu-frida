@@ -23,20 +23,26 @@ struct JniTable {
 
 /// Calls `GetStringUTFChars` and copies the result into an owned `String`.
 ///
-/// Returns `None` (after clearing any pending JNI exception) when `env` or
-/// `name` is null or the conversion call fails. The owned copy is made before
-/// `ReleaseStringUTFChars`, so the caller never borrows JNI memory.
+/// Returns `None` (clearing any pending JNI exception when the table is
+/// reachable) when `env`/table/`name` is null or the conversion fails.
+/// The owned copy is made before `ReleaseStringUTFChars`, so the caller
+/// never borrows JNI memory.
 ///
 /// # Safety
 /// `env` must be a valid `JNIEnv` for this thread or null; `name` must be a
 /// valid `jstring` or null.
 pub unsafe fn read_app_name(env: JniEnv, name: JString) -> Option<String> {
-    if env.is_null() || name.is_null() {
+    if env.is_null() {
         return None;
     }
     // SAFETY: `env` non-null per above; a `JNIEnv` is a table pointer by JNI layout.
     let table = unsafe { *(env as *mut *const JniTable) };
     if table.is_null() {
+        return None;
+    }
+    if name.is_null() {
+        // SAFETY: live table; clearing is a no-op without a pending exception.
+        unsafe { ((*table).exception_clear)(env) };
         return None;
     }
     // SAFETY: table from a live `JNIEnv`; raw string released below.
@@ -136,17 +142,34 @@ mod tests {
 
     #[test]
     fn jni_app_name_resolution() {
-        // Null env/name fail closed without touching JNI.
+        // Null env fails closed without touching JNI.
         assert_eq!(
-            // SAFETY: null inputs take the early return above; nothing dereferenced.
+            // SAFETY: null env takes the early return above; nothing dereferenced.
             unsafe { read_app_name(std::ptr::null_mut(), 0x1 as JString) },
             None
         );
+
+        // Null name with a valid env clears the pending exception.
+        let (table_null, slot_null, _) = mock_env(stub_get);
+        let env = slot_null as JniEnv;
+        CLEARED.store(false, Ordering::Relaxed);
+        RELEASED.store(false, Ordering::Relaxed);
+        // SAFETY: live pair from mock_env; null name takes the clear path.
+        assert_eq!(unsafe { read_app_name(env, std::ptr::null_mut()) }, None);
+        assert!(CLEARED.load(Ordering::Relaxed));
+        assert!(!RELEASED.load(Ordering::Relaxed));
+        // SAFETY: the pair above, reconstructed exactly once.
+        unsafe { free_mock_env(table_null, slot_null) };
+
+        // Null table fails closed with nothing to call through.
+        let slot: *mut *const JniTable = Box::into_raw(Box::new(std::ptr::null()));
         assert_eq!(
-            // SAFETY: as above.
-            unsafe { read_app_name(0x1 as JniEnv, std::ptr::null_mut()) },
+            // SAFETY: live slot holding null; name non-null so the table is read.
+            unsafe { read_app_name(slot as JniEnv, 0x1 as JString) },
             None
         );
+        // SAFETY: into_raw output reconstructed exactly once.
+        unsafe { drop(Box::from_raw(slot)) };
 
         // OOM conversion clears the pending exception and releases nothing.
         let (table_oom, slot_oom, name) = mock_env(stub_get_oom);
