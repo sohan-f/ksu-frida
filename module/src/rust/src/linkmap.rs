@@ -413,15 +413,12 @@ use self::{Dyn64 as Dyn, Phdr64 as Phdr, Sym64 as Sym};
 /// `ptr[..max]` must be readable.
 #[inline(always)]
 unsafe fn bounded_strlen(ptr: *const u8, max: usize) -> Option<usize> {
-    // SAFETY: the caller bounds the scan; each read lands inside `ptr[..max]`.
-    unsafe {
-        for i in 0..max {
-            if ptr.add(i).read() == 0 {
-                return Some(i);
-            }
-        }
+    if max == 0 {
+        return None;
     }
-    None
+    // SAFETY: caller bounds the scan; Bionic word/SIMD scan stays in `ptr[..max]`.
+    let n = unsafe { libc::strnlen(ptr.cast::<c_char>(), max) };
+    if n < max { Some(n) } else { None }
 }
 
 #[inline(always)]
