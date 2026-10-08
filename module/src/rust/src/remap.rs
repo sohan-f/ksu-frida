@@ -413,7 +413,10 @@ fn install_fault_retry() -> FaultRetry {
         // SAFETY: zeroed `sigaction` is the documented way to build a fresh action; every field used is set before install.
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
         action.sa_sigaction = park_or_forward as *const () as usize;
-        action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+        // The kernel restarts interrupted syscalls from the installed action:
+        // inherit RESTART per signal so kill-delivered faults keep app semantics.
+        action.sa_flags =
+            libc::SA_SIGINFO | libc::SA_ONSTACK | (current.sa_flags & libc::SA_RESTART);
         // SAFETY: installs the fully initialised `action` above; the kernel copies it synchronously.
         if unsafe { libc::sigaction(sig, &raw const action, std::ptr::null_mut()) } != 0 {
             loge_fmt(format_args!(
@@ -899,6 +902,83 @@ mod tests {
         unsafe {
             libc::sigaction(libc::SIGSEGV, &saved_action, std::ptr::null_mut());
             libc::pthread_sigmask(libc::SIG_SETMASK, &saved_mask, std::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // real sigaction(2)/threads; no Miri shims
+    fn wrapper_keeps_sa_restart() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+
+        static RAN: AtomicBool = AtomicBool::new(false);
+
+        unsafe extern "C" fn probe(_sig: c_int, _info: *mut libc::siginfo_t, _ctx: *mut c_void) {
+            RAN.store(true, Ordering::Relaxed);
+        }
+
+        let _state = lock_state();
+        RAN.store(false, Ordering::Relaxed);
+
+        // SAFETY: output buffers for the queries below.
+        let mut saved_action: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        let mut saved_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            // SAFETY: query-only calls.
+            unsafe {
+                libc::sigaction(libc::SIGSEGV, std::ptr::null(), &mut saved_action);
+                libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut saved_mask)
+            },
+            0
+        );
+
+        // SAFETY: fully initialised below; restored at the end of the test.
+        let mut probe_action: libc::sigaction = unsafe { std::mem::zeroed() };
+        probe_action.sa_sigaction = probe as *const () as usize;
+        probe_action.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+        assert_eq!(
+            // SAFETY: fully initialised action above; installed synchronously.
+            unsafe { libc::sigaction(libc::SIGSEGV, &probe_action, std::ptr::null_mut(),) },
+            0
+        );
+
+        // SAFETY: test-owned pipe pair.
+        let mut fds = [0; 2];
+        // SAFETY: valid two-element output buffer.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: main thread id for the directed kill below.
+        let main_tid = unsafe { libc::pthread_self() };
+        let helper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            // SAFETY: directed kill at the blocked reader below.
+            unsafe { libc::pthread_kill(main_tid, libc::SIGSEGV) };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !RAN.load(Ordering::Relaxed) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // SAFETY: releases the reader either way; RAN pins the verdict.
+            unsafe { libc::write(fds[1], [1u8].as_ptr().cast(), 1) };
+        });
+
+        {
+            let _retry = install_fault_retry();
+            // Kill-delivered fault forwards; with RESTART kept the read resumes.
+            let mut byte = [0u8; 1];
+            // SAFETY: blocking read on our own empty pipe end.
+            let n = unsafe { libc::read(fds[0], byte.as_mut_ptr().cast(), 1) };
+            assert!(RAN.load(Ordering::Relaxed));
+            assert_eq!(n, 1, "interrupted read must restart, not EINTR");
+            assert_eq!(byte, [1u8]);
+        }
+        helper.join().expect("helper thread died");
+
+        // SAFETY: restores the pre-test disposition, mask, and pipe pair.
+        unsafe {
+            libc::sigaction(libc::SIGSEGV, &saved_action, std::ptr::null_mut());
+            libc::pthread_sigmask(libc::SIG_SETMASK, &saved_mask, std::ptr::null_mut());
+            libc::close(fds[0]);
+            libc::close(fds[1]);
         }
     }
 
