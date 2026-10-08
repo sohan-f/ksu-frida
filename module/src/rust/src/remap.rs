@@ -413,10 +413,11 @@ fn install_fault_retry() -> FaultRetry {
         // SAFETY: zeroed `sigaction` is the documented way to build a fresh action; every field used is set before install.
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
         action.sa_sigaction = park_or_forward as *const () as usize;
-        // The kernel restarts interrupted syscalls from the installed action:
-        // inherit RESTART per signal so kill-delivered faults keep app semantics.
+        // The kernel picks the handler stack and syscall restart from the
+        // installed action: inherit both per signal so forwarded faults
+        // keep app semantics instead of forcing wrapper defaults.
         action.sa_flags =
-            libc::SA_SIGINFO | libc::SA_ONSTACK | (current.sa_flags & libc::SA_RESTART);
+            libc::SA_SIGINFO | (current.sa_flags & (libc::SA_ONSTACK | libc::SA_RESTART));
         // SAFETY: installs the fully initialised `action` above; the kernel copies it synchronously.
         if unsafe { libc::sigaction(sig, &raw const action, std::ptr::null_mut()) } != 0 {
             loge_fmt(format_args!(
@@ -981,6 +982,55 @@ mod tests {
             libc::pthread_sigmask(libc::SIG_SETMASK, &saved_mask, std::ptr::null_mut());
             libc::close(fds[0]);
             libc::close(fds[1]);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // real sigaction(2); no Miri shims
+    fn wrapper_inherits_onstack_per_signal() {
+        unsafe extern "C" fn probe(_sig: c_int, _info: *mut libc::siginfo_t, _ctx: *mut c_void) {}
+
+        let _state = lock_state();
+
+        // SAFETY: output buffer for the query below; restored at the end.
+        let mut saved_action: libc::sigaction = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            // SAFETY: query-only call (`act == NULL`).
+            unsafe { libc::sigaction(libc::SIGSEGV, std::ptr::null(), &mut saved_action) },
+            0
+        );
+
+        for (extra, expect_onstack) in [(0, false), (libc::SA_ONSTACK, true)] {
+            // SAFETY: fully initialised below; restored at the end of the test.
+            let mut probe_action: libc::sigaction = unsafe { std::mem::zeroed() };
+            probe_action.sa_sigaction = probe as *const () as usize;
+            probe_action.sa_flags = libc::SA_SIGINFO | extra;
+            assert_eq!(
+                // SAFETY: fully initialised action above.
+                unsafe { libc::sigaction(libc::SIGSEGV, &probe_action, std::ptr::null_mut(),) },
+                0
+            );
+            {
+                let _retry = install_fault_retry();
+                // SAFETY: output buffer for the query below.
+                let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+                assert_eq!(
+                    // SAFETY: query-only call (`act == NULL`).
+                    unsafe { libc::sigaction(libc::SIGSEGV, std::ptr::null(), &mut current) },
+                    0
+                );
+                assert_eq!(
+                    current.sa_flags & libc::SA_ONSTACK != 0,
+                    expect_onstack,
+                    "wrapper must inherit ONSTACK, not force it"
+                );
+                assert_ne!(current.sa_sigaction as usize, probe as *const () as usize);
+            }
+        }
+
+        // SAFETY: restores the pre-test disposition.
+        unsafe {
+            libc::sigaction(libc::SIGSEGV, &saved_action, std::ptr::null_mut());
         }
     }
 
