@@ -260,8 +260,11 @@ fn load_advanced_config(module_dir: &str, app_name: &str) -> Option<TargetConfig
     }
     let bytes = fs::read(format!("{module_dir}/config.json")).ok()?;
 
-    // Byte precheck skips the parse for non-targets; package names are never JSON-escaped.
-    if !contains_bytes(&bytes, app_name.as_bytes()) {
+    // Byte precheck skips the parse for non-targets. A miss is definitive
+    // only without backslashes: `\uXXXX` escapes decode to characters
+    // (e.g. `.`) that never appear literally, so files holding escapes
+    // take the slow path and parse anyway.
+    if !contains_bytes(&bytes, app_name.as_bytes()) && !bytes.contains(&b'\\') {
         return None;
     }
 
@@ -623,6 +626,19 @@ mod tests {
         assert_eq!(strtoul_base10("abc"), 0);
         assert_eq!(strtoul_base10(""), 0);
         assert_eq!(strtoul_base10("-5"), 0);
+    }
+
+    #[test]
+    fn escaped_app_name_resolves() {
+        let dir = TempDir::new("escaped");
+        fs::write(
+            dir.join("config.json"),
+            r#"{"targets":[{"app_name":"com\u002eexample.app","enabled":true,
+                "start_up_delay_ms":0,"injected_libraries":[]}]}"#,
+        )
+        .unwrap();
+        let cfg = load_config(dir.to_str().unwrap(), "com.example.app").expect("escaped config");
+        assert_eq!(cfg.app_name, "com.example.app");
     }
 
     #[test]
