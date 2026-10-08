@@ -739,6 +739,18 @@ fn sibling_config_paths(
     ))
 }
 
+// Sibling config source for a library, if its name takes the suffix.
+fn sibling_config_src(lib_path: &str) -> Option<String> {
+    let (src_dir, lib_name) = split_lib_path(lib_path);
+    sibling_config_paths(src_dir, "", lib_name).map(|(src_cfg, _)| src_cfg)
+}
+
+// A present sibling config must be honored from files: Gadget derives its
+// config path from the loaded path, which a memfd load cannot provide.
+fn prefers_file_staging(lib_path: &str) -> bool {
+    sibling_config_src(lib_path).is_some_and(|src_cfg| std::path::Path::new(&src_cfg).exists())
+}
+
 fn unlink_staged(staged_lib_path: &str) {
     let lib_ok = remove_file(staged_lib_path);
     let cfg_ok = remove_file(&with_config_suffix(staged_lib_path));
@@ -1017,7 +1029,10 @@ pub(crate) fn stage_and_inject(
     scrub_header: bool,
     stage: bool,
 ) {
-    if try_memfd_inject(lib_path, log_context, hide_maps, scrub_header) {
+    // A present sibling config must load from files (see prefers_file_staging).
+    if !prefers_file_staging(lib_path)
+        && try_memfd_inject(lib_path, log_context, hide_maps, scrub_header)
+    {
         return;
     }
     let staged: Option<String> = if stage {
@@ -1101,6 +1116,20 @@ mod tests {
             "/dir.so/libx.config.so"
         );
         assert_eq!(with_config_suffix("./libx.so"), "./libx.config.so");
+    }
+
+    #[test]
+    fn file_staging_preferred_only_with_sibling_config() {
+        let dir = TempDir::new("sibling-pref");
+        let lib = dir.join("libsecmon_com.foo.so");
+        fs::write(&lib, b"x").unwrap();
+        assert!(!prefers_file_staging(lib.to_str().unwrap()));
+        fs::write(dir.join("libsecmon_com.foo.config.so"), b"{}").unwrap();
+        assert!(prefers_file_staging(lib.to_str().unwrap()));
+
+        let plain = dir.join("mylib");
+        fs::write(&plain, b"x").unwrap();
+        assert!(!prefers_file_staging(plain.to_str().unwrap()));
     }
 
     #[test]
