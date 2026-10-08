@@ -739,6 +739,16 @@ fn sibling_config_paths(
     ))
 }
 
+// Symlinks resolve (and hardlinks land arbitrarily) under fd-derived
+// naming, so such sources stage a real file under the configured name.
+fn lib_needs_file_staging(lib_path: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = fs::symlink_metadata(lib_path) else {
+        return false;
+    };
+    meta.file_type().is_symlink() || (meta.is_file() && meta.nlink() > 1)
+}
+
 // Sibling config source for a library, if its name takes the suffix.
 fn sibling_config_src(lib_path: &str) -> Option<String> {
     let (src_dir, lib_name) = split_lib_path(lib_path);
@@ -770,6 +780,20 @@ fn unlink_staged(staged_lib_path: &str) {
 }
 
 pub fn inject_lib(lib_path: &str, log_context: &str, hide_maps: bool, scrub_header: bool) {
+    // The linker derives the loaded path from the fd, resolving symlinks:
+    // hide and verify must use the target path, not a configured alias.
+    let resolved = resolve_lib_path(lib_path);
+    inject_lib_resolved(&resolved, log_context, hide_maps, scrub_header)
+}
+
+// Canonicalize-or-fallback: missing files keep the old behavior below.
+fn resolve_lib_path(lib_path: &str) -> String {
+    fs::canonicalize(lib_path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| lib_path.to_string())
+}
+
+fn inject_lib_resolved(lib_path: &str, log_context: &str, hide_maps: bool, scrub_header: bool) {
     let base = basename(lib_path);
     let c_path = match cstring(lib_path) {
         Ok(c_path) => c_path,
@@ -1021,6 +1045,9 @@ fn try_memfd_inject(
 }
 
 // stage=false injects the source directly; only gated children stage.
+// Symlinked/hardlinked sources always stage: fd-derived names would
+// otherwise break hiding and the sibling config alike.
+// Returns whether injection was attempted.
 pub(crate) fn stage_and_inject(
     lib_path: &str,
     app_name: &str,
@@ -1028,20 +1055,30 @@ pub(crate) fn stage_and_inject(
     hide_maps: bool,
     scrub_header: bool,
     stage: bool,
-) {
+) -> bool {
     // A present sibling config must load from files (see prefers_file_staging).
     if !prefers_file_staging(lib_path)
         && try_memfd_inject(lib_path, log_context, hide_maps, scrub_header)
     {
-        return;
+        return true;
     }
-    let staged: Option<String> = if stage {
+    let do_stage = stage || lib_needs_file_staging(lib_path);
+    let staged: Option<String> = if do_stage {
         stage_gadget(app_name, lib_path)
     } else {
         logi_fmt(format_args!("{log_context}Staging skipped for {lib_path}"));
         None
     };
-    if staged.is_none() && stage {
+    if do_stage && staged.is_none() {
+        if lib_needs_file_staging(lib_path) {
+            // A raw fallback would load under the wrong name: hiding and
+            // the sidecar both key off fd-derived paths. Skip instead.
+            loge_fmt(format_args!(
+                "{log_context}Staging {} failed; skipping injection to preserve hiding and sidecar",
+                basename(lib_path)
+            ));
+            return false;
+        }
         loge_fmt(format_args!(
             "{log_context}Staging {} failed; falling back to the raw path",
             basename(lib_path)
@@ -1058,6 +1095,7 @@ pub(crate) fn stage_and_inject(
     if let Some(staged) = staged.as_deref() {
         unlink_staged(staged);
     }
+    true
 }
 
 fn inject_libs(cfg: &TargetConfig, pid: libc::pid_t) {
@@ -1103,6 +1141,30 @@ mod tests {
     use crate::test_support::TempDir;
 
     #[test]
+    #[cfg_attr(miri, ignore)] // real symlinks are outside miri's filesystem
+    fn resolve_lib_path_follows_alias_but_keeps_missing() {
+        let dir = TempDir::new("resolve");
+        let real = dir.join("real.so");
+        fs::write(&real, b"x").unwrap();
+        std::os::unix::fs::symlink(&real, dir.join("alias.so")).unwrap();
+
+        // The linker will show the target, so hiding must use it too.
+        assert_eq!(
+            resolve_lib_path(dir.join("alias.so").to_str().unwrap()),
+            real.to_str().unwrap().to_string()
+        );
+        // Regular files and missing paths are unchanged.
+        assert_eq!(
+            resolve_lib_path(real.to_str().unwrap()),
+            real.to_str().unwrap().to_string()
+        );
+        assert_eq!(
+            resolve_lib_path(dir.join("missing.so").to_str().unwrap()),
+            dir.join("missing.so").to_str().unwrap().to_string()
+        );
+    }
+
+    #[test]
     fn config_suffix_is_anchored_to_the_basename() {
         assert_eq!(with_config_suffix("libsecmon.so"), "libsecmon.config.so");
         assert_eq!(
@@ -1116,6 +1178,51 @@ mod tests {
             "/dir.so/libx.config.so"
         );
         assert_eq!(with_config_suffix("./libx.so"), "./libx.config.so");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "android"))]
+    #[cfg_attr(miri, ignore)] // real symlinks are outside miri's filesystem
+    fn staging_failure_skips_link_sources() {
+        // Host has no /data cache, so staging always fails here and the
+        // fallback decision below is what is under test.
+        let dir = TempDir::new("skip-link");
+        let real = dir.join("real.so");
+        fs::write(&real, b"x").unwrap();
+        let alias = dir.join("alias.so");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        assert!(!stage_and_inject(
+            alias.to_str().unwrap(),
+            "com.example.app",
+            "[test] ",
+            true,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // real links are outside miri's filesystem
+    fn alias_and_hardlink_sources_need_file_staging() {
+        let dir = TempDir::new("link-stage");
+        let real = dir.join("real.so");
+        fs::write(&real, b"x").unwrap();
+        let alias = dir.join("alias.so");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let hard = dir.join("hard.so");
+        fs::hard_link(&real, &hard).unwrap();
+        let plain = dir.join("plain.so");
+        fs::write(&plain, b"x").unwrap();
+
+        assert!(lib_needs_file_staging(alias.to_str().unwrap()));
+        assert!(lib_needs_file_staging(hard.to_str().unwrap()));
+        // The hard link bumped real.so to nlink 2: d_path may show either.
+        assert!(lib_needs_file_staging(real.to_str().unwrap()));
+        assert!(!lib_needs_file_staging(plain.to_str().unwrap()));
+        assert!(!lib_needs_file_staging(
+            dir.join("missing.so").to_str().unwrap()
+        ));
     }
 
     #[test]
