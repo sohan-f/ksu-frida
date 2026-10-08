@@ -629,6 +629,35 @@ fn remap_matches(query: &str, scrub_header: bool) {
     }
 }
 
+/// Fuzz driver for [`parse_maps_line`] + [`maps_path_matches`]: no panic
+/// on any input, and file queries (containing `/`) match only on the
+/// full stripped path — the exact-match invariant behind the remap fix.
+#[cfg(fuzzing)]
+pub fn fuzz_maps_match(data: &[u8]) {
+    let split = data
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(32.min(data.len()));
+    let query = String::from_utf8_lossy(&data[..split]).into_owned();
+    let rest = if split < data.len() {
+        &data[split + 1..]
+    } else {
+        &[]
+    };
+    let line = String::from_utf8_lossy(rest);
+    if let Some(info) = parse_maps_line(&line) {
+        let matched = maps_path_matches(&info.path, &query);
+        if query.contains('/') {
+            let stripped = info.path.strip_suffix(" (deleted)").unwrap_or(&info.path);
+            assert_eq!(
+                matched,
+                stripped == query,
+                "file queries must compare full paths"
+            );
+        }
+    }
+}
+
 /// Overwrites the ELF identification bytes of the lowest private mapping.
 /// The header always sits at the base of a standard shared object, and the
 /// loader is done with it by the time we run, so nothing reads it back.

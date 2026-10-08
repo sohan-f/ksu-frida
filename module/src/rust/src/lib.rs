@@ -26,6 +26,12 @@ pub fn fuzz_scrub_elf(data: &[u8]) {
     linkmap::fuzz_scrub_elf(data);
 }
 
+// Feeds adversarial maps lines + queries to the remap matcher; only compiled under `cargo fuzz`.
+#[cfg(fuzzing)]
+pub fn fuzz_maps_match(data: &[u8]) {
+    remap::fuzz_maps_match(data);
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::ops::Deref;

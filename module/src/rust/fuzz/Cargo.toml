@@ -26,3 +26,10 @@ path = "fuzz_targets/scrub_elf.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "maps_match"
+path = "fuzz_targets/maps_match.rs"
+test = false
+doc = false
+bench = false
