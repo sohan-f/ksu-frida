@@ -1242,6 +1242,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // Miri-interpreted addresses never appear in host /proc/self/maps
     #[cfg(target_pointer_width = "64")]
     fn gnu_nsyms_counts_chained_symbols() {
         let mut blob = vec![1u32, 1, 1, 0];
