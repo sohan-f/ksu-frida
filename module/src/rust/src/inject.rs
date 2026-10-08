@@ -1,6 +1,4 @@
-use std::ffi::CString;
-#[cfg(any(target_os = "android", test))]
-use std::ffi::c_int;
+use std::ffi::{CStr, CString, c_int};
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -469,19 +467,72 @@ fn split_lib_path(src_lib_path: &str) -> (&str, &str) {
     }
 }
 
-fn remove_stage_dir_contents(dir: &str) {
-    let Ok(entries) = fs::read_dir(dir) else {
+fn remove_stage_dir_contents_at(dirfd: c_int) {
+    // SAFETY: dirfd from `open_stage_dir`; fdopendir takes ownership below.
+    let dirp = unsafe { libc::fdopendir(dirfd) };
+    if dirp.is_null() {
+        // SAFETY: fdopendir failed, so the fd is still ours.
+        unsafe { libc::close(dirfd) };
         return;
-    };
-    for entry in entries.map_while(Result::ok) {
-        if entry
-            .file_type()
-            .map(|t| t.is_file() || t.is_symlink())
-            .unwrap_or(false)
-        {
-            remove_file(&entry.path().to_string_lossy());
-        }
     }
+    // SAFETY: `dirp` live from above; shares its lifetime.
+    let dfd = unsafe { libc::dirfd(dirp) };
+    loop {
+        crate::sys::set_errno(0);
+        // SAFETY: `dirp` live; NULL ends the walk (errno tells error apart).
+        let entry = unsafe { libc::readdir(dirp) };
+        if entry.is_null() {
+            break;
+        }
+        // SAFETY: `d_name` is NUL-terminated by the readdir contract.
+        let name = unsafe { (*entry).d_name.as_ptr() };
+        // SAFETY: read-only borrow of the NUL-terminated name above.
+        let short = unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes();
+        if short == b"." || short == b".." {
+            continue;
+        }
+        // SAFETY: `dfd` live, name from readdir; never follows a final link.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `dfd` live, name from readdir; never follows a final link.
+        if unsafe { libc::fstatat(dfd, name, &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+            continue;
+        }
+        #[allow(clippy::unnecessary_cast)]
+        let (ifmt, ifreg, iflnk) = (
+            libc::S_IFMT as u32,
+            libc::S_IFREG as u32,
+            libc::S_IFLNK as u32,
+        );
+        let fmt = st.st_mode as u32 & ifmt;
+        if fmt != ifreg && fmt != iflnk {
+            continue;
+        }
+        // SAFETY: dirfd-relative unlink; never traverses the entry.
+        unsafe { libc::unlinkat(dfd, name, 0) };
+    }
+    // SAFETY: closes `dirp` and the underlying fd.
+    unsafe { libc::closedir(dirp) };
+}
+
+// The marker must be a real file inside the entry, never a followed link.
+fn stage_marker_is_file(dirfd: c_int) -> bool {
+    // SAFETY: dirfd from `open_stage_dir`; name is a static literal.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: same live dirfd; no-follow stat of one static name.
+    if unsafe {
+        libc::fstatat(
+            dirfd,
+            c".staging".as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return false;
+    }
+    #[allow(clippy::unnecessary_cast)]
+    let (ifmt, ifreg) = (libc::S_IFMT as u32, libc::S_IFREG as u32);
+    st.st_mode as u32 & ifmt == ifreg
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -529,16 +580,48 @@ fn pid_is_alive(pid: libc::pid_t) -> bool {
 }
 
 fn sweep_stale_stage_dirs(cache_dir: &str) {
-    let Ok(entries) = fs::read_dir(cache_dir) else {
+    let Some(c_cache) = stage_cpath(cache_dir) else {
         return;
     };
+    // SAFETY: NUL-terminated path; O_NOFOLLOW rejects a planted .cache link.
+    let cachefd = unsafe {
+        libc::open(
+            c_cache.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if cachefd < 0 {
+        return;
+    }
+    sweep_open_cache_dir(cache_dir, cachefd);
+}
+
+// Takes ownership of `cachefd`, closing it on every path below.
+fn sweep_open_cache_dir(cache_dir: &str, cachefd: c_int) {
+    // SAFETY: owned fd from the caller; fdopendir takes over below.
+    let dirp = unsafe { libc::fdopendir(cachefd) };
+    if dirp.is_null() {
+        // SAFETY: fdopendir failed, so the fd is still ours.
+        unsafe { libc::close(cachefd) };
+        return;
+    }
+    // SAFETY: `dirp` live from above; shares its lifetime.
+    let cfd = unsafe { libc::dirfd(dirp) };
     // SAFETY: `getpid(2)` cannot fail.
     let own_pid = unsafe { libc::getpid() };
+    // Display only; every destructive op below is fd-relative.
     let mut dir = String::new();
-    let mut marker = String::new();
-    for entry in entries.map_while(Result::ok) {
-        let name = entry.file_name();
-        let Some(s) = name.to_str() else {
+    loop {
+        crate::sys::set_errno(0);
+        // SAFETY: `dirp` live; NULL ends the walk (errno tells error apart).
+        let entry = unsafe { libc::readdir(dirp) };
+        if entry.is_null() {
+            break;
+        }
+        // SAFETY: `d_name` is NUL-terminated by the readdir contract.
+        let name = unsafe { (*entry).d_name.as_ptr() };
+        // SAFETY: read-only borrow of the name above.
+        let Ok(s) = unsafe { CStr::from_ptr(name) }.to_str() else {
             continue;
         };
         let Ok(pid) = s.parse::<libc::pid_t>() else {
@@ -547,28 +630,44 @@ fn sweep_stale_stage_dirs(cache_dir: &str) {
         if pid == own_pid {
             continue;
         }
-        dir.clear();
-        dir.push_str(cache_dir);
-        dir.push('/');
-        dir.push_str(s);
-        marker.clear();
-        marker.push_str(&dir);
-        marker.push('/');
-        marker.push_str(STAGE_MARKER);
+        // Real directory only, relative to the cache fd: no traversal at all.
+        // SAFETY: `cfd` live, name from readdir; link plants rejected.
+        let entryfd = unsafe {
+            libc::openat(
+                cfd,
+                name,
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if entryfd < 0 {
+            continue;
+        }
         // Only our stage dirs carry the marker; app-owned numeric dirs stay untouched.
-        if !std::path::Path::new(&marker).exists() {
+        if !stage_marker_is_file(entryfd) {
+            // SAFETY: fd ours from above; marker missing.
+            unsafe { libc::close(entryfd) };
             continue;
         }
         // Liveness last, just before removal: narrows PID-reuse to ns
         // and skips pidfd/kill for unmarked numeric dirs.
         if pid_is_alive(pid) {
+            // SAFETY: as above.
+            unsafe { libc::close(entryfd) };
             continue;
         }
-        remove_stage_dir_contents(&dir);
-        if remove_dir(&dir) {
+        remove_stage_dir_contents_at(entryfd);
+        // Fully fd-relative removal: safe even if the entry is swapped mid-sweep.
+        // SAFETY: `cfd` live, name from readdir; AT_REMOVEDIR fails safe on links.
+        if unsafe { libc::unlinkat(cfd, name, libc::AT_REMOVEDIR) } == 0 {
+            dir.clear();
+            dir.push_str(cache_dir);
+            dir.push('/');
+            dir.push_str(s);
             logi_fmt(format_args!("stage: swept stale dir {dir}"));
         }
     }
+    // SAFETY: closes `dirp` and the underlying fd.
+    unsafe { libc::closedir(dirp) };
 }
 
 // Marker proving a numeric cache subdir is our stage dir: the sweep only enters dirs carrying it.
@@ -1379,6 +1478,57 @@ mod tests {
         assert!(
             std::path::Path::new(&format!("{cache}/{dead}")).exists(),
             "non-empty dir must stay for remove_dir to report"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // uses fork(2) via dead_pid()
+    fn sweep_does_not_follow_planted_symlink() {
+        let stage = TempDir::new("sweep-link");
+        let cache = stage.path().to_str().unwrap().to_string();
+
+        let dead = dead_pid().to_string();
+        let target = format!("{cache}/target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(format!("{target}/victim.bin"), b"app file").unwrap();
+        fs::write(format!("{target}/{STAGE_MARKER}"), b"").unwrap();
+        std::os::unix::fs::symlink(&target, format!("{cache}/{dead}")).unwrap();
+
+        sweep_stale_stage_dirs(&cache);
+
+        assert!(
+            std::path::Path::new(&format!("{target}/victim.bin")).exists(),
+            "planted link target must stay"
+        );
+        assert!(
+            std::fs::symlink_metadata(format!("{cache}/{dead}"))
+                .map(|t| t.file_type().is_symlink())
+                .unwrap_or(false),
+            "planted link itself must stay"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // uses fork(2) via dead_pid()
+    fn sweep_does_not_follow_planted_cache_symlink() {
+        let stage = TempDir::new("sweep-cache-link");
+        let base = stage.path().to_str().unwrap().to_string();
+        let real = format!("{base}/real");
+        fs::create_dir_all(&real).unwrap();
+
+        let dead = dead_pid().to_string();
+        let victim_dir = format!("{real}/{dead}");
+        fs::create_dir_all(&victim_dir).unwrap();
+        fs::write(format!("{victim_dir}/victim.bin"), b"app file").unwrap();
+        fs::write(format!("{victim_dir}/{STAGE_MARKER}"), b"").unwrap();
+        let link = format!("{base}/cache");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        sweep_stale_stage_dirs(&link);
+
+        assert!(
+            std::path::Path::new(&format!("{victim_dir}/victim.bin")).exists(),
+            "link-redirected sweep must stay out"
         );
     }
 
