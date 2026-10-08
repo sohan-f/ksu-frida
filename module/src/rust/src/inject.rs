@@ -692,8 +692,7 @@ fn verify_hiding(lib_path: &str, log_context: &str, hide_maps: bool) {
     }
     let base = basename(lib_path);
     // Linker first (in-memory walk), maps second (file scan), threads last
-    // (directory walk); scrub stops at the first match, so only a full walk
-    // catches a surviving duplicate.
+    // (directory walk); independent of `scrub`, so it catches anything missed.
     if crate::linkmap::is_linker_visible(lib_path, false) {
         loge_fmt(format_args!(
             "{log_context}Hide verify LEAK (linker) for {base}"

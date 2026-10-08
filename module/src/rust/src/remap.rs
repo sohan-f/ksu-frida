@@ -151,9 +151,15 @@ fn is_synchronous_fault(code: c_int) -> bool {
 /// Installed only by [`install_fault_retry`]; `info` comes from the kernel.
 unsafe extern "C" fn park_or_forward(sig: c_int, info: *mut libc::siginfo_t, context: *mut c_void) {
     let start = IN_FLIGHT_START.load(Ordering::Acquire);
+    if start == 0 {
+        // SAFETY: `forward_fault` only chains to actions captured by `install_fault_retry` earlier in this rebuild.
+        unsafe { forward_fault(sig, info, context) };
+        return;
+    }
     // SAFETY: `gettid(2)` takes no arguments, cannot fail and allocates nothing — safe inside a signal handler.
+    // After the early-out above so idle faults skip the syscall.
     let tid = unsafe { libc::gettid() };
-    if start != 0 && tid != REBUILDER_TID.load(Ordering::Relaxed) as c_int {
+    if tid != REBUILDER_TID.load(Ordering::Relaxed) as c_int {
         // SAFETY: plain `c_int` field read of the kernel-provided `siginfo_t`.
         let code = unsafe { (*info).si_code };
         if is_synchronous_fault(code) {

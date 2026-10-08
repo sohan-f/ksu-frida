@@ -97,8 +97,8 @@ struct VisibleSearch {
     leaked: bool,
 }
 
-/// Read-only walk like [`scrub_callback`], but visits every entry: `scrub`
-/// stops at the first match, so a later duplicate would survive it.
+/// Read-only full walk mirroring [`scrub_callback`]; independent check
+/// that nothing still shows the target.
 unsafe extern "C" fn verify_callback(
     info: *mut DlPhdrInfo,
     size: usize,
