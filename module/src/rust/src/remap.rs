@@ -18,6 +18,21 @@ static PREVIOUS_FLAGS: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new
 // fault landing between the two stores above never transmutes a torn pair.
 static PREVIOUS_VERSION: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
 
+// Saved sa_mask bytes, published with handler/flags above; 128B on glibc/Bionic.
+// Single writer under REBUILD_LOCK (the handler only sets the fired flag),
+// readers pair every access with the seqlock version, so the access below is sound.
+struct MaskBytes(std::cell::UnsafeCell<[u8; SIGSET_LEN]>);
+// SAFETY: only `store_mask_bytes` mutates (under REBUILD_LOCK) and every
+// reader is version-gated; no concurrent access is observable.
+unsafe impl Sync for MaskBytes {}
+const SIGSET_LEN: usize = size_of::<libc::sigset_t>();
+static PREVIOUS_MASK: [MaskBytes; 2] = [
+    MaskBytes(std::cell::UnsafeCell::new([0; SIGSET_LEN])),
+    MaskBytes(std::cell::UnsafeCell::new([0; SIGSET_LEN])),
+];
+// Set when a forwarded fault emulates SA_RESETHAND; Drop then leaves DFL.
+static RESETHAND_FIRED: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
+
 #[repr(align(64))]
 struct PaddedUsize(AtomicUsize);
 #[repr(align(64))]
@@ -203,13 +218,17 @@ unsafe fn forward_fault(sig: c_int, info: *mut libc::siginfo_t, context: *mut c_
         return;
     };
 
-    let Some((handler, flags)) = load_previous(index) else {
+    // A fired reset stays fired: later faults in this window take DFL.
+    if RESETHAND_FIRED[index].load(Ordering::Acquire) {
+        // SAFETY: plain `signal(2)`/`raise(2)` on the faulting thread.
+        unsafe { raise_dfl(sig) };
+        return;
+    }
+
+    let Some((handler, flags, mask)) = load_previous(index) else {
         // Torn publish: fail closed via DFL re-raise instead of transmuting.
         // SAFETY: plain `signal(2)`/`raise(2)` on the faulting thread.
-        unsafe {
-            libc::signal(sig, libc::SIG_DFL);
-            libc::raise(sig);
-        }
+        unsafe { raise_dfl(sig) };
         return;
     };
     if handler.addr() == libc::SIG_IGN {
@@ -221,15 +240,28 @@ unsafe fn forward_fault(sig: c_int, info: *mut libc::siginfo_t, context: *mut c_
 
     if handler.addr() == libc::SIG_DFL {
         // SAFETY: plain `signal(2)`/`raise(2)` on the faulting thread; the pending signal is delivered before we return to it.
-        unsafe {
-            libc::signal(sig, libc::SIG_DFL);
-            libc::raise(sig);
-        }
+        unsafe { raise_dfl(sig) };
         return;
     }
 
     let flags = flags as c_int;
-    // SAFETY: handler/flags were read from a real `sigaction` via a seqlock, so the transmuted signature matches the flag branched on below.
+    if flags & libc::SA_RESETHAND != 0 && RESETHAND_FIRED[index].swap(true, Ordering::AcqRel) {
+        // Lost the reset race: the first delivery already claimed the handler.
+        // SAFETY: as above.
+        unsafe { raise_dfl(sig) };
+        return;
+    }
+    // Block the saved mask (+sig unless NODEFER) around the nested call.
+    let mut blocked = mask;
+    if flags & libc::SA_NODEFER == 0 {
+        // SAFETY: pure bit op on our own stack set.
+        unsafe { libc::sigaddset(&mut blocked, sig) };
+    }
+    // SAFETY: plain output slot for the block call below.
+    let mut old: libc::sigset_t = unsafe { std::mem::zeroed() };
+    // SAFETY: async-signal-safe; `old` restored after the nested call.
+    unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut old) };
+    // SAFETY: handler/flags/mask were read from a real `sigaction` via a seqlock, so the transmuted signature matches the flag branched on below.
     unsafe {
         if flags & libc::SA_SIGINFO != 0 {
             let handler: unsafe extern "C" fn(c_int, *mut libc::siginfo_t, *mut c_void) =
@@ -240,12 +272,27 @@ unsafe fn forward_fault(sig: c_int, info: *mut libc::siginfo_t, context: *mut c_
             handler(sig);
         }
     }
+    // SAFETY: paired restore of the block above.
+    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
+}
+
+/// Fail closed via DFL re-raise on the faulting thread.
+///
+/// # Safety
+/// `sig` must be a guarded signal delivered to this thread.
+#[inline]
+unsafe fn raise_dfl(sig: c_int) {
+    // SAFETY: plain `signal(2)`/`raise(2)`; the pending signal lands before return.
+    unsafe {
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
 }
 
 struct RebuildGuard;
 
 #[inline]
-fn load_previous(index: usize) -> Option<(*mut c_void, usize)> {
+fn load_previous(index: usize) -> Option<(*mut c_void, usize, libc::sigset_t)> {
     // Single-atomic publish: odd means the installer is mid-store.
     let v0 = PREVIOUS_VERSION[index].load(Ordering::Acquire);
     if v0 & 1 == 1 {
@@ -259,28 +306,45 @@ fn load_previous(index: usize) -> Option<(*mut c_void, usize)> {
         if v & 1 == 1 {
             return None;
         }
-        let h = PREVIOUS_HANDLER[index].load(Ordering::Relaxed);
-        let f = PREVIOUS_FLAGS[index].load(Ordering::Relaxed);
+        let out = read_previous(index);
         return if v == PREVIOUS_VERSION[index].load(Ordering::Acquire) {
-            Some((h, f))
+            Some(out)
         } else {
             None
         };
     }
-    let h = PREVIOUS_HANDLER[index].load(Ordering::Relaxed);
-    let f = PREVIOUS_FLAGS[index].load(Ordering::Relaxed);
+    let out = read_previous(index);
     if v0 == PREVIOUS_VERSION[index].load(Ordering::Acquire) {
-        Some((h, f))
+        Some(out)
     } else {
         None
     }
 }
 
 #[inline]
-fn publish_previous(index: usize, handler: *mut c_void, flags: usize) {
+fn read_previous(index: usize) -> (*mut c_void, usize, libc::sigset_t) {
+    let handler = PREVIOUS_HANDLER[index].load(Ordering::Relaxed);
+    let flags = PREVIOUS_FLAGS[index].load(Ordering::Relaxed);
+    // SAFETY: single writer under REBUILD_LOCK; version-checked by the caller.
+    let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+    // SAFETY: same contract; every byte lands in `mask`.
+    let dst = unsafe { std::slice::from_raw_parts_mut(&mut mask as *mut _ as *mut u8, SIGSET_LEN) };
+    // SAFETY: same single-writer/version contract as above.
+    let src = unsafe { &*PREVIOUS_MASK[index].0.get() };
+    dst.copy_from_slice(src);
+    (handler, flags, mask)
+}
+
+#[inline]
+fn publish_previous(index: usize, handler: *mut c_void, flags: usize, mask: &libc::sigset_t) {
     PREVIOUS_VERSION[index].fetch_add(1, Ordering::Relaxed);
     PREVIOUS_HANDLER[index].store(handler, Ordering::Relaxed);
     PREVIOUS_FLAGS[index].store(flags, Ordering::Relaxed);
+    // SAFETY: single writer under REBUILD_LOCK; published by the bump below.
+    let src = unsafe { std::slice::from_raw_parts(mask as *const _ as *const u8, SIGSET_LEN) };
+    // SAFETY: same single-writer contract; readers are version-gated.
+    let dst = unsafe { &mut *PREVIOUS_MASK[index].0.get() };
+    dst.copy_from_slice(src);
     PREVIOUS_VERSION[index].fetch_add(1, Ordering::Release);
 }
 
@@ -342,6 +406,7 @@ fn install_fault_retry() -> FaultRetry {
             index,
             std::ptr::with_exposed_provenance_mut(current.sa_sigaction),
             current.sa_flags as usize,
+            &current.sa_mask,
         );
         retry.previous[index] = current;
 
@@ -380,8 +445,18 @@ impl Drop for FaultRetry {
                 continue;
             }
 
-            // SAFETY: only reached when the current handler is still ours; `previous` was saved at install time for this process.
-            unsafe { libc::sigaction(sig, &raw const self.previous[index], std::ptr::null_mut()) };
+            if RESETHAND_FIRED[index].swap(false, Ordering::AcqRel) {
+                // Emulate the kernel reset: leave DFL, not the one-shot handler.
+                // SAFETY: zeroed action is DFL (NULL handler).
+                let dfl: libc::sigaction = unsafe { std::mem::zeroed() };
+                // SAFETY: current handler is still ours (checked above).
+                unsafe { libc::sigaction(sig, &dfl, std::ptr::null_mut()) };
+            } else {
+                // SAFETY: current handler is still ours (checked above); restores the saved action.
+                unsafe {
+                    libc::sigaction(sig, &raw const self.previous[index], std::ptr::null_mut())
+                };
+            }
         }
         REBUILDER_TID.0.store(0, Ordering::Relaxed);
     }
@@ -397,6 +472,9 @@ pub(crate) fn after_fork() {
         if v.load(Ordering::Relaxed) & 1 == 1 {
             v.fetch_add(1, Ordering::Release);
         }
+    }
+    for fired in &RESETHAND_FIRED {
+        fired.store(false, Ordering::Relaxed);
     }
 }
 
@@ -722,12 +800,106 @@ mod tests {
     fn previous_publish_is_single_atomic() {
         let _state = lock_state();
         let h = 0x1234 as *mut c_void;
-        publish_previous(0, h, 7);
-        assert_eq!(load_previous(0), Some((h, 7)));
-        // Odd version fails closed instead of returning a torn pair.
+        // Byte pattern instead of libc set ops (no Miri shims needed).
+        let raw = [0b1010_0101u8; SIGSET_LEN];
+        // SAFETY: any bit pattern stores fine; only round-tripped below.
+        let mask: libc::sigset_t = unsafe { std::mem::transmute(raw) };
+        publish_previous(0, h, 7, &mask);
+        let (rh, rf, rmask) = load_previous(0).expect("published");
+        assert_eq!((rh, rf), (h, 7));
+        // SAFETY: reads our own stack copy as bytes.
+        let back: [u8; SIGSET_LEN] = unsafe { std::mem::transmute(rmask) };
+        assert_eq!(back, raw);
+        // Odd version fails closed instead of returning a torn triple.
         PREVIOUS_VERSION[0].fetch_add(1, Ordering::Relaxed);
-        assert_eq!(load_previous(0), None);
+        assert!(load_previous(0).is_none());
         PREVIOUS_VERSION[0].fetch_add(1, Ordering::Release);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // real sigaction(2)/raise(2); no Miri shims
+    fn forward_applies_mask_and_reset() {
+        use std::sync::atomic::AtomicBool;
+
+        static RAN: AtomicBool = AtomicBool::new(false);
+        static SAW_MASKED: AtomicBool = AtomicBool::new(false);
+
+        unsafe extern "C" fn probe(_sig: c_int, _info: *mut libc::siginfo_t, _ctx: *mut c_void) {
+            // SAFETY: query-only mask read into our own stack slot.
+            let mut cur: libc::sigset_t = unsafe { std::mem::zeroed() };
+            // SAFETY: async-signal-safe query; pure membership test below.
+            unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut cur) };
+            // SAFETY: as above.
+            let masked = unsafe {
+                libc::sigismember(&cur, libc::SIGUSR1) == 1
+                    && libc::sigismember(&cur, libc::SIGSEGV) == 1
+            };
+            RAN.store(true, Ordering::Relaxed);
+            SAW_MASKED.store(masked, Ordering::Relaxed);
+        }
+
+        let _state = lock_state();
+        RAN.store(false, Ordering::Relaxed);
+        SAW_MASKED.store(false, Ordering::Relaxed);
+
+        // SAFETY: query-only mask read on this thread.
+        let mut saved_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+        // SAFETY: scratch set for the unblock below.
+        let mut unblock: libc::sigset_t = unsafe { std::mem::zeroed() };
+        // SAFETY: this-thread mask and set ops only.
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut saved_mask);
+            libc::sigemptyset(&mut unblock);
+            libc::sigaddset(&mut unblock, libc::SIGUSR1);
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &unblock, std::ptr::null_mut());
+        }
+
+        // SAFETY: query-only call below; the old action is restored at the end.
+        let mut saved_action: libc::sigaction = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            // SAFETY: query-only call (`act == NULL`).
+            unsafe { libc::sigaction(libc::SIGSEGV, std::ptr::null(), &mut saved_action) },
+            0
+        );
+        // SAFETY: fully initialised below; restored at the end of the test.
+        let mut probe_action: libc::sigaction = unsafe { std::mem::zeroed() };
+        probe_action.sa_sigaction = probe as *const () as usize;
+        probe_action.sa_mask = unblock;
+        probe_action.sa_flags = libc::SA_SIGINFO | libc::SA_RESETHAND;
+        assert_eq!(
+            // SAFETY: fully initialised action above; installed synchronously.
+            unsafe { libc::sigaction(libc::SIGSEGV, &probe_action, std::ptr::null_mut(),) },
+            0
+        );
+
+        {
+            let _retry = install_fault_retry();
+            // Kill-delivered fault skips parking (garbage si_addr) and forwards.
+            // SAFETY: our handler is installed; the probe only records and returns.
+            unsafe { libc::raise(libc::SIGSEGV) };
+            assert!(RAN.load(Ordering::Relaxed));
+            assert!(SAW_MASKED.load(Ordering::Relaxed));
+            // Reset recorded atomically; the saved payload is untouched.
+            assert!(RESETHAND_FIRED[0].load(Ordering::Relaxed));
+            let (handler, _, _) = load_previous(0).expect("published");
+            assert_ne!(handler.addr(), libc::SIG_DFL);
+        }
+
+        // Drop honored the reset: DFL installed, not the one-shot probe.
+        // SAFETY: output buffer for the query below.
+        let mut after: libc::sigaction = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            // SAFETY: query-only call (`act == NULL`).
+            unsafe { libc::sigaction(libc::SIGSEGV, std::ptr::null(), &mut after) },
+            0
+        );
+        assert_eq!(after.sa_sigaction as usize, libc::SIG_DFL);
+
+        // SAFETY: restores the pre-test disposition and thread mask.
+        unsafe {
+            libc::sigaction(libc::SIGSEGV, &saved_action, std::ptr::null_mut());
+            libc::pthread_sigmask(libc::SIG_SETMASK, &saved_mask, std::ptr::null_mut());
+        }
     }
 
     #[test]
