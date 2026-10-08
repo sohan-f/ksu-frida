@@ -14,6 +14,9 @@ static PREVIOUS_HANDLER: [AtomicPtr<c_void>; 2] = [
     AtomicPtr::new(std::ptr::null_mut()),
 ];
 static PREVIOUS_FLAGS: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
+// Seqlock version: odd = writing, even = stable. Single-atomic publish so a
+// fault landing between the two stores above never transmutes a torn pair.
+static PREVIOUS_VERSION: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
 
 static IN_FLIGHT_START: AtomicUsize = AtomicUsize::new(0);
 // END is stored while START is zero, so non-zero START implies a stable END.
@@ -105,6 +108,11 @@ fn parse_maps_range(line: &str) -> Option<(usize, usize, c_int)> {
 
 fn maps_path_matches(path: &str, query: &str) -> bool {
     let path = path.strip_suffix(" (deleted)").unwrap_or(path);
+    if query.contains('/') {
+        // File load: exact staged path. Basename-only would rebuild a
+        // foreign same-basename lib in another dir.
+        return path == query;
+    }
     path.rsplit_once('/').map_or(path, |(_, base)| base) == query
         || path
             .strip_prefix("/memfd:")
@@ -188,7 +196,15 @@ unsafe fn forward_fault(sig: c_int, info: *mut libc::siginfo_t, context: *mut c_
         return;
     };
 
-    let handler = PREVIOUS_HANDLER[index].load(Ordering::Relaxed);
+    let Some((handler, flags)) = load_previous(index) else {
+        // Torn publish: fail closed via DFL re-raise instead of transmuting.
+        // SAFETY: plain `signal(2)`/`raise(2)` on the faulting thread.
+        unsafe {
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+        }
+        return;
+    };
     if handler.addr() == libc::SIG_IGN {
         // Preserve an explicitly ignored signal. In particular, SIGBUS can
         // be raised asynchronously; converting SIG_IGN to SIG_DFL would
@@ -205,8 +221,8 @@ unsafe fn forward_fault(sig: c_int, info: *mut libc::siginfo_t, context: *mut c_
         return;
     }
 
-    let flags = PREVIOUS_FLAGS[index].load(Ordering::Relaxed) as c_int;
-    // SAFETY: `PREVIOUS_HANDLER`/`PREVIOUS_FLAGS` were read from a real `sigaction`, so the transmuted signature matches the flag branched on below.
+    let flags = flags as c_int;
+    // SAFETY: handler/flags were read from a real `sigaction` via a seqlock, so the transmuted signature matches the flag branched on below.
     unsafe {
         if flags & libc::SA_SIGINFO != 0 {
             let handler: unsafe extern "C" fn(c_int, *mut libc::siginfo_t, *mut c_void) =
@@ -220,6 +236,46 @@ unsafe fn forward_fault(sig: c_int, info: *mut libc::siginfo_t, context: *mut c_
 }
 
 struct RebuildGuard;
+
+#[inline]
+fn load_previous(index: usize) -> Option<(*mut c_void, usize)> {
+    // Single-atomic publish: odd means the installer is mid-store.
+    let v0 = PREVIOUS_VERSION[index].load(Ordering::Acquire);
+    if v0 & 1 == 1 {
+        for _ in 0..1000 {
+            std::hint::spin_loop();
+            if PREVIOUS_VERSION[index].load(Ordering::Relaxed) & 1 == 0 {
+                break;
+            }
+        }
+        let v = PREVIOUS_VERSION[index].load(Ordering::Acquire);
+        if v & 1 == 1 {
+            return None;
+        }
+        let h = PREVIOUS_HANDLER[index].load(Ordering::Relaxed);
+        let f = PREVIOUS_FLAGS[index].load(Ordering::Relaxed);
+        return if v == PREVIOUS_VERSION[index].load(Ordering::Acquire) {
+            Some((h, f))
+        } else {
+            None
+        };
+    }
+    let h = PREVIOUS_HANDLER[index].load(Ordering::Relaxed);
+    let f = PREVIOUS_FLAGS[index].load(Ordering::Relaxed);
+    if v0 == PREVIOUS_VERSION[index].load(Ordering::Acquire) {
+        Some((h, f))
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn publish_previous(index: usize, handler: *mut c_void, flags: usize) {
+    PREVIOUS_VERSION[index].fetch_add(1, Ordering::Relaxed);
+    PREVIOUS_HANDLER[index].store(handler, Ordering::Relaxed);
+    PREVIOUS_FLAGS[index].store(flags, Ordering::Relaxed);
+    PREVIOUS_VERSION[index].fetch_add(1, Ordering::Release);
+}
 
 impl RebuildGuard {
     fn acquire() -> RebuildGuard {
@@ -272,11 +328,11 @@ fn install_fault_retry() -> FaultRetry {
             continue;
         }
 
-        PREVIOUS_HANDLER[index].store(
+        publish_previous(
+            index,
             std::ptr::with_exposed_provenance_mut(current.sa_sigaction),
-            Ordering::Relaxed,
+            current.sa_flags as usize,
         );
-        PREVIOUS_FLAGS[index].store(current.sa_flags as usize, Ordering::Relaxed);
         retry.previous[index] = current;
 
         // SAFETY: zeroed `sigaction` is the documented way to build a fresh action; every field used is set before install.
@@ -326,6 +382,12 @@ pub(crate) fn after_fork() {
     IN_FLIGHT_END.store(0, Ordering::Relaxed);
     REBUILDER_TID.store(0, Ordering::Relaxed);
     REBUILD_LOCK.store(false, Ordering::Release);
+    // Unstick a publish interrupted mid-store: single bump to even.
+    for v in &PREVIOUS_VERSION {
+        if v.load(Ordering::Relaxed) & 1 == 1 {
+            v.fetch_add(1, Ordering::Release);
+        }
+    }
 }
 
 #[inline]
@@ -463,7 +525,7 @@ fn tag_anon(address: *mut c_void, size: usize) {
 }
 
 pub fn remap_lib(lib_path: &str, scrub_header: bool) {
-    remap_matches(basename(lib_path), scrub_header);
+    remap_matches(lib_path, scrub_header);
 }
 
 pub(crate) fn maps_show(query: &str) -> bool {
@@ -493,10 +555,7 @@ pub(crate) fn mapped_perms(start: usize, end: usize) -> Option<c_int> {
 /// source path for fd loads, so basename matching misses them.
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub fn remap_memfd(scrub_header: bool) {
-    #[cfg(any(target_os = "android", test))]
     remap_matches(crate::sys::MEMFD_NAME, scrub_header);
-    #[cfg(not(any(target_os = "android", test)))]
-    remap_matches("dalvik-jit-cache", scrub_header);
 }
 
 fn remap_matches(query: &str, scrub_header: bool) {
@@ -505,7 +564,7 @@ fn remap_matches(query: &str, scrub_header: bool) {
         return;
     }
 
-    logi_fmt(format_args!("Remapping {query}"));
+    logi_fmt(format_args!("Remapping {}", basename(query)));
 
     let _retry = install_fault_retry();
 
@@ -530,14 +589,14 @@ fn remap_matches(query: &str, scrub_header: bool) {
                 tag_anon(address, size);
             }
             Err(RelocateError::Allocate(e)) => {
-                loge_fmt(format_args!("Failed to Allocate Memory: {e}"));
+                loge_fmt(format_args!("remap: allocate failed: {e}"));
                 return;
             }
             Err(RelocateError::Protect(e)) => {
                 loge_fmt(format_args!("remap: cannot read {}: {e}", info.path));
             }
             Err(RelocateError::Commit(e)) => {
-                loge_fmt(format_args!("mremap failed: {e}"));
+                loge_fmt(format_args!("remap: mremap failed: {e}"));
             }
             Err(RelocateError::Restore(e)) => {
                 loge_fmt(format_args!(
@@ -551,16 +610,16 @@ fn remap_matches(query: &str, scrub_header: bool) {
     logi("Remapped");
 
     if scrub_header {
-        scrub_elf_magic(query);
+        scrub_elf_magic_on(&maps, query);
     }
 }
 
 /// Overwrites the ELF identification bytes of the lowest private mapping.
 /// The header always sits at the base of a standard shared object, and the
 /// loader is done with it by the time we run, so nothing reads it back.
-fn scrub_elf_magic(query: &str) {
+fn scrub_elf_magic_on(maps: &[ProcMapsInfo], query: &str) {
     let mut target: Option<(usize, c_int)> = None;
-    for info in get_modules_by_name(query) {
+    for info in maps {
         if !info.private {
             continue;
         }
@@ -576,7 +635,7 @@ fn scrub_elf_magic(query: &str) {
     // SAFETY: `base` is the page-aligned start of a live mapping from the
     // scan above; only its first 16 bytes are touched below.
     if unsafe { wipe_elf_magic_at(base as *mut c_void, perms) } {
-        logi_fmt(format_args!("Scrubbed ELF header for {query}"));
+        logi_fmt(format_args!("Scrubbed ELF header for {}", basename(query)));
     }
 }
 
@@ -614,6 +673,18 @@ unsafe fn wipe_elf_magic_at(base: *mut c_void, perms: c_int) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn previous_publish_is_single_atomic() {
+        let _state = lock_state();
+        let h = 0x1234 as *mut c_void;
+        publish_previous(0, h, 7);
+        assert_eq!(load_previous(0), Some((h, 7)));
+        // Odd version fails closed instead of returning a torn pair.
+        PREVIOUS_VERSION[0].fetch_add(1, Ordering::Relaxed);
+        assert_eq!(load_previous(0), None);
+        PREVIOUS_VERSION[0].fetch_add(1, Ordering::Release);
+    }
 
     #[test]
     #[cfg_attr(miri, ignore)] // mmap(2)/mprotect(2) have no Miri shims
@@ -686,10 +757,17 @@ mod tests {
 
     #[test]
     fn maps_path_match_is_exact_and_handles_memfd_names() {
-        assert!(maps_path_matches("/data/app/libfoo.so", "libfoo.so"));
+        assert!(maps_path_matches(
+            "/data/app/libfoo.so",
+            "/data/app/libfoo.so"
+        ));
         assert!(maps_path_matches(
             "/data/app/libfoo.so (deleted)",
-            "libfoo.so"
+            "/data/app/libfoo.so"
+        ));
+        assert!(!maps_path_matches(
+            "/data/app/other/libfoo.so",
+            "/data/app/libfoo.so"
         ));
         assert!(!maps_path_matches("/data/app/libfoo.so.1", "libfoo.so"));
         assert!(!maps_path_matches(

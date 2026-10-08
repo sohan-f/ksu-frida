@@ -553,7 +553,7 @@ fn sweep_stale_stage_dirs(cache_dir: &str) {
         }
         remove_stage_dir_contents(&dir);
         if remove_dir(&dir) {
-            logi_fmt(format_args!("Swept stale stage dir {dir}"));
+            logi_fmt(format_args!("stage: swept stale dir {dir}"));
         }
     }
 }
@@ -697,7 +697,7 @@ fn verify_hiding(lib_path: &str, log_context: &str, hide_maps: bool) {
         loge_fmt(format_args!(
             "{log_context}Hide verify LEAK (linker) for {base}"
         ));
-    } else if crate::remap::maps_show(base) {
+    } else if crate::remap::maps_show(lib_path) {
         loge_fmt(format_args!(
             "{log_context}Hide verify LEAK (maps) for {base}"
         ));
