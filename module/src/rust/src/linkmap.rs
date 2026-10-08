@@ -71,8 +71,8 @@ unsafe extern "C" fn scrub_callback(
         );
     }
     search.found = true;
-    // Stop at the first match; each staged lib rescans, so later calls converge on later entries.
-    1
+    // Continue past matches: duplicate entries (isolated namespaces) all need scrubbing.
+    0
 }
 
 #[inline(always)]
@@ -863,7 +863,7 @@ mod tests {
         // SAFETY: both entries are live owned strings; `search` outlives them.
         unsafe {
             assert_eq!(scrub_callback(&raw mut first_entry, entry_size(), data), 0);
-            assert_eq!(scrub_callback(&raw mut second_entry, entry_size(), data), 1);
+            assert_eq!(scrub_callback(&raw mut second_entry, entry_size(), data), 0);
         }
 
         assert!(search.found);
@@ -874,6 +874,36 @@ mod tests {
             assert_eq!(CStr::from_ptr(second).to_bytes(), b"libnative_1234.so");
             free_cstring(first, 19);
             free_cstring(second, 43);
+        }
+    }
+
+    #[test]
+    fn callback_scrubs_duplicate_entries() {
+        let first = raw_cstring("/data/libsecmon.so");
+        let second = raw_cstring("/data/libsecmon.so");
+        let mut first_entry = entry(first);
+        let mut second_entry = entry(second);
+        let mut search = ScrubSearch {
+            target: b"/data/libsecmon.so".to_vec(),
+            replacement: b"libnative_1.so".to_vec(),
+            found: false,
+            soname: false,
+            symbols: 0,
+            substring: false,
+        };
+        let data = (&raw mut search).cast::<c_void>();
+        // SAFETY: both entries are live owned strings; `search` outlives them.
+        unsafe {
+            assert_eq!(scrub_callback(&raw mut first_entry, entry_size(), data), 0);
+            assert_eq!(scrub_callback(&raw mut second_entry, entry_size(), data), 0);
+        }
+        assert!(search.found);
+        // SAFETY: read-only checks, then freed with original lengths (17 each).
+        unsafe {
+            assert_eq!(CStr::from_ptr(first).to_bytes(), b"libnative_1.so");
+            assert_eq!(CStr::from_ptr(second).to_bytes(), b"libnative_1.so");
+            free_cstring(first, 17);
+            free_cstring(second, 17);
         }
     }
 
@@ -1106,7 +1136,7 @@ mod tests {
                     entry_size(),
                     (&raw mut search).cast::<c_void>()
                 ),
-                1
+                0
             );
         }
         assert!(search.found);
