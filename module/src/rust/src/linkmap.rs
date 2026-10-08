@@ -954,6 +954,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // dl_iterate_phdr(3) has no Miri shim
     fn null_dlpi_name_is_ignored() {
         let mut null_entry = entry(std::ptr::null());
         let mut search = ScrubSearch {
