@@ -81,10 +81,11 @@ fn prot_from_perms(perms: &str) -> c_int {
 
 #[inline]
 fn parse_maps_line(line: &str) -> Option<ProcMapsInfo> {
-    // The kernel separates the five fixed fields with single spaces, but the
-    // pathname itself may contain spaces (shown unescaped), so split 6 ways.
-    // Only the line terminator is stripped: newlines arrive octal-escaped,
-    // so a literal `\n` here is never pathname content.
+    // The five fixed fields are single-space separated; the kernel pads the
+    // gap before the pathname to a fixed column, so only leading whitespace
+    // is stripped there. Pathnames never start with whitespace (absolute,
+    // bracketed, or empty), but trailing spaces are data. Newlines arrive
+    // octal-escaped, so a literal `\n` is only ever the line terminator.
     let line = line.strip_suffix('\n').unwrap_or(line);
     let mut parts = line.trim_start().splitn(6, ' ');
     let (range, perms, _, _, _, path) = (
@@ -113,7 +114,7 @@ fn parse_maps_line(line: &str) -> Option<ProcMapsInfo> {
         end,
         perms: prot,
         private,
-        path: path.to_string(),
+        path: path.trim_start().to_string(),
     })
 }
 
@@ -642,7 +643,27 @@ unsafe fn relocate_segment(
     // mapping from `mmap` without `FIXED` — both `size` bytes and non-overlapping.
     unsafe {
         std::ptr::copy_nonoverlapping(address as *const u8, map as *mut u8, size);
+    }
 
+    // Apply the intended protections to the scratch before committing: if
+    // policy denies them here, the original mapping is still intact and we
+    // abort instead of stranding a half-protected replacement.
+    // SAFETY: `map`/`size` are ours from the `mmap` above.
+    if unsafe { libc::mprotect(map, size, perms) } != 0 {
+        let err = io::Error::last_os_error();
+        if copy_prot != perms {
+            // SAFETY: same range frozen above; best-effort repair of a partial apply.
+            unsafe { libc::mprotect(address, size, perms) };
+        }
+        end_rebuild();
+        // SAFETY: as above; best-effort cleanup, result deliberately ignored.
+        unsafe { libc::munmap(map, size) };
+        return Err(RelocateError::Restore(err));
+    }
+
+    // SAFETY: `map` is ours and `address`/`size` describe the live target;
+    // FIXED transplants the already-correctly-protected scratch over it.
+    unsafe {
         let moved = crate::sys::mremap(
             map,
             size,
@@ -1539,6 +1560,15 @@ mod tests {
             parse_maps_line("7ac49c2000-7ac4a26000 r--p 00000000 00:00 0 /data/x/libfoo.so\n")
                 .expect("line");
         assert_eq!(info.path, "/data/x/libfoo.so");
+
+        // Kernel-faithful padding between the inode column and the path.
+        let info = parse_maps_line(
+            "762e1cc000-762e1cd000 rw-s 00000000 00:148 6171                          /tmp/seg.bin\n",
+        )
+        .expect("line");
+        assert_eq!(info.start, 0x762e1cc000);
+        assert!(!info.private);
+        assert_eq!(info.path, "/tmp/seg.bin");
     }
 
     #[test]
@@ -1659,6 +1689,70 @@ mod tests {
                 (libc::PROT_READ, true),
                 "protections restored"
             );
+
+            assert_eq!(libc::munmap(address, SIZE), 0);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // mmap(2)/mprotect(2)/mremap(2) have no Miri shims
+    fn relocate_aborted_before_commit_keeps_original() {
+        use crate::test_support::TempDir;
+
+        let _state = lock_state();
+        const SIZE: usize = 4096;
+        let expected: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8).collect();
+
+        let _retry = install_fault_retry();
+
+        // File-backed on purpose: only the pathname tells an aborted
+        // rebuild (mapping intact) from a committed one (anon transplant).
+        let dir = TempDir::new("relocate-abort");
+        let file = dir.join("seg.bin");
+        std::fs::write(&file, &expected).unwrap();
+        // SAFETY: fresh file mapping owned by this test; failure asserted inside.
+        unsafe {
+            let fd = libc::open(
+                crate::sys::cstring(file.to_str().unwrap())
+                    .unwrap()
+                    .as_ptr(),
+                libc::O_RDWR,
+            );
+            assert!(fd >= 0, "{}", io::Error::last_os_error());
+            let address = libc::mmap(
+                std::ptr::null_mut(),
+                SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            );
+            assert_ne!(address, libc::MAP_FAILED, "{}", io::Error::last_os_error());
+            assert_eq!(libc::close(fd), 0);
+
+            // Bogus protections: the pre-commit mprotect must fail (EINVAL)
+            // while the original file mapping is still intact.
+            let err = relocate_segment(address, SIZE, 0x1000, "/test/libbogus.so").unwrap_err();
+            assert!(
+                matches!(err, RelocateError::Restore(_)),
+                "unexpected error: {err:?}"
+            );
+            let after = std::slice::from_raw_parts(address as *const u8, SIZE);
+            assert_eq!(after, &expected[..], "original bytes must survive");
+            // Intactness here means identity, not protections: the request
+            // itself is invalid, so the best-effort restore has nothing
+            // valid to apply. Only the pathname tells an aborted rebuild
+            // (file mapping intact) from a committed one (anon transplant).
+            let mut seen_path = false;
+            for line in std::fs::read_to_string("/proc/self/maps").unwrap().lines() {
+                if let Some(info) = parse_maps_line(line)
+                    && info.start == address as usize
+                {
+                    assert_eq!(info.path, file.to_str().unwrap());
+                    seen_path = true;
+                }
+            }
+            assert!(seen_path, "file mapping must still be mapped");
 
             assert_eq!(libc::munmap(address, SIZE), 0);
         }
