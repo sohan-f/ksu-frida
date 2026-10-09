@@ -1247,6 +1247,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // raw openat2(2) has no Miri shim
     fn sibling_copy_tolerates_absence_but_not_failure() {
         let dir = TempDir::new("sibling-copy");
         let missing = dir.join("lib.config.so");
