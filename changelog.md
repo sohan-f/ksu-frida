@@ -1,3 +1,11 @@
+# v2.12.0
+- Hardened library hiding against signal and process edge cases during remapping
+- Honored the target map-hiding setting in forked child processes
+- Loaded per-target gadget configs reliably across staged, symlinked, and child injections
+- Skipped injection cleanly when staging fails instead of loading the wrong file
+- Treated unreadable sidecar configs as failures instead of silently ignoring them
+- Adopted Frida gadget 17.23.1 with hash-verified downloads
+
 # v2.11.0
 - Verified hiding after every injection and reported any leftover traces in verbose logs
 - Renamed injected thread names to blend in with system threads
