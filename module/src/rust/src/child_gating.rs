@@ -106,7 +106,9 @@ unsafe extern "C" fn fork_replacement() -> libc::pid_t {
 }
 
 fn fork_inner() -> libc::pid_t {
-    let orig_ptr = ORIG_FORK.load(Ordering::Acquire);
+    // The patch lands before our store publishes; a fork in that gap
+    // waits briefly instead of failing the spawn.
+    let orig_ptr = crate::sys::wait_for_hook_origin(&ORIG_FORK);
     if orig_ptr.is_null() {
         logi("[child_gating] fork hook fired before its origin was published");
         set_errno(libc::EAGAIN);

@@ -50,7 +50,9 @@ unsafe extern "C" fn setname_replacement(thread: libc::pthread_t, name: *const c
 }
 
 fn setname_inner(thread: libc::pthread_t, name: *const c_char) -> c_int {
-    let orig_ptr = ORIG_SETNAME.load(Ordering::Acquire);
+    // Same patch/store gap as the fork hook: wait briefly, then fail the
+    // rename (the thread keeps a neutral default) instead of racing it.
+    let orig_ptr = crate::sys::wait_for_hook_origin(&ORIG_SETNAME);
     if orig_ptr.is_null() {
         // No origin yet: skip the rename (the thread keeps a neutral
         // default) instead of proceeding unwatched. Silent by design:

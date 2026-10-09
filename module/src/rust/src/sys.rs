@@ -272,9 +272,69 @@ pub fn lookup_symbol(name: &CStr) -> Option<*mut c_void> {
     if addr.is_null() { None } else { Some(addr) }
 }
 
+// Spins for a hook trampoline published between patching and our store; a
+// hook call landing in that gap waits instead of failing the operation.
+// Bounded: a failed install never publishes, so waiting forever is wrong.
+// The gap is straight-line code after the hook call returns; a hundred
+// thousand spins covers it by orders of magnitude while keeping both the
+// failure path and contended readers in the microsecond range.
+const HOOK_PUBLISH_SPIN: u32 = 100_000;
+
+pub fn wait_for_hook_origin(origin: &std::sync::atomic::AtomicPtr<c_void>) -> *mut c_void {
+    use std::sync::atomic::Ordering::{Acquire, Relaxed};
+    let mut ptr = origin.load(Relaxed);
+    for i in 0..HOOK_PUBLISH_SPIN {
+        if !ptr.is_null() {
+            break;
+        }
+        // Yield periodically: a pure spin would starve the descheduled
+        // installer this wait is for. Not signal context, so this is safe.
+        if i & 1023 == 0 {
+            // SAFETY: plain syscall; no locks held, no invariants.
+            unsafe { libc::sched_yield() };
+        }
+        std::hint::spin_loop();
+        ptr = origin.load(Relaxed);
+    }
+    // Single Acquire so observing the pointer synchronizes with the
+    // Release publish (the loop above intentionally stays Relaxed).
+    origin.load(Acquire)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicPtr;
+
+    #[test]
+    fn hook_origin_wait_times_out_to_null() {
+        static ORIGIN: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+        assert!(wait_for_hook_origin(&ORIGIN).is_null());
+    }
+
+    #[test]
+    fn hook_origin_wait_picks_up_late_publication() {
+        static ORIGIN: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+        let published = 0x1234 as *mut c_void;
+        // Scheduling may delay the setter past one bound; retry keeps the
+        // test deterministic (bounded rounds, never hangs).
+        for _ in 0..20 {
+            ORIGIN.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Relaxed);
+            let found = std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    ORIGIN.store(0x1234 as *mut c_void, std::sync::atomic::Ordering::Release);
+                });
+                wait_for_hook_origin(&ORIGIN) == published
+            });
+            if found {
+                ORIGIN.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        }
+        // Unreachable unless the scheduler starves the setter twenty times.
+        panic!("late publication never observed");
+    }
 
     #[test]
     fn cstring_accepts_ordinary_paths() {

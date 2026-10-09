@@ -408,7 +408,15 @@ impl Drop for RebuildGuard {
 struct FaultRetry {
     previous: [libc::sigaction; 2],
     installed: [bool; 2],
+    guarded: [bool; 2],
     _rebuild: RebuildGuard,
+}
+
+impl FaultRetry {
+    /// True only when every guarded signal is parked by our handler.
+    fn guards_active(&self) -> bool {
+        self.guarded == [true, true]
+    }
 }
 
 fn install_fault_retry() -> FaultRetry {
@@ -416,6 +424,7 @@ fn install_fault_retry() -> FaultRetry {
         // SAFETY: `libc::sigaction` is a plain FFI struct — all-zeroed is a valid starting state.
         previous: std::array::from_fn(|_| unsafe { std::mem::zeroed() }),
         installed: [false; 2],
+        guarded: [false; 2],
         _rebuild: RebuildGuard::acquire(),
     };
     // SAFETY: `gettid(2)` cannot fail.
@@ -437,6 +446,7 @@ fn install_fault_retry() -> FaultRetry {
 
         if current.sa_sigaction as usize == park_or_forward as *const () as usize {
             retry.previous[index] = current;
+            retry.guarded[index] = true;
             continue;
         }
 
@@ -465,6 +475,7 @@ fn install_fault_retry() -> FaultRetry {
             continue;
         }
         retry.installed[index] = true;
+        retry.guarded[index] = true;
     }
 
     retry
@@ -730,6 +741,15 @@ fn remap_matches(query: &str, scrub_header: bool) {
     logi_fmt(format_args!("Remapping {}", basename(query)));
 
     let _retry = install_fault_retry();
+    // Without parked faults a concurrent write reaches the app handler;
+    // fail closed (visible but alive) instead of risking a crash.
+    if !_retry.guards_active() {
+        loge_fmt(format_args!(
+            "remap: fault guard unavailable for {}; skipping",
+            basename(query)
+        ));
+        return;
+    }
 
     let mut seen_start = Vec::with_capacity(maps.len());
     for info in &maps {
@@ -865,6 +885,16 @@ unsafe fn wipe_elf_magic_at(base: *mut c_void, perms: c_int) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // sigaction(2) has no Miri shim
+    fn install_reports_active_guards() {
+        let _state = lock_state();
+        {
+            let retry = install_fault_retry();
+            assert!(retry.guards_active());
+        }
+    }
 
     #[test]
     fn previous_publish_is_single_atomic() {
