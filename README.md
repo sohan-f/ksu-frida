@@ -1,75 +1,106 @@
+<div align="center">
+
 # KsuFrida
 
-Frida gadget injection module for KernelSU via Zygisk (API v5).
+Frida gadget injection for KernelSU, via Zygisk.
 
-- Gadget is not embedded into the APK — APK integrity/signature checks still pass
-- No ptrace — avoids ptrace-based detection
-- Library remapping hides injected libraries from /proc/self/maps
-- Configurable injection delay, child gating, and multiple library injection
-- WebUI for managing targets from KernelSU Manager
+[![Release](https://img.shields.io/github/v/release/sohan-f/ksu-frida)](https://github.com/sohan-f/ksu-frida/releases)
+[![CI](https://github.com/sohan-f/ksu-frida/actions/workflows/ci.yml/badge.svg)](https://github.com/sohan-f/ksu-frida/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-## Prerequisites
+</div>
 
-- KernelSU (KernelSU-Next supported; Magisk/APatch are not targeted)
-- A Zygisk provider implementing **Zygisk API v5**: [ReZygisk](https://github.com/PerformanC/ReZygisk) or a recent Zygisk Next
+Loads the gadget from disk at app start. App signatures stay intact. No ptrace. Injected libraries are hidden from `/proc/self/maps` and the linker tables.
 
-## Quick Start
+**Contents**
 
-1. Download the latest release from the [Releases](https://github.com/sohan-f/ksu-frida/releases) page
-2. Install the ZIP via KernelSU Manager
-3. Reboot
+- [Requirements](#requirements)
+- [Install](#install)
+- [Use](#use)
+- [Files on device](#files-on-device)
+- [Build](#build)
+- [Troubleshoot](#troubleshoot)
+- [Credits](#credits)
 
-### Option A: WebUI (KernelSU only)
+## Requirements
 
-Open KernelSU Manager → Modules → KsuFrida → WebUI. Add target apps, configure delay, toggle child
-gating, watch module/gadget status, restart targets to apply changes, validate configs before
-saving, copy the exact connect commands for the ports your gadgets picked, refresh the gadget
-binary from the bundled payload, and check for gadget updates from the knox-frida-patcher
-releases (the gadget ships separately from this module).
+| Need | Notes |
+|------|-------|
+| KernelSU or KernelSU-Next | Magisk and APatch are not supported |
+| Zygisk provider with API v5 | [ReZygisk](https://github.com/PerformanC/ReZygisk) or recent Zygisk Next |
+| Android 12 or newer | API 31 minimum |
 
-Each target can optionally have its own gadget port and Frida Gadget JSON config. Set a dedicated
-port in that target's details to give it an isolated gadget config; edit the JSON there to use a
-different script or interaction mode. Targets without a dedicated port keep using the shared
-`libsecmon.so` gadget and its default config. Dedicated ports must be unique across targets.
-Targets that inject the 32-bit gadget (`libsecmon32.so`) get a matching 32-bit pair on save.
+## Install
 
-### Option B: Manual config
+1. Get the ZIP from [Releases](https://github.com/sohan-f/ksu-frida/releases).
+2. Install it in KernelSU Manager.
+3. Reboot.
 
-```shell
-adb shell su -c 'cp /data/local/tmp/libsec/config.json.example /data/local/tmp/libsec/config.json'
-adb shell su -c "sed -i 's/com.example.package/your.target.app/' /data/local/tmp/libsec/config.json"
-```
+> [!NOTE]
+> Zygisk loads at zygote start, so the module does nothing until reboot.
 
-### Connecting
+## Use
 
-The default gadget config uses **listen mode** on port 27042. After opening the target app:
+### WebUI
+
+Open KernelSU Manager > Modules > KsuFrida > WebUI.
+
+| Tab | What it does |
+|-----|--------------|
+| Targets | Add or remove apps, set delay and child gating |
+| Status | Module state, gadget version, running targets |
+| Gadget | Refresh the binary, check for updates |
+
+A target can have its own port and gadget config. Set a port in the target details to give it a private config file. Targets with no port share `libsecmon.so` and the default config. Ports must be unique. 32-bit targets get a matching 32-bit pair on save.
+
+### Connect
+
+The default config listens on `127.0.0.1:27042`. Start the target app, then run:
 
 ```shell
 adb forward tcp:27042 tcp:27042
 frida -H 127.0.0.1:27042 -n Gadget -l your_script.js
 ```
 
-For a target with its own port, use the connect command shown in that target's details. Each app can
-then run at the same time and listen on its own port.
+For a target with its own port, use the command shown in its WebUI details.
 
-## Configuration
+### Manual setup
 
-Config files are stored at `/data/local/tmp/libsec/`:
+<details>
+<summary>Set up <code>config.json</code> by hand</summary>
 
-| File | Purpose |
-|------|---------|
-| `config.json` | Target apps, delay, child gating settings |
-| `libsecmon.config.so` | Frida gadget config (listen/script mode) |
-| `libsecmon.so` | Frida gadget binary (auto-installed) |
+```shell
+adb shell su -c 'cp /data/local/tmp/libsec/config.json.example /data/local/tmp/libsec/config.json'
+adb shell su -c "sed -i 's/com.example.package/your.target.app/' /data/local/tmp/libsec/config.json"
+```
+
+Full field reference: [`docs/advanced_config.md`](docs/advanced_config.md). Legacy file-based setup: [`docs/simple_config.md`](docs/simple_config.md).
+
+</details>
+
+## Files on device
+
+All state lives in `/data/local/tmp/libsec/`:
+
+| File | Use |
+|------|-----|
+| `config.json` | Target apps, delay, child gating |
+| `libsecmon.so` | Gadget binary, 64-bit |
+| `libsecmon32.so` | Gadget binary, 32-bit |
+| `libsecmon.config.so` | Shared gadget config (listen on 27042) |
+| `libsecmon_<app>.so` | Per-target copy, only when a custom port is set |
+| `verbose` | Touch this file to enable logcat output |
 
 Example `config.json`:
+
 ```json
 {
     "targets": [
         {
             "app_name": "com.example.app",
             "enabled": true,
-            "start_up_delay_ms": 0,
+            "hide_maps": true,
+            "start_up_delay_ms": 100,
             "injected_libraries": [
                 { "path": "/data/local/tmp/libsec/libsecmon.so" }
             ],
@@ -83,47 +114,58 @@ Example `config.json`:
 }
 ```
 
-## Building
+> [!TIP]
+> Keep the delay at 100 ms or higher. Lower values can stall app startup.
 
-Prerequisites:
+## Build
 
-- Android SDK with NDK
-- Rust stable toolchain with the Android targets and [cargo-ndk](https://crates.io/crates/cargo-ndk):
+<details>
+<summary>Build steps and gadget pins</summary>
+
+You need the Android SDK with NDK, plus Rust stable and `cargo-ndk`:
 
 ```shell
 rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
 cargo install cargo-ndk
 ```
 
+Build the ZIP:
+
 ```shell
 ./gradlew :module:assembleRelease
 ```
 
-The Gradle build compiles the Rust core (`module/src/rust`: config parsing, injection
-staging, remapping, child-gating policy) via cargo-ndk and links it into the C++
-Zygisk shell (`module/src/jni`: Zygisk ABI entry + Dobby hook shim) automatically.
+The ZIP lands in `out/`. To build, flash, and reboot in one step:
 
-Output ZIP will be in the `out/` directory.
-
-To build, install and reboot directly:
 ```shell
 ./gradlew :module:flashAndRebootZygiskRelease
 ```
 
-### Gadget pins
+The Gradle build compiles `module/src/rust` with cargo-ndk and links it into the Zygisk library in `module/src/jni`.
 
-The Frida gadget is fetched from the [knox-frida-patcher](https://github.com/sohan-f/knox-frida-patcher)
-releases, but builds never follow "latest" silently: `gadget-pins.json` at the repo root pins the
-exact version plus the SHA-256 of each arch asset. `fetchGadget` cross-checks the release metadata
-against the pins and verifies every downloaded byte; any mismatch fails the build. The WebUI updater
-on-device enforces the same hashes before installing.
+**Gadget version.** The gadget comes from [knox-frida-patcher](https://github.com/sohan-f/knox-frida-patcher) releases. Version and SHA-256 per arch are pinned in `gadget-pins.json`. The build checks the hashes and stops on mismatch. The WebUI updater checks the same hashes on device. To move to a new gadget, copy the version and digests from the release `gadget.json` into `gadget-pins.json` and rebuild.
 
-To adopt a new gadget version, copy the version and digests from the release `gadget.json`
-(or `SHA256SUMS` asset) into `gadget-pins.json` and rebuild.
+</details>
+
+## Troubleshoot
+
+The module stays silent in logcat unless verbose mode is on:
+
+```shell
+adb shell su -c 'touch /data/local/tmp/libsec/verbose'
+adb logcat -s KsuFrida
+```
+
+Checklist:
+
+- Rebooted after flash
+- Target app restarted after config save
+- Target package name spelled exactly as in the app manifest
+- No port shared by two targets
 
 ## Credits
 
-- [lico-n](https://github.com/lico-n) — Original author of [ZygiskFrida](https://github.com/lico-n/ZygiskFrida)
-- [electrondefuser](https://github.com/electrondefuser) — Library remapper, child gating, advanced config system
+- [lico-n](https://github.com/lico-n): original [ZygiskFrida](https://github.com/lico-n/ZygiskFrida)
+- [electrondefuser](https://github.com/electrondefuser): remapper, child gating, config system
 - [xDL](https://github.com/hexhacking/xDL)
-- Inspired by [Zygisk-Il2CppDumper](https://github.com/Perfare/Zygisk-Il2CppDumper)
+- [Zygisk-Il2CppDumper](https://github.com/Perfare/Zygisk-Il2CppDumper) for reference
