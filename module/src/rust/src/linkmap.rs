@@ -11,6 +11,7 @@ struct ScrubSearch {
     symbols: usize,
     substring: bool,
     memfd: bool,
+    unrestored: bool,
 }
 
 /// # Safety
@@ -63,9 +64,10 @@ unsafe extern "C" fn scrub_callback(
     // SAFETY: `info` is the matched live entry; the callee bounds every
     // read by the linker's own tables and truncates writes to measured
     // footprints.
-    let (soname, symbols) = unsafe { scrub_elf_metadata(info, &search.replacement) };
+    let (soname, symbols, restored) = unsafe { scrub_elf_metadata(info, &search.replacement) };
     search.soname = soname;
     search.symbols = symbols;
+    search.unrestored = search.unrestored || !restored;
     // SAFETY: `dlpi_name` is the linker's heap copy of the loaded path; its
     // known footprint is `current.len() + 1`, which is all we ever touch.
     unsafe {
@@ -507,6 +509,17 @@ impl WritableWindow {
         // would otherwise widen onto neighbor mappings, and the restore
         // below would clobber their protections.
         let perms = crate::remap::mapped_perms(addr, end)?;
+        // Never widen an executable range: restoring exec is where device
+        // policy says no, and a writable leftover there is the worst residue.
+        if perms & libc::PROT_EXEC != 0 {
+            loge_fmt(format_args!(
+                "linkmap: refusing executable {label} window {addr:#x}+{len:#x}"
+            ));
+            return None;
+        }
+        logi_fmt(format_args!(
+            "linkmap: {label} window {addr:#x}+{len:#x} perms {perms:#x}"
+        ));
         let start = addr & !(page - 1);
         let end = end.checked_add(page - 1)? & !(page - 1);
         // SAFETY: page-aligned range around caller-owned data; checked below.
@@ -531,17 +544,40 @@ impl WritableWindow {
             label,
         })
     }
+
+    /// Restores protections, reporting whether anything is left writable.
+    fn close(self) -> bool {
+        // SAFETY: the range `open` flipped; same restore as `Drop` below.
+        let ok = unsafe { libc::mprotect(self.start as *mut c_void, self.len, self.perms) } == 0;
+        if !ok {
+            loge_fmt(format_args!(
+                "linkmap: cannot re-protect {} {:#x}+{:#x} perms {:#x}: {}",
+                self.label,
+                self.start,
+                self.len,
+                self.perms,
+                std::io::Error::last_os_error()
+            ));
+        }
+        std::mem::forget(self);
+        ok
+    }
 }
 
 impl Drop for WritableWindow {
     fn drop(&mut self) {
+        // Safety net for early returns: `close` forgets, so this only
+        // runs when the caller never reached it.
         // SAFETY: the range `open` flipped; best-effort restore of the
         // protections it had (a blanket PROT_READ would strip neighbors
         // sharing the rounded pages).
         if unsafe { libc::mprotect(self.start as *mut c_void, self.len, self.perms) } != 0 {
             loge_fmt(format_args!(
-                "linkmap: cannot re-protect {}: {}",
+                "linkmap: cannot re-protect {} {:#x}+{:#x} perms {:#x}: {}",
                 self.label,
+                self.start,
+                self.len,
+                self.perms,
                 std::io::Error::last_os_error()
             ));
         }
@@ -612,12 +648,12 @@ unsafe fn scrub_tables(
 /// # Safety
 /// `info` must be a live linker entry (only called from [`scrub_callback`]
 /// on a match); `replacement` is truncated to every footprint it touches.
-unsafe fn scrub_elf_metadata(info: *mut DlPhdrInfo, replacement: &[u8]) -> (bool, usize) {
+unsafe fn scrub_elf_metadata(info: *mut DlPhdrInfo, replacement: &[u8]) -> (bool, usize, bool) {
     // SAFETY: `info` is the matched live entry; `phdr[..phnum]` is the
     // linker's own read-only table.
     let (base, phdr, phnum) = unsafe { ((*info).addr, (*info).phdr, (*info).phnum) };
     if phdr.is_null() {
-        return (false, 0);
+        return (false, 0, true);
     }
 
     let mut dyn_addr = 0usize;
@@ -629,14 +665,14 @@ unsafe fn scrub_elf_metadata(info: *mut DlPhdrInfo, replacement: &[u8]) -> (bool
         if p.p_type == PT_DYNAMIC {
             // Fail closed on wrap: a wrapped base would scrub the wrong object.
             let Some(addr) = base.checked_add(p.p_vaddr as usize) else {
-                return (false, 0);
+                return (false, 0, true);
             };
             dyn_addr = addr;
             break;
         }
     }
     if dyn_addr == 0 {
-        return (false, 0);
+        return (false, 0, true);
     }
 
     let (mut strtab, mut strsz, mut symtab, mut hash, mut gnu_hash, mut soname) =
@@ -662,7 +698,7 @@ unsafe fn scrub_elf_metadata(info: *mut DlPhdrInfo, replacement: &[u8]) -> (bool
         }
     }
     if strtab == 0 || strsz == 0 {
-        return (false, 0);
+        return (false, 0, true);
     }
     // Fail closed on wrap; zero offsets resolve to `base` (absent-table sentinel below).
     let (Some(strtab), Some(symtab), Some(hash), Some(gnu_hash)) = (
@@ -671,7 +707,7 @@ unsafe fn scrub_elf_metadata(info: *mut DlPhdrInfo, replacement: &[u8]) -> (bool
         base.checked_add(hash),
         base.checked_add(gnu_hash),
     ) else {
-        return (false, 0);
+        return (false, 0, true);
     };
 
     let nsyms = if hash != base {
@@ -688,15 +724,14 @@ unsafe fn scrub_elf_metadata(info: *mut DlPhdrInfo, replacement: &[u8]) -> (bool
     // SAFETY: `strtab[..strsz]` names our own read-only table (bounded
     // above); the window makes it writable, and the callee keeps every
     // write inside a measured footprint.
-    let (soname_done, symbols) = unsafe {
+    unsafe {
         let Some(window) = WritableWindow::open(strtab, strsz, "dynstr") else {
-            return (false, 0);
+            return (false, 0, true);
         };
-        let result = scrub_tables(strtab, strsz, symtab, base, nsyms, soname, replacement);
-        drop(window);
-        result
-    };
-    (soname_done, symbols)
+        let (soname_done, symbols) =
+            scrub_tables(strtab, strsz, symtab, base, nsyms, soname, replacement);
+        (soname_done, symbols, window.close())
+    }
 }
 
 /// Upper bound on the symbol count from a GNU hash table.
@@ -817,6 +852,7 @@ pub fn scrub_dlpi_name(staged_path: &str) {
         symbols: 0,
         substring: false,
         memfd: false,
+        unrestored: false,
     };
 
     run_scrub(&mut search);
@@ -828,6 +864,12 @@ pub fn scrub_dlpi_name(staged_path: &str) {
             if search.soname { "renamed" } else { "left" },
             search.symbols
         ));
+        if search.unrestored {
+            loge_fmt(format_args!(
+                "linkmap: scrubbed {} but left memory writable",
+                basename(staged_path)
+            ));
+        }
     } else {
         loge_fmt(format_args!(
             "linkmap: no dl_iterate_phdr entry matched {}; name left visible",
@@ -851,6 +893,7 @@ pub fn scrub_memfd() {
         symbols: 0,
         substring: false,
         memfd: true,
+        unrestored: false,
     };
 
     run_scrub(&mut search);
@@ -861,6 +904,9 @@ pub fn scrub_memfd() {
             if search.soname { "renamed" } else { "left" },
             search.symbols
         ));
+        if search.unrestored {
+            loge("linkmap: scrubbed memfd but left memory writable");
+        }
     } else {
         loge("linkmap: no dl_iterate_phdr entry matched memfd; name left visible");
         log_all_names();
@@ -919,6 +965,7 @@ mod tests {
             symbols: 0,
             substring: false,
             memfd: false,
+            unrestored: false,
         };
         let data = (&raw mut search).cast::<c_void>();
 
@@ -953,6 +1000,7 @@ mod tests {
             symbols: 0,
             substring: false,
             memfd: false,
+            unrestored: false,
         };
         let data = (&raw mut search).cast::<c_void>();
         // SAFETY: both entries are live owned strings; `search` outlives them.
@@ -997,6 +1045,7 @@ mod tests {
             symbols: 0,
             substring: false,
             memfd: false,
+            unrestored: false,
         };
         // SAFETY: as above.
         unsafe {
@@ -1028,6 +1077,7 @@ mod tests {
             symbols: 0,
             substring: false,
             memfd: false,
+            unrestored: false,
         };
         // SAFETY: live owned string; undersized `size` must stop before touching it.
         unsafe {
@@ -1060,6 +1110,7 @@ mod tests {
             symbols: 0,
             substring: false,
             memfd: false,
+            unrestored: false,
         };
         // SAFETY: null name must return before any string read.
         unsafe {
@@ -1207,6 +1258,71 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // mmap(2)/mprotect(2) have no Miri shims
+    fn window_refuses_executable_mappings() {
+        const SIZE: usize = 4096;
+        // SAFETY: fresh executable mapping owned by this test.
+        let addr = unsafe {
+            let addr = libc::mmap(
+                std::ptr::null_mut(),
+                SIZE,
+                libc::PROT_READ | libc::PROT_EXEC,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                -1,
+                0,
+            );
+            assert_ne!(
+                addr,
+                libc::MAP_FAILED,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+            addr
+        };
+        // SAFETY: `addr`/`SIZE` names our live executable mapping.
+        assert!(
+            // SAFETY: as above.
+            unsafe { WritableWindow::open(addr as usize, SIZE, "test") }.is_none(),
+            "executable ranges must never be widened"
+        );
+        // SAFETY: cleanup our mapping.
+        unsafe {
+            assert_eq!(libc::munmap(addr, SIZE), 0);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // mmap(2)/mprotect(2) have no Miri shims
+    fn window_close_reports_failed_restore() {
+        const SIZE: usize = 4096;
+        // SAFETY: fresh anonymous mapping owned by this test.
+        let addr = unsafe {
+            let addr = libc::mmap(
+                std::ptr::null_mut(),
+                SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                -1,
+                0,
+            );
+            assert_ne!(
+                addr,
+                libc::MAP_FAILED,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+            addr
+        };
+        // SAFETY: `addr`/`SIZE` is our live mapping.
+        let window = unsafe { WritableWindow::open(addr as usize, SIZE, "test").expect("window") };
+        // SAFETY: unmaps out from under the window; the restore must fail.
+        unsafe {
+            assert_eq!(libc::munmap(addr, SIZE), 0);
+            assert!(!window.close());
+        }
+    }
+
+    #[test]
     fn substring_match_finds_memfd_entry() {
         let memfd = raw_cstring("/memfd:jit-cache (deleted)");
         let mut memfd_entry = entry(memfd);
@@ -1218,6 +1334,7 @@ mod tests {
             symbols: 0,
             substring: false,
             memfd: true,
+            unrestored: false,
         };
         // SAFETY: entry is a live owned string; `search` outlives the call.
         unsafe {
@@ -1422,8 +1539,9 @@ mod tests {
         };
         // SAFETY: `info` describes the fake image above; the replacement
         // fits every footprint it can touch.
-        let (soname_done, symbols) =
+        let (soname_done, symbols, restored) =
             unsafe { scrub_elf_metadata(&raw mut info, b"libnative_1.so") };
+        assert!(restored);
         // SAFETY: read-only checks of our own page (perms restored to R).
         // (Strings live at `strtab_off + off`, not bare `off`.)
         unsafe {
@@ -1535,8 +1653,9 @@ mod tests {
         };
         // SAFETY: `info` describes the fake image above; the replacement
         // fits every footprint it can touch.
-        let (soname_done, symbols) =
+        let (soname_done, symbols, restored) =
             unsafe { scrub_elf_metadata(&raw mut info, b"libnative_1.so") };
+        assert!(restored);
         // SAFETY: read-only checks of our own page (perms restored to R).
         unsafe {
             let at =
@@ -1657,8 +1776,9 @@ mod tests {
         // SAFETY: `info` describes the fake image above; the replacement
         // fits every footprint it can touch. The oversized SysV count wins
         // over the live GNU table, so no symbol is walked or rewritten.
-        let (soname_done, symbols) =
+        let (soname_done, symbols, restored) =
             unsafe { scrub_elf_metadata(&raw mut info, b"libnative_1.so") };
+        assert!(restored);
         // SAFETY: read-only checks of our own page (perms restored to R).
         unsafe {
             let at =
