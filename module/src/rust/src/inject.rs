@@ -695,6 +695,7 @@ fn stage_gadget(app_name: &str, src_lib_path: &str) -> Option<String> {
     }
     // Exclusive creation prevents a planted marker or hard link from being truncated.
     if open_dst_hardened(&format!("{stage_dir}/{STAGE_MARKER}")).is_none() {
+        // Not ours to remove: another attempt may own that marker.
         remove_dir(&stage_dir);
         return None;
     }
@@ -710,16 +711,59 @@ fn stage_gadget(app_name: &str, src_lib_path: &str) -> Option<String> {
     if !copy_file(src_lib_path, &dst_lib) {
         remove_file(&dst_lib);
         remove_file(&with_config_suffix(&dst_lib));
-        remove_dir(&stage_dir);
+        cleanup_stage_dir(&stage_dir);
         return None;
     }
 
-    if let Some((src_cfg, dst_cfg)) = sibling_config_paths(src_dir, &stage_dir, lib_name)
-        && !copy_file(&src_cfg, &dst_cfg)
-    {
-        remove_file(&dst_cfg);
+    if let Some((src_cfg, dst_cfg)) = sibling_config_paths(src_dir, &stage_dir, lib_name) {
+        match copy_sibling_config(&src_cfg, &dst_cfg) {
+            SiblingOutcome::Absent | SiblingOutcome::Staged => {}
+            SiblingOutcome::Failed => {
+                // A staged library without its config would misbehave: fail
+                // the staging and let the caller fall back (or skip) instead.
+                remove_file(&dst_lib);
+                cleanup_stage_dir(&stage_dir);
+                return None;
+            }
+        }
     }
     Some(dst_lib)
+}
+
+// Copy outcome for an optional sidecar: absence is normal, failure is not.
+enum SiblingOutcome {
+    Absent,
+    Staged,
+    Failed,
+}
+
+fn copy_sibling_config(src_cfg: &str, dst_cfg: &str) -> SiblingOutcome {
+    // NotFound (including dangling links) is the normal optional-absent
+    // case; any other metadata error (denied, looped) must fail rather
+    // than stage without config.
+    match fs::metadata(src_cfg) {
+        Err(err) if err.kind() == ErrorKind::NotFound => return SiblingOutcome::Absent,
+        Err(err) => {
+            loge_fmt(format_args!(
+                "stage: stat sibling config failed: {src_cfg}: {err}"
+            ));
+            return SiblingOutcome::Failed;
+        }
+        Ok(_) => {}
+    }
+    if copy_file(src_cfg, dst_cfg) {
+        SiblingOutcome::Staged
+    } else {
+        remove_file(dst_cfg);
+        SiblingOutcome::Failed
+    }
+}
+
+// Best-effort teardown of a stage dir; the marker must go or later
+// stagings in this process fail their exclusive create on it.
+fn cleanup_stage_dir(stage_dir: &str) {
+    remove_file(&format!("{stage_dir}/{STAGE_MARKER}"));
+    remove_dir(stage_dir);
 }
 
 // Sibling config (source, staged) unless the library name holds no `.so` —
@@ -1070,19 +1114,13 @@ pub(crate) fn stage_and_inject(
         None
     };
     if do_stage && staged.is_none() {
-        if lib_needs_file_staging(lib_path) {
-            // A raw fallback would load under the wrong name: hiding and
-            // the sidecar both key off fd-derived paths. Skip instead.
-            loge_fmt(format_args!(
-                "{log_context}Staging {} failed; skipping injection to preserve hiding and sidecar",
-                basename(lib_path)
-            ));
-            return false;
-        }
+        // No raw fallback: it would reuse the already-loaded file (no new
+        // constructors or threads) or the wrong fd-derived name. Skip.
         loge_fmt(format_args!(
-            "{log_context}Staging {} failed; falling back to the raw path",
+            "{log_context}Staging {} failed; skipping injection",
             basename(lib_path)
         ));
+        return false;
     }
     let inject_path = staged.as_deref().unwrap_or(lib_path);
 
@@ -1111,7 +1149,12 @@ fn inject_libs(cfg: &TargetConfig, pid: libc::pid_t) {
     crate::thread_names::enable_thread_name_sanitizing();
 
     if cfg.child_gating.enabled {
-        enable_child_gating(&cfg.child_gating, &cfg.app_name, cfg.scrub_elf_header);
+        enable_child_gating(
+            &cfg.child_gating,
+            &cfg.app_name,
+            cfg.scrub_elf_header,
+            cfg.hide_maps,
+        );
     }
 
     sweep_stale_stage_dirs(&format!(
@@ -1165,6 +1208,29 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_stage_dir_removes_marker_and_empty_dir() {
+        let dir = TempDir::new("cleanup");
+        let stage = dir.join("1234");
+        fs::create_dir_all(&stage).unwrap();
+        fs::write(stage.join(STAGE_MARKER), b"").unwrap();
+        fs::write(stage.join("libsecmon.so"), b"x").unwrap();
+
+        // Marker plus staged files go; the helper reports nothing.
+        fs::remove_file(stage.join("libsecmon.so")).unwrap();
+        cleanup_stage_dir(stage.to_str().unwrap());
+        assert!(!stage.exists());
+
+        // A non-empty dir keeps its contents but loses nothing else.
+        let stage = dir.join("5678");
+        fs::create_dir_all(&stage).unwrap();
+        fs::write(stage.join(STAGE_MARKER), b"").unwrap();
+        fs::write(stage.join("leftover.bin"), b"x").unwrap();
+        cleanup_stage_dir(stage.to_str().unwrap());
+        assert!(!stage.join(STAGE_MARKER).exists());
+        assert!(stage.join("leftover.bin").exists());
+    }
+
+    #[test]
     fn config_suffix_is_anchored_to_the_basename() {
         assert_eq!(with_config_suffix("libsecmon.so"), "libsecmon.config.so");
         assert_eq!(
@@ -1178,6 +1244,70 @@ mod tests {
             "/dir.so/libx.config.so"
         );
         assert_eq!(with_config_suffix("./libx.so"), "./libx.config.so");
+    }
+
+    #[test]
+    fn sibling_copy_tolerates_absence_but_not_failure() {
+        let dir = TempDir::new("sibling-copy");
+        let missing = dir.join("lib.config.so");
+        let dst = dir.join("out.config.so");
+        assert!(matches!(
+            copy_sibling_config(missing.to_str().unwrap(), dst.to_str().unwrap()),
+            SiblingOutcome::Absent
+        ));
+        assert!(!dst.exists());
+
+        let src = dir.join("lib2.config.so");
+        fs::write(&src, b"{}").unwrap();
+        let dst = dir.join("out2.config.so");
+        assert!(matches!(
+            copy_sibling_config(src.to_str().unwrap(), dst.to_str().unwrap()),
+            SiblingOutcome::Staged
+        ));
+        assert_eq!(fs::read(&dst).unwrap(), b"{}");
+
+        let dir_src = dir.join("dir.config.so");
+        fs::create_dir_all(&dir_src).unwrap();
+        let dst = dir.join("out3.config.so");
+        assert!(matches!(
+            copy_sibling_config(dir_src.to_str().unwrap(), dst.to_str().unwrap()),
+            SiblingOutcome::Failed
+        ));
+        assert!(!dst.exists());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // real symlinks are outside miri's filesystem
+    fn sibling_metadata_errors_are_failures_not_absence() {
+        let dir = TempDir::new("sibling-meta");
+        std::os::unix::fs::symlink(dir.join("b"), dir.join("a")).unwrap();
+        std::os::unix::fs::symlink(dir.join("a"), dir.join("b")).unwrap();
+        let dst = dir.join("out.config.so");
+        assert!(matches!(
+            copy_sibling_config(dir.join("a").to_str().unwrap(), dst.to_str().unwrap()),
+            SiblingOutcome::Failed
+        ));
+        assert!(!dst.exists());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "android"))]
+    fn child_staging_failure_skips_instead_of_raw_fallback() {
+        // Host has no /data cache, so staging always fails here: with
+        // stage=true there is no correct raw fallback (same file, no new
+        // threads), so injection must be skipped.
+        let dir = TempDir::new("skip-child");
+        let lib = dir.join("libsecmon.so");
+        fs::write(&lib, b"x").unwrap();
+
+        assert!(!stage_and_inject(
+            lib.to_str().unwrap(),
+            "com.example.app",
+            "[test] ",
+            true,
+            false,
+            true,
+        ));
     }
 
     #[test]

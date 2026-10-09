@@ -20,6 +20,8 @@ static GATING_APP_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new()
 // Header scrubbing follows the parent target; atomics only, safe post-fork.
 static GATING_SCRUB_HEADER: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+// Map hiding follows the parent target like scrubbing does.
+static GATING_HIDE_MAPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 #[cfg(target_os = "android")]
 unsafe extern "C" {
@@ -82,8 +84,9 @@ fn run_child_action(action: ChildMode, libraries: &[String], app_name: &str) -> 
                 return 0;
             }
             let scrub = GATING_SCRUB_HEADER.load(Ordering::Relaxed);
+            let hide_maps = GATING_HIDE_MAPS.load(Ordering::Relaxed);
             for lib_path in libraries {
-                stage_and_inject(lib_path, app_name, "", true, scrub, true);
+                stage_and_inject(lib_path, app_name, "", hide_maps, scrub, true);
             }
             0
         }
@@ -159,7 +162,12 @@ fn lookup_hook_target(name: &CStr) -> Option<*mut c_void> {
     addr
 }
 
-pub fn enable_child_gating(cfg: &ChildGatingConfig, app_name: &str, scrub_header: bool) {
+pub fn enable_child_gating(
+    cfg: &ChildGatingConfig,
+    app_name: &str,
+    scrub_header: bool,
+    hide_maps: bool,
+) {
     if CHILD_GATING_MODE.set(cfg.mode).is_err() {
         loge("[child_gating] already enabled; ignoring second config");
         return;
@@ -167,6 +175,7 @@ pub fn enable_child_gating(cfg: &ChildGatingConfig, app_name: &str, scrub_header
     let _ = INJECTED_LIBRARIES.set(cfg.injected_libraries.clone());
     let _ = GATING_APP_NAME.set(app_name.to_string());
     GATING_SCRUB_HEADER.store(scrub_header, Ordering::Relaxed);
+    GATING_HIDE_MAPS.store(hide_maps, Ordering::Relaxed);
 
     if cfg.mode == ChildMode::Pass {
         loge("[child_gating] mode is pass; children will run ungated");
@@ -307,6 +316,15 @@ mod tests {
         let _ = INJECTED_LIBRARIES.set(cfg.injected_libraries.clone());
         assert_eq!(CHILD_GATING_MODE.get(), Some(&ChildMode::Kill));
         assert_eq!(INJECTED_LIBRARIES.get().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn child_hide_flag_round_trips() {
+        GATING_HIDE_MAPS.store(true, Ordering::Relaxed);
+        assert!(GATING_HIDE_MAPS.load(Ordering::Relaxed));
+        GATING_HIDE_MAPS.store(false, Ordering::Relaxed);
+        assert!(!GATING_HIDE_MAPS.load(Ordering::Relaxed));
+        GATING_HIDE_MAPS.store(true, Ordering::Relaxed);
     }
 
     #[test]
