@@ -292,20 +292,27 @@ unsafe extern "C" fn park_or_forward(sig: c_int, info: *mut libc::siginfo_t, con
 // (bounded) before deciding, so a paused claim settles first.
 static IN_FLIGHT_FORWARD: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
 
+struct FlightGuard {
+    index: usize,
+}
+
+impl Drop for FlightGuard {
+    fn drop(&mut self) {
+        // Saturating: a fork from inside a forwarded handler resets the
+        // counter underneath this guard via after_fork; wrapping to
+        // MAX would stall every later teardown drain in the child.
+        let _ =
+            IN_FLIGHT_FORWARD[self.index]
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1));
+    }
+}
+
 /// # Safety
 /// Called only from [`park_or_forward`].
 unsafe fn forward_fault(sig: c_int, info: *mut libc::siginfo_t, context: *mut c_void) {
     let Some(index) = GUARDED_SIGNALS.iter().position(|&guarded| guarded == sig) else {
         return;
     };
-    struct FlightGuard {
-        index: usize,
-    }
-    impl Drop for FlightGuard {
-        fn drop(&mut self) {
-            IN_FLIGHT_FORWARD[self.index].fetch_sub(1, Ordering::Relaxed);
-        }
-    }
     IN_FLIGHT_FORWARD[index].fetch_add(1, Ordering::Relaxed);
     let _flight = FlightGuard { index };
 
@@ -1566,6 +1573,26 @@ mod tests {
         unsafe {
             libc::sigaction(libc::SIGSEGV, &saved_action, std::ptr::null_mut());
         }
+    }
+
+    #[test]
+    fn flight_guard_never_underflows_reset_counter() {
+        let _state = lock_state();
+        // Models a fork from inside a forwarded handler: after_fork zeroes
+        // the counter while this guard is still live on the stack.
+        IN_FLIGHT_FORWARD[0].store(1, Ordering::Relaxed);
+        after_fork();
+        {
+            let _flight = FlightGuard { index: 0 };
+        }
+        assert_eq!(IN_FLIGHT_FORWARD[0].load(Ordering::Relaxed), 0);
+
+        // Balanced use still counts exactly.
+        IN_FLIGHT_FORWARD[0].fetch_add(1, Ordering::Relaxed);
+        {
+            let _flight = FlightGuard { index: 0 };
+        }
+        assert_eq!(IN_FLIGHT_FORWARD[0].load(Ordering::Relaxed), 0);
     }
 
     #[test]
