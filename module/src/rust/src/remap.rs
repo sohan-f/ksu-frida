@@ -49,12 +49,39 @@ static REBUILD_LOCK: PaddedBool = PaddedBool(AtomicBool::new(false));
 
 const PARK_SPIN_LIMIT: usize = 100_000_000;
 
+#[derive(Debug, Clone)]
 struct ProcMapsInfo {
     start: usize,
     end: usize,
     perms: c_int,
     private: bool,
     path: String,
+    dev_major: u32,
+    dev_minor: u32,
+    inode: u64,
+}
+
+/// Device and inode identifying a mapped file, for disambiguating
+/// kernel-escaped pathnames (`\n` vs literal `\012` render identically).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileId {
+    dev_major: u32,
+    dev_minor: u32,
+    inode: u64,
+}
+
+#[inline]
+fn parse_dev_inode(dev: &str, inode: &str) -> Option<(u32, u32, u64)> {
+    // Device numbers print hex, inodes decimal (verified against stat).
+    let (major, minor) = dev.split_once(':')?;
+    let (Ok(major), Ok(minor), Ok(inode)) = (
+        u32::from_str_radix(major, 16),
+        u32::from_str_radix(minor, 16),
+        inode.parse(),
+    ) else {
+        return None;
+    };
+    Some((major, minor, inode))
 }
 
 #[inline]
@@ -88,7 +115,7 @@ fn parse_maps_line(line: &str) -> Option<ProcMapsInfo> {
     // octal-escaped, so a literal `\n` is only ever the line terminator.
     let line = line.strip_suffix('\n').unwrap_or(line);
     let mut parts = line.trim_start().splitn(6, ' ');
-    let (range, perms, _, _, _, path) = (
+    let (range, perms, _, dev, inode, path) = (
         parts.next()?,
         parts.next()?,
         parts.next()?,
@@ -104,6 +131,7 @@ fn parse_maps_line(line: &str) -> Option<ProcMapsInfo> {
     ) else {
         return None;
     };
+    let (dev_major, dev_minor, inode) = parse_dev_inode(dev, inode)?;
 
     let prot = prot_from_perms(perms);
     // 4th char is p/s: shared mappings must keep sharing, never convert to private anon.
@@ -115,6 +143,9 @@ fn parse_maps_line(line: &str) -> Option<ProcMapsInfo> {
         perms: prot,
         private,
         path: path.trim_start().to_string(),
+        dev_major,
+        dev_minor,
+        inode,
     })
 }
 
@@ -152,6 +183,33 @@ fn escaped_maps_query(query: &str) -> Option<String> {
     query.contains('\n').then(|| query.replace('\n', "\\012"))
 }
 
+// Identity check for file queries: strings alone cannot tell a real
+// newline from a literal `\012` (the kernel renders both the same), but
+// device and inode can. Unknown identity (unstatable path) keeps the
+// string verdict, so deleted-but-mapped files still match.
+fn identity_matches(info: &ProcMapsInfo, query_id: Option<FileId>) -> bool {
+    let Some(query_id) = query_id else {
+        return true;
+    };
+    info.dev_major == query_id.dev_major
+        && info.dev_minor == query_id.dev_minor
+        && info.inode == query_id.inode
+}
+
+// Device and inode of a configured path, when it can be statted.
+fn query_file_id(query: &str) -> Option<FileId> {
+    if !query.contains('/') {
+        return None;
+    }
+    let meta = std::fs::metadata(query).ok()?;
+    use std::os::unix::fs::MetadataExt;
+    Some(FileId {
+        dev_major: libc::major(meta.dev()) as u32,
+        dev_minor: libc::minor(meta.dev()) as u32,
+        inode: meta.ino(),
+    })
+}
+
 fn get_modules_by_name(m_name: &str) -> Vec<ProcMapsInfo> {
     let mut maps = Vec::new();
 
@@ -160,6 +218,7 @@ fn get_modules_by_name(m_name: &str) -> Vec<ProcMapsInfo> {
     };
 
     let escaped = escaped_maps_query(m_name);
+    let query_id = query_file_id(m_name);
     let mut reader = BufReader::new(file);
     let mut line = String::with_capacity(256);
     while reader.read_line(&mut line).unwrap_or(0) > 0 {
@@ -174,7 +233,7 @@ fn get_modules_by_name(m_name: &str) -> Vec<ProcMapsInfo> {
             line.clear();
             continue;
         };
-        if maps_path_matches(&info.path, m_name) {
+        if maps_path_matches(&info.path, m_name) && identity_matches(&info, query_id) {
             maps.push(info);
         }
         line.clear();
@@ -1562,6 +1621,44 @@ mod tests {
     }
 
     #[test]
+    fn dev_inode_parse_hex_device_and_decimal_inode() {
+        let info = parse_maps_line(
+            "762e1cc000-762e1cd000 rw-s 00000000 00:148 6171                          /tmp/seg.bin\n",
+        )
+        .expect("line");
+        assert_eq!(
+            (info.dev_major, info.dev_minor, info.inode),
+            (0, 0x148, 6171)
+        );
+    }
+
+    #[test]
+    fn identity_matches_needs_ids_only_for_files() {
+        let id = FileId {
+            dev_major: 0,
+            dev_minor: 1,
+            inode: 2,
+        };
+        let same = ProcMapsInfo {
+            start: 0,
+            end: 0,
+            perms: 0,
+            private: true,
+            path: String::new(),
+            dev_major: 0,
+            dev_minor: 1,
+            inode: 2,
+        };
+        let other = ProcMapsInfo {
+            inode: 3,
+            ..same.clone()
+        };
+        assert!(identity_matches(&same, Some(id)));
+        assert!(!identity_matches(&other, Some(id)));
+        assert!(identity_matches(&other, None));
+    }
+
+    #[test]
     fn escaped_query_covers_newline_pathnames_only() {
         assert_eq!(escaped_maps_query("/data/x/libfoo.so"), None);
         assert_eq!(
@@ -1578,6 +1675,69 @@ mod tests {
         assert_eq!(info.path, "/data/x/a\\012b.so");
         assert!(maps_path_matches(&info.path, "/data/x/a\nb.so"));
         assert!(!maps_path_matches(&info.path, "/data/x/a\nc.so"));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // mmap(2) has no Miri shim
+    fn twin_newline_and_literal_names_resolve_to_own_mapping() {
+        use crate::test_support::TempDir;
+
+        let dir = TempDir::new("twin-map");
+        let newline_file = dir.join("a\nb.so");
+        let literal_file = dir.join("a\\012b.so");
+        std::fs::write(&newline_file, vec![0u8; 4096]).unwrap();
+        std::fs::write(&literal_file, vec![1u8; 4096]).unwrap();
+        let newline_path = newline_file.to_str().unwrap().to_string();
+        let literal_path = literal_file.to_str().unwrap().to_string();
+
+        // SAFETY: fresh file mappings owned by this test.
+        let (newline_addr, literal_addr) = unsafe {
+            let map_one = |path: &str| {
+                let fd = libc::open(crate::sys::cstring(path).unwrap().as_ptr(), libc::O_RDONLY);
+                assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+                let address = libc::mmap(
+                    std::ptr::null_mut(),
+                    4096,
+                    libc::PROT_READ,
+                    libc::MAP_PRIVATE,
+                    fd,
+                    0,
+                );
+                assert_ne!(
+                    address,
+                    libc::MAP_FAILED,
+                    "{}",
+                    std::io::Error::last_os_error()
+                );
+                assert_eq!(libc::close(fd), 0);
+                address as usize
+            };
+            (map_one(&newline_path), map_one(&literal_path))
+        };
+
+        // Both render identically in maps; identity must pick each file's own.
+        let newline_hits = get_modules_by_name(&newline_path);
+        assert_eq!(
+            newline_hits
+                .iter()
+                .map(|info| info.start)
+                .collect::<Vec<_>>(),
+            [newline_addr]
+        );
+        let literal_hits = get_modules_by_name(&literal_path);
+        assert_eq!(
+            literal_hits
+                .iter()
+                .map(|info| info.start)
+                .collect::<Vec<_>>(),
+            [literal_addr]
+        );
+
+        // SAFETY: cleanup our mappings.
+        unsafe {
+            assert_eq!(libc::munmap(newline_addr as *mut c_void, 4096), 0);
+            assert_eq!(libc::munmap(literal_addr as *mut c_void, 4096), 0);
+        }
     }
 
     #[test]
