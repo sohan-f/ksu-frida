@@ -553,6 +553,9 @@ fn install_fault_retry() -> FaultRetry {
         // so forwarded faults keep app semantics instead of wrapper defaults.
         action.sa_flags = libc::SA_SIGINFO
             | (current.sa_flags & (libc::SA_ONSTACK | libc::SA_NODEFER | libc::SA_RESTART));
+        // The saved mask must be installed, not just reapplied later: until
+        // the nested call blocks it, cross signals stay deliverable here.
+        action.sa_mask = current.sa_mask;
         // SAFETY: installs the fully initialised `action` above; the kernel copies it synchronously.
         if unsafe { libc::sigaction(sig, &raw const action, std::ptr::null_mut()) } != 0 {
             loge_fmt(format_args!(
@@ -1187,6 +1190,62 @@ mod tests {
             libc::pthread_sigmask(libc::SIG_SETMASK, &saved_mask, std::ptr::null_mut());
             libc::close(fds[0]);
             libc::close(fds[1]);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // real sigaction(2); no Miri shims
+    fn wrapper_inherits_mask_per_signal() {
+        unsafe extern "C" fn probe(_sig: c_int, _info: *mut libc::siginfo_t, _ctx: *mut c_void) {}
+
+        let _state = lock_state();
+
+        // SAFETY: output buffer for the query below; restored at the end.
+        let mut saved_action: libc::sigaction = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            // SAFETY: query-only call (`act == NULL`).
+            unsafe { libc::sigaction(libc::SIGSEGV, std::ptr::null(), &mut saved_action) },
+            0
+        );
+
+        for mask_usr1 in [false, true] {
+            // SAFETY: fully initialised below; restored at the end of the test.
+            let mut probe_action: libc::sigaction = unsafe { std::mem::zeroed() };
+            probe_action.sa_sigaction = probe as *const () as usize;
+            probe_action.sa_flags = libc::SA_SIGINFO;
+            if mask_usr1 {
+                // SAFETY: pure set op on our own stack set.
+                unsafe {
+                    libc::sigemptyset(&mut probe_action.sa_mask);
+                    libc::sigaddset(&mut probe_action.sa_mask, libc::SIGUSR1);
+                }
+            }
+            assert_eq!(
+                // SAFETY: fully initialised action above.
+                unsafe { libc::sigaction(libc::SIGSEGV, &probe_action, std::ptr::null_mut(),) },
+                0
+            );
+            {
+                let _retry = install_fault_retry();
+                // SAFETY: output buffer for the query below.
+                let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+                assert_eq!(
+                    // SAFETY: query-only call (`act == NULL`).
+                    unsafe { libc::sigaction(libc::SIGSEGV, std::ptr::null(), &mut current) },
+                    0
+                );
+                // SAFETY: read-only membership test on the queried mask.
+                let has_usr1 = unsafe { libc::sigismember(&current.sa_mask, libc::SIGUSR1) } == 1;
+                assert_eq!(
+                    has_usr1, mask_usr1,
+                    "wrapper must inherit sa_mask, not install empty"
+                );
+            }
+        }
+
+        // SAFETY: restores the pre-test disposition.
+        unsafe {
+            libc::sigaction(libc::SIGSEGV, &saved_action, std::ptr::null_mut());
         }
     }
 
