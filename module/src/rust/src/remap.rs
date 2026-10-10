@@ -663,8 +663,11 @@ enum RelocateError {
 fn copy_prot_for(perms: c_int) -> c_int {
     // Freeze writers during the copy: drop WRITE so concurrent writes fault
     // into park_or_forward instead of being lost. Restored after commit.
+    // Reading needs READ on every architecture: WRITE-only would leave
+    // PROT_NONE (and W|X unreadable) and fault the copy itself, which the
+    // rebuilder cannot park on.
     if perms & libc::PROT_WRITE != 0 {
-        perms & !libc::PROT_WRITE
+        (perms & !libc::PROT_WRITE) | libc::PROT_READ
     } else if perms & libc::PROT_READ == 0 {
         libc::PROT_READ
     } else {
@@ -1901,6 +1904,13 @@ mod tests {
             libc::PROT_READ | libc::PROT_EXEC
         );
         assert_eq!(copy_prot_for(libc::PROT_EXEC), libc::PROT_READ);
+        // Write without read is unreadable on ARM64: the copy source must
+        // stay readable (PROT_NONE or --x would fault the rebuilder itself).
+        assert_eq!(copy_prot_for(libc::PROT_WRITE), libc::PROT_READ);
+        assert_eq!(
+            copy_prot_for(libc::PROT_WRITE | libc::PROT_EXEC),
+            libc::PROT_READ | libc::PROT_EXEC
+        );
     }
 
     fn prot_at(addr: usize) -> (c_int, bool) {
@@ -2014,6 +2024,51 @@ mod tests {
                 }
             }
             assert!(seen_path, "file mapping must still be mapped");
+
+            assert_eq!(libc::munmap(address, SIZE), 0);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // mmap(2)/mprotect(2) have no Miri shims
+    fn relocate_write_only_segment_stays_readable_for_the_copy() {
+        let _state = lock_state();
+        const SIZE: usize = 4096;
+        let expected: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8).collect();
+
+        let _retry = install_fault_retry();
+
+        // SAFETY: fresh anonymous mapping owned by this test.
+        unsafe {
+            let address = libc::mmap(
+                std::ptr::null_mut(),
+                SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                -1,
+                0,
+            );
+            assert_ne!(address, libc::MAP_FAILED, "{}", io::Error::last_os_error());
+            std::ptr::copy_nonoverlapping(expected.as_ptr(), address as *mut u8, SIZE);
+
+            assert_eq!(libc::mprotect(address, SIZE, libc::PROT_WRITE), 0);
+            assert_eq!(prot_at(address as usize), (libc::PROT_WRITE, true));
+
+            relocate_segment(address, SIZE, libc::PROT_WRITE, "/test/libwrite.so")
+                .expect("relocate_segment failed");
+
+            assert_eq!(
+                prot_at(address as usize),
+                (libc::PROT_WRITE, true),
+                "write-only protections restored"
+            );
+            // Our own mapping: re-add read to verify the copied bytes below.
+            assert_eq!(
+                libc::mprotect(address, SIZE, libc::PROT_READ | libc::PROT_WRITE),
+                0
+            );
+            let after = std::slice::from_raw_parts(address as *const u8, SIZE);
+            assert_eq!(after, &expected[..], "segment contents must survive");
 
             assert_eq!(libc::munmap(address, SIZE), 0);
         }
