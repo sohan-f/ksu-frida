@@ -1539,6 +1539,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // symtab span check reads host maps, blind to Miri memory
     fn scrub_tables_rewrites_only_frida_names() {
         let strtab = b"\0frida_agent\0puts\0".to_vec();
         let syms = [
