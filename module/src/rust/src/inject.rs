@@ -833,6 +833,17 @@ fn prefers_file_staging(lib_path: &str) -> bool {
     sibling_config_src(lib_path).is_some_and(|src_cfg| std::path::Path::new(&src_cfg).exists())
 }
 
+// A sibling that exists but cannot be statted (denied, looped): neither
+// memfd (no sidecar) nor files (unreadable sidecar) can honor it.
+fn unreadable_sibling_config(lib_path: &str) -> Option<String> {
+    let src_cfg = sibling_config_src(lib_path)?;
+    match fs::metadata(&src_cfg) {
+        Ok(_) => None,
+        Err(err) if err.kind() == ErrorKind::NotFound => None,
+        Err(_) => Some(src_cfg),
+    }
+}
+
 fn unlink_staged(staged_lib_path: &str) {
     let lib_ok = remove_file(staged_lib_path);
     let cfg_ok = remove_file(&with_config_suffix(staged_lib_path));
@@ -1128,6 +1139,14 @@ pub(crate) fn stage_and_inject(
     scrub_header: bool,
     stage: bool,
 ) -> bool {
+    // Unreadable sidecars fail closed before anything else: memfd would
+    // drop the config and files cannot provide it either.
+    if let Some(src_cfg) = unreadable_sibling_config(lib_path) {
+        loge_fmt(format_args!(
+            "{log_context}Sibling config unreadable, skipping injection to preserve sidecar: {src_cfg}"
+        ));
+        return false;
+    }
     // A present sibling config must load from files (see prefers_file_staging).
     if !prefers_file_staging(lib_path)
         && try_memfd_inject(lib_path, log_context, hide_maps, scrub_header)
@@ -1341,6 +1360,25 @@ mod tests {
             SiblingOutcome::Failed
         ));
         assert!(!dst.exists());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // real symlinks are outside miri's filesystem
+    fn looped_sibling_config_skips_injection() {
+        let dir = TempDir::new("loop-skip");
+        let lib = dir.join("libsecmon.so");
+        fs::write(&lib, b"x").unwrap();
+        std::os::unix::fs::symlink(dir.join("b"), dir.join("libsecmon.config.so")).unwrap();
+        std::os::unix::fs::symlink(dir.join("libsecmon.config.so"), dir.join("b")).unwrap();
+
+        assert!(!stage_and_inject(
+            lib.to_str().unwrap(),
+            "com.example.app",
+            "[test] ",
+            true,
+            false,
+            false,
+        ));
     }
 
     #[test]
