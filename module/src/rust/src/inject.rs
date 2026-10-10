@@ -148,6 +148,43 @@ fn delay_start_up(start_up_delay_ms: u64) {
     }
 }
 
+// Only regular files can load: FIFOs block on open with no writer, and
+// special nodes confuse the loader. Missing paths still flow through to
+// the fast-failing open/dlopen logs below.
+fn source_is_loadable(path: &str) -> bool {
+    match fs::metadata(path) {
+        Ok(meta) => meta.is_file(),
+        Err(_) => true,
+    }
+}
+
+// Opens a staging source without hanging: O_NONBLOCK defeats fifo plants,
+// and the fstat on our own fd (not the path) defeats substitution races.
+fn open_src_hardened(src: &str) -> io::Result<File> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(src)?;
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: `zeroed` stat as an output slot; no invariants yet.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `fstat` on our own open fd writes only into `st` above.
+        if unsafe { libc::fstat(file.as_raw_fd(), &raw mut st) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        #[allow(clippy::unnecessary_cast)]
+        let (ifmt, ifreg) = (libc::S_IFMT as u32, libc::S_IFREG as u32);
+        if st.st_mode as u32 & ifmt != ifreg {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
+        }
+    }
+    Ok(file)
+}
+
 fn open_dst_hardened(dst: &str) -> Option<File> {
     #[cfg(any(target_os = "android", target_os = "linux", test))]
     {
@@ -188,7 +225,7 @@ fn open_dst_hardened(dst: &str) -> Option<File> {
 }
 
 fn copy_file(src: &str, dst: &str) -> bool {
-    let mut input = match File::open(src) {
+    let mut input = match open_src_hardened(src) {
         Ok(file) => file,
         Err(err) => {
             loge_fmt(format_args!("stage: open src failed: {src}: {err}"));
@@ -1018,7 +1055,7 @@ fn write_memfd(src_lib_path: &str) -> Option<c_int> {
         return None;
     }
 
-    let mut input = match File::open(src_lib_path) {
+    let mut input = match open_src_hardened(src_lib_path) {
         Ok(file) => file,
         Err(err) => {
             loge_fmt(format_args!(
@@ -1144,6 +1181,13 @@ pub(crate) fn stage_and_inject(
     if let Some(src_cfg) = unreadable_sibling_config(lib_path) {
         loge_fmt(format_args!(
             "{log_context}Sibling config unreadable, skipping injection to preserve sidecar: {src_cfg}"
+        ));
+        return false;
+    }
+    // Non-regular sources would hang (fifo) or confuse the loader below.
+    if !source_is_loadable(lib_path) {
+        loge_fmt(format_args!(
+            "{log_context}Skipping injection for non-file source: {lib_path}"
         ));
         return false;
     }
@@ -1360,6 +1404,37 @@ mod tests {
             SiblingOutcome::Failed
         ));
         assert!(!dst.exists());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // real fifos are outside miri's filesystem
+    fn fifo_sources_never_block_or_load() {
+        let dir = TempDir::new("fifo-src");
+        let fifo = dir.join("libsecmon.so");
+        let c_fifo = CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: `c_fifo` is NUL-terminated; creates a test-owned node.
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+
+        let regular = dir.join("regular.so");
+        fs::write(&regular, b"x").unwrap();
+        assert!(source_is_loadable(regular.to_str().unwrap()));
+        assert!(!source_is_loadable(fifo.to_str().unwrap()));
+        assert!(source_is_loadable(dir.join("missing.so").to_str().unwrap()));
+
+        assert!(!copy_file(
+            fifo.to_str().unwrap(),
+            dir.join("dst.bin").to_str().unwrap()
+        ));
+        assert!(write_memfd(fifo.to_str().unwrap()).is_none());
+        assert!(!stage_and_inject(
+            fifo.to_str().unwrap(),
+            "com.example.app",
+            "[test] ",
+            true,
+            false,
+            false,
+        ));
+        assert!(!dir.join("dst.bin").exists());
     }
 
     #[test]
