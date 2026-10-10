@@ -1,3 +1,12 @@
+# v2.14.0
+- Loaded per-target gadget configs reliably across staged, symlinked, and child injections
+- Honored the target map-hiding setting in forked child processes
+- Rejected invalid target configs instead of silently falling back without child gating
+- Kept staging cleanup to files the current attempt created, with exclusive stage directories
+- Matched file mappings by device and inode, including trailing-space and newline pathnames
+- Hardened metadata scrubbing against malformed tables without crashing on bad entries
+- Preserved app signal-handler semantics during remapping and waited out hook installation races
+
 # v2.12.0
 - Hardened library hiding against signal and process edge cases during remapping
 - Honored the target map-hiding setting in forked child processes
