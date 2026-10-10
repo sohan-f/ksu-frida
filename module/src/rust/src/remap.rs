@@ -162,16 +162,22 @@ fn parse_maps_range(line: &str) -> Option<(usize, usize, c_int)> {
 }
 
 fn maps_path_matches(path: &str, query: &str) -> bool {
-    let path = path.strip_suffix(" (deleted)").unwrap_or(path);
     if query.contains('/') {
-        // File load: exact staged path. Basename-only would rebuild a
-        // foreign same-basename lib in another dir.
+        // Raw first: a literal ` (deleted)` filename must match itself.
         if path == query {
             return true;
         }
-        // Newlines arrive octal-escaped; try that form too.
-        return escaped_maps_query(query).is_some_and(|escaped| path == escaped);
+        let stripped = path.strip_suffix(" (deleted)").unwrap_or(path);
+        if stripped == query {
+            return true;
+        }
+        // Newlines arrive octal-escaped; try that form too, both ways.
+        if let Some(escaped) = escaped_maps_query(query) {
+            return path == escaped || stripped == escaped;
+        }
+        return false;
     }
+    let path = path.strip_suffix(" (deleted)").unwrap_or(path);
     path.rsplit_once('/').map_or(path, |(_, base)| base) == query
         || path
             .strip_prefix("/memfd:")
@@ -1649,6 +1655,65 @@ mod tests {
             );
             assert_eq!(prot_at(addr as usize), (libc::PROT_READ, true));
             assert_eq!(libc::munmap(addr, SIZE), 0);
+        }
+    }
+
+    #[test]
+    fn deleted_suffix_is_tried_raw_before_stripped() {
+        // Genuine deletion markers still match the live path underneath.
+        assert!(maps_path_matches(
+            "/data/x/libfoo.so (deleted)",
+            "/data/x/libfoo.so"
+        ));
+        // A literal ` (deleted)` filename matches itself, not just its stem.
+        assert!(maps_path_matches(
+            "/data/x/libfoo.so (deleted)",
+            "/data/x/libfoo.so (deleted)"
+        ));
+        assert!(!maps_path_matches(
+            "/data/x/other.so (deleted)",
+            "/data/x/libfoo.so (deleted)"
+        ));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // mmap(2) has no Miri shim
+    fn literal_deleted_suffix_mapping_is_found() {
+        use crate::test_support::TempDir;
+
+        let dir = TempDir::new("deleted-name");
+        let file = dir.join("libfoo.so (deleted)");
+        std::fs::write(&file, vec![0u8; 4096]).unwrap();
+        let path = file.to_str().unwrap().to_string();
+        // SAFETY: fresh file mapping owned by this test.
+        let address = unsafe {
+            let fd = libc::open(crate::sys::cstring(&path).unwrap().as_ptr(), libc::O_RDONLY);
+            assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+            let address = libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                fd,
+                0,
+            );
+            assert_ne!(
+                address,
+                libc::MAP_FAILED,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+            assert_eq!(libc::close(fd), 0);
+            address as usize
+        };
+        let found = get_modules_by_name(&path);
+        assert_eq!(
+            found.iter().map(|info| info.start).collect::<Vec<_>>(),
+            [address]
+        );
+        // SAFETY: cleanup our mapping.
+        unsafe {
+            assert_eq!(libc::munmap(address as *mut c_void, 4096), 0);
         }
     }
 
