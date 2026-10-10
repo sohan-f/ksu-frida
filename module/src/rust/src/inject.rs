@@ -1633,6 +1633,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // O_NONBLOCK open has no Miri shim
     fn copy_file_rejects_a_missing_source() {
         let dir = TempDir::new("copy-missing");
         let dst = dir.join("dst.bin");
