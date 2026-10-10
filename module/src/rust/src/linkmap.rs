@@ -604,10 +604,17 @@ unsafe fn scrub_tables(
     replacement: &[u8],
 ) -> (bool, usize) {
     let mut symbols = 0usize;
-    if symtab != base && nsyms <= MAX_SYMBOLS {
+    // The table span itself must be readable: a counted walk over an
+    // unmapped base faults on its first step.
+    let symtab_ok = symtab != base
+        && nsyms <= MAX_SYMBOLS
+        && symtab
+            .checked_add(nsyms.saturating_mul(size_of::<Sym>()))
+            .is_some_and(|end| range_is_readable(symtab, end));
+    if symtab_ok {
         for i in 0..nsyms {
-            // SAFETY: `i` is bounded by `nchain` from our own hash table
-            // (capped above); each step lands inside our own table; unaligned copy.
+            // SAFETY: `i` is bounded by the span checked above; each step
+            // lands inside our own readable table; unaligned copy.
             let sym: Sym =
                 unsafe { ((symtab + i * size_of::<Sym>()) as *const Sym).read_unaligned() };
             let off = sym.st_name as usize;
@@ -684,9 +691,12 @@ unsafe fn scrub_elf_metadata(info: *mut DlPhdrInfo, replacement: &[u8]) -> (bool
     // Walk the declared segment, not a fixed prefix: entries may legally sit
     // anywhere before DT_NULL. The mapping cap keeps hostile sizes inside
     // readable memory; the absolute cap bounds the work itself.
-    let Some((_, map_end)) = crate::remap::mapped_range(dyn_addr) else {
+    let Some((dyn_prot, map_end)) = crate::remap::mapped_range(dyn_addr) else {
         return (false, 0, true);
     };
+    if dyn_prot & libc::PROT_READ == 0 {
+        return (false, 0, true);
+    }
     let count = (dyn_size / size_of::<Dyn>())
         .min(map_end.saturating_sub(dyn_addr) / size_of::<Dyn>())
         .min(MAX_DYNAMIC);
@@ -726,7 +736,14 @@ unsafe fn scrub_elf_metadata(info: *mut DlPhdrInfo, replacement: &[u8]) -> (bool
     };
 
     let nsyms = if hash != base {
-        // SAFETY: `hash` names our own read-only table; unaligned-safe `u32` reads.
+        // The count header must be readable before trusting it.
+        let Some(hash_end) = hash.checked_add(8) else {
+            return (false, 0, true);
+        };
+        if !range_is_readable(hash, hash_end) {
+            return (false, 0, true);
+        }
+        // SAFETY: 8 readable bytes validated above; unaligned-safe `u32` reads.
         unsafe { (hash as *const u32).add(1).read_unaligned() as usize }
     } else if gnu_hash != base {
         // SAFETY: `gnu_hash` names our own read-only table; the callee
@@ -749,13 +766,25 @@ unsafe fn scrub_elf_metadata(info: *mut DlPhdrInfo, replacement: &[u8]) -> (bool
     }
 }
 
+/// True when one live mapping covers `[start, end)` readably.
+fn range_is_readable(start: usize, end: usize) -> bool {
+    crate::remap::mapped_perms(start, end).is_some_and(|prot| prot & libc::PROT_READ != 0)
+}
+
 /// Upper bound on the symbol count from a GNU hash table.
 ///
 /// # Safety
 /// `table` must address a readable `DT_GNU_HASH` table of our own image;
 /// every read below stays inside its header, buckets, and chains.
 unsafe fn gnu_nsyms(table: usize) -> usize {
-    // SAFETY: header of our own table; unaligned-safe `u32` reads.
+    // The header itself must be readable before trusting its counts.
+    let Some(table_end) = table.checked_add(16) else {
+        return 0;
+    };
+    if !range_is_readable(table, table_end) {
+        return 0;
+    }
+    // SAFETY: header of our own readable table; unaligned-safe `u32` reads.
     let (nbuckets, symoffset, bloom_words) = unsafe {
         let header = table as *const u32;
         (
@@ -776,12 +805,23 @@ unsafe fn gnu_nsyms(table: usize) -> usize {
     let Some(chain) = nbuckets.checked_mul(4).and_then(|b| buckets.checked_add(b)) else {
         return 0;
     };
+    // Buckets are read eagerly below, so the whole array must be readable,
+    // not just its start: a gap inside still faults the walker outright.
+    let Some(buckets_end) = buckets.checked_add(nbuckets.saturating_mul(4)) else {
+        return 0;
+    };
+    if !range_is_readable(buckets, buckets_end) {
+        return 0;
+    }
     // Corrupt stop-bit-less chain would read MBs past the table inside
     // the linker callback with no fault guard; cap the walk to the live
     // mapping end as well as the symbol budget.
-    let Some((_, map_end)) = crate::remap::mapped_range(chain) else {
+    let Some((chain_prot, map_end)) = crate::remap::mapped_range(chain) else {
         return 0;
     };
+    if chain_prot & libc::PROT_READ == 0 {
+        return 0;
+    }
     let map_words = map_end.saturating_sub(chain) / 4;
     let mut budget = MAX_SYMBOLS.min(map_words);
     if budget == 0 {
@@ -1183,6 +1223,134 @@ mod tests {
         assert!(!entry_matches(b"abc", b"", true));
         assert!(!entry_matches(b"short", b"much longer needle", true));
         assert!(!entry_matches(b"short", b"much longer needle", false));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // mmap(2)/mprotect(2) have no Miri shims
+    #[cfg(target_pointer_width = "64")]
+    fn gnu_nsyms_skips_gap_buckets_with_mapped_chain() {
+        const SIZE: usize = 12288;
+        const PAGE: usize = 4096;
+        // SAFETY: one three-page mapping owned by this test; middle goes dark.
+        let base = unsafe {
+            let base = libc::mmap(
+                std::ptr::null_mut(),
+                SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                -1,
+                0,
+            );
+            assert_ne!(
+                base,
+                libc::MAP_FAILED,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+            assert_eq!(
+                libc::mprotect((base as usize + PAGE) as *mut c_void, PAGE, libc::PROT_NONE),
+                0,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+            base as usize
+        };
+        // Buckets fill the dark page exactly; the chain lands mapped past it,
+        // so only the bucket-range check (not the chain cap) stops the walk.
+        // SAFETY: header below is fully inside our readable first page.
+        unsafe {
+            let header = base as *mut u32;
+            header.write_unaligned(1024);
+            header.add(1).write_unaligned(0);
+            header
+                .add(2)
+                .write_unaligned(((PAGE - 16) / size_of::<usize>()) as u32);
+        }
+        // SAFETY: as above; no bucket is read (dark), so no walk happens.
+        assert_eq!(unsafe { gnu_nsyms(base) }, 0);
+
+        // SAFETY: cleanup our mapping (light the dark page first).
+        unsafe {
+            assert_eq!(
+                libc::mprotect(
+                    (base + PAGE) as *mut c_void,
+                    PAGE,
+                    libc::PROT_READ | libc::PROT_WRITE
+                ),
+                0
+            );
+            assert_eq!(libc::munmap(base as *mut c_void, SIZE), 0);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // Miri-interpreted addresses never appear in host maps
+    #[cfg(target_pointer_width = "64")]
+    fn gnu_nsyms_skips_unmapped_buckets() {
+        // Header valid, buckets aimed 8GB out: no readable range, no walk.
+        let mut blob = vec![1u32, 1, 1 << 30, 0];
+        blob.extend([0u32, 0]);
+        // SAFETY: blob outlives the call; the bucket range is unmapped.
+        assert_eq!(unsafe { gnu_nsyms(blob.as_ptr() as usize) }, 0);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // mmap(2)/mprotect(2) have no Miri shims
+    #[cfg(target_pointer_width = "64")]
+    fn gnu_nsyms_refuses_unreadable_ranges() {
+        const SIZE: usize = 8192;
+        const HALF: usize = 4096;
+        // SAFETY: one two-page mapping owned by this test; split below.
+        let base = unsafe {
+            let base = libc::mmap(
+                std::ptr::null_mut(),
+                SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                -1,
+                0,
+            );
+            assert_ne!(
+                base,
+                libc::MAP_FAILED,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+            // Second half goes dark: still a live mapping, no longer readable.
+            assert_eq!(
+                libc::mprotect((base as usize + HALF) as *mut c_void, HALF, libc::PROT_NONE),
+                0,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+            base as usize
+        };
+        // Header itself unreadable: fail closed without touching it.
+        // SAFETY: `base + HALF` names our live (if dark) mapping.
+        assert_eq!(unsafe { gnu_nsyms(base + HALF) }, 0);
+
+        // Buckets routed into the dark half: containment passes (mapped)
+        // but the readability check stops the walk before any read.
+        let bloom_words = (HALF - 16) / size_of::<usize>();
+        // SAFETY: header below is fully inside our readable half.
+        unsafe {
+            let header = base as *mut u32;
+            header.write_unaligned(1);
+            header.add(1).write_unaligned(0);
+            header.add(2).write_unaligned(bloom_words as u32);
+        }
+        // SAFETY: as above; the bucket range is dark, so no walk happens.
+        assert_eq!(unsafe { gnu_nsyms(base) }, 0);
+
+        // SAFETY: cleanup our mapping (light the dark half first).
+        unsafe {
+            let dark = (base + HALF) as *mut c_void;
+            assert_eq!(
+                libc::mprotect(dark, HALF, libc::PROT_READ | libc::PROT_WRITE),
+                0
+            );
+            assert_eq!(libc::munmap(base as *mut c_void, SIZE), 0);
+        }
     }
 
     #[test]
