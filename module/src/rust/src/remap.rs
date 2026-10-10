@@ -203,9 +203,11 @@ fn query_file_id(query: &str) -> Option<FileId> {
     }
     let meta = std::fs::metadata(query).ok()?;
     use std::os::unix::fs::MetadataExt;
+    // dev_t and the major/minor return types differ per ABI (u64/i32/u32
+    // across glibc and Bionic targets); values are small and non-negative.
     Some(FileId {
-        dev_major: libc::major(meta.dev()) as u32,
-        dev_minor: libc::minor(meta.dev()) as u32,
+        dev_major: libc::major(meta.dev() as libc::dev_t) as u32,
+        dev_minor: libc::minor(meta.dev() as libc::dev_t) as u32,
         inode: meta.ino(),
     })
 }
