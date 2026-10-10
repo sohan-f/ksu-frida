@@ -412,6 +412,34 @@ fn ensure_dir(path: &str, mode: libc::mode_t) -> bool {
     true
 }
 
+// Creates a stage dir exclusively: a pre-existing entry is never adopted,
+// so later cleanup only ever removes files this attempt created.
+fn create_stage_dir(path: &str) -> bool {
+    let Some(c_path) = stage_cpath(path) else {
+        return false;
+    };
+    // SAFETY: `c_path` is NUL-terminated; anything but fresh creation fails.
+    if unsafe { libc::mkdir(c_path.as_ptr(), 0o700) } != 0 {
+        return false;
+    }
+
+    // SAFETY: `zeroed` stat as an output slot; no invariants yet.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `lstat` on our NUL-terminated path writes only into `st` above.
+    if unsafe { libc::lstat(c_path.as_ptr(), &raw mut st) } != 0 {
+        return false;
+    }
+    // lstat, not stat: a raced-in symlink final component must not pass.
+    #[allow(clippy::unnecessary_cast)]
+    let (ifmt, iflnk, ifdir) = (
+        libc::S_IFMT as u32,
+        libc::S_IFLNK as u32,
+        libc::S_IFDIR as u32,
+    );
+    let fmt = st.st_mode & ifmt;
+    fmt != iflnk && fmt == ifdir
+}
+
 fn remove_file(path: &str) -> bool {
     let Some(c_path) = stage_cpath(path) else {
         return false;
@@ -690,7 +718,7 @@ fn stage_gadget(app_name: &str, src_lib_path: &str) -> Option<String> {
     sweep_stale_stage_dirs(&cache_dir);
     // SAFETY: `getpid(2)` cannot fail.
     let stage_dir = format!("{cache_dir}/{}", unsafe { libc::getpid() });
-    if !ensure_dir(&stage_dir, 0o700) {
+    if !create_stage_dir(&stage_dir) {
         return None;
     }
     // Exclusive creation prevents a planted marker or hard link from being truncated.
@@ -1228,6 +1256,30 @@ mod tests {
         cleanup_stage_dir(stage.to_str().unwrap());
         assert!(!stage.join(STAGE_MARKER).exists());
         assert!(stage.join("leftover.bin").exists());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // real symlinks are outside miri's filesystem
+    fn create_stage_dir_never_adopts_existing_entries() {
+        let dir = TempDir::new("stage-excl");
+        let fresh = dir.join("fresh");
+        assert!(create_stage_dir(fresh.to_str().unwrap()));
+        assert!(fresh.is_dir());
+
+        // A pre-existing directory (and its files) must survive untouched.
+        let lived = dir.join("lived");
+        fs::create_dir_all(&lived).unwrap();
+        fs::write(lived.join("libsecmon.so"), b"x").unwrap();
+        assert!(!create_stage_dir(lived.to_str().unwrap()));
+        assert!(lived.join("libsecmon.so").exists());
+
+        let file = dir.join("file");
+        fs::write(&file, b"x").unwrap();
+        assert!(!create_stage_dir(file.to_str().unwrap()));
+
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&fresh, &link).unwrap();
+        assert!(!create_stage_dir(link.to_str().unwrap()));
     }
 
     #[test]
