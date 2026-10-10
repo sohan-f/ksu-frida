@@ -198,7 +198,10 @@ const DT_STRSZ: i64 = 10;
 const DT_SONAME: i64 = 14;
 const DT_GNU_HASH: i64 = 0x6fff_fef5;
 
-const MAX_DYNAMIC: usize = 128;
+// Backstop only: the walk above is already bounded by the declared segment
+// size and the live mapping. 16KB of entries exceeds any legitimate table
+// (the shipped gadget carries 26) while keeping hostile walks trivial.
+const MAX_DYNAMIC: usize = 1024;
 const MAX_SYMBOLS: usize = 1_000_000;
 
 /// Fuzz driver for [`scrub_elf_metadata`]: carves an adversarial but
@@ -348,7 +351,8 @@ pub fn fuzz_scrub_elf(data: &[u8]) {
                 p_offset: 0,
                 p_vaddr: dyn_off as _,
                 p_paddr: 0,
-                p_filesz: 0,
+                // Cover exactly the table above: the walk is bounded by this size.
+                p_filesz: (dyn_count * size_of::<Dyn>()) as _,
                 p_memsz: 0,
                 p_align: 0,
             });
@@ -657,6 +661,7 @@ unsafe fn scrub_elf_metadata(info: *mut DlPhdrInfo, replacement: &[u8]) -> (bool
     }
 
     let mut dyn_addr = 0usize;
+    let mut dyn_size = 0usize;
     for i in 0..phnum as usize {
         // SAFETY: `i` is bounded by the linker's `phnum`; each step lands
         // inside our own read-only table; unaligned copy, no alignment promise.
@@ -668,6 +673,7 @@ unsafe fn scrub_elf_metadata(info: *mut DlPhdrInfo, replacement: &[u8]) -> (bool
                 return (false, 0, true);
             };
             dyn_addr = addr;
+            dyn_size = p.p_filesz as usize;
             break;
         }
     }
@@ -675,9 +681,18 @@ unsafe fn scrub_elf_metadata(info: *mut DlPhdrInfo, replacement: &[u8]) -> (bool
         return (false, 0, true);
     }
 
+    // Walk the declared segment, not a fixed prefix: entries may legally sit
+    // anywhere before DT_NULL. The mapping cap keeps hostile sizes inside
+    // readable memory; the absolute cap bounds the work itself.
+    let Some((_, map_end)) = crate::remap::mapped_range(dyn_addr) else {
+        return (false, 0, true);
+    };
+    let count = (dyn_size / size_of::<Dyn>())
+        .min(map_end.saturating_sub(dyn_addr) / size_of::<Dyn>())
+        .min(MAX_DYNAMIC);
     let (mut strtab, mut strsz, mut symtab, mut hash, mut gnu_hash, mut soname) =
         (0usize, 0usize, 0usize, 0usize, 0usize, None::<usize>);
-    for i in 0..MAX_DYNAMIC {
+    for i in 0..count {
         // SAFETY: bounded walk of the linker's dynamic array; each step
         // lands inside our own read-only table; unaligned copy.
         let d: Dyn = unsafe { ((dyn_addr + i * size_of::<Dyn>()) as *const Dyn).read_unaligned() };
@@ -1493,7 +1508,7 @@ mod tests {
                 p_offset: 0,
                 p_vaddr: dyn_off as u64,
                 p_paddr: 0,
-                p_filesz: 0,
+                p_filesz: 6 * size_of::<Dyn64>() as u64,
                 p_memsz: 0,
                 p_align: 0,
             });
@@ -1598,7 +1613,7 @@ mod tests {
                 p_offset: 0,
                 p_vaddr: dyn_off as u64,
                 p_paddr: 0,
-                p_filesz: 0,
+                p_filesz: 6 * size_of::<Dyn64>() as u64,
                 p_memsz: 0,
                 p_align: 0,
             });
@@ -1712,7 +1727,7 @@ mod tests {
                 p_offset: 0,
                 p_vaddr: dyn_off as u64,
                 p_paddr: 0,
-                p_filesz: 0,
+                p_filesz: 7 * size_of::<Dyn64>() as u64,
                 p_memsz: 0,
                 p_align: 0,
             });
@@ -1788,6 +1803,169 @@ mod tests {
             assert_eq!(at(soname_off), b"libnative_1.so");
             assert_eq!(at(sym1_off), b"frida_agent_main");
             assert_eq!(at(sym2_off), b"puts");
+            assert_eq!(libc::munmap(page as *mut c_void, SIZE), 0);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    #[cfg(target_pointer_width = "64")]
+    fn elf_scrub_finds_entries_past_the_old_prefix_cap() {
+        const SIZE: usize = 4096;
+        const COUNT: usize = 160;
+        // SAFETY: fresh anonymous page owned by this test.
+        let page = unsafe {
+            let page = libc::mmap(
+                std::ptr::null_mut(),
+                SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                -1,
+                0,
+            );
+            assert_ne!(
+                page,
+                libc::MAP_FAILED,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+            page as *mut u8
+        };
+
+        let soname_off = 1usize;
+        let sym1_off = 20usize;
+        let strtab_off = 2700usize;
+        let strtab: &[u8] = b"\0libfrida-gadget.so\0frida_agent_main\0";
+        let symtab_off = 2900usize;
+        let hash_off = 3100usize;
+        let dyn_off = 64usize;
+
+        // SAFETY: all writes land inside our own page at the offsets above.
+        unsafe {
+            (page.add(0) as *mut Phdr64).write(Phdr64 {
+                p_type: PT_DYNAMIC,
+                p_flags: 0,
+                p_offset: 0,
+                p_vaddr: dyn_off as u64,
+                p_paddr: 0,
+                p_filesz: (COUNT * size_of::<Dyn64>()) as u64,
+                p_memsz: 0,
+                p_align: 0,
+            });
+            // Filler first: the metadata this test cares about sits past
+            // the old fixed walk, with DT_NULL terminating the table.
+            for i in 0..COUNT {
+                let (tag, val) = match i {
+                    150 => (DT_STRTAB, strtab_off as u64),
+                    151 => (DT_STRSZ, strtab.len() as u64),
+                    152 => (DT_SYMTAB, symtab_off as u64),
+                    153 => (DT_HASH, hash_off as u64),
+                    154 => (DT_SONAME, soname_off as u64),
+                    155 => (DT_NULL, 0),
+                    _ => (1, 0),
+                };
+                (page.add(dyn_off + i * size_of::<Dyn64>()) as *mut Dyn64).write(Dyn64 {
+                    d_tag: tag,
+                    d_val: val,
+                });
+            }
+            std::ptr::copy_nonoverlapping(strtab.as_ptr(), page.add(strtab_off), strtab.len());
+            let names = [0u32, sym1_off as u32];
+            for (i, name) in names.iter().enumerate() {
+                (page.add(symtab_off + i * size_of::<Sym64>()) as *mut Sym64).write(Sym64 {
+                    st_name: *name,
+                    st_info: 0,
+                    st_other: 0,
+                    st_shndx: 0,
+                    st_value: 0,
+                    st_size: 0,
+                });
+            }
+            let hash: [u32; 5] = [1, 2, 1, 0, 1];
+            std::ptr::copy_nonoverlapping(
+                hash.as_ptr(),
+                page.add(hash_off) as *mut u32,
+                hash.len(),
+            );
+        }
+
+        let mut info = DlPhdrInfo {
+            addr: page as usize,
+            name: c"fake.so".as_ptr(),
+            phdr: page as *const c_void,
+            phnum: 1,
+        };
+        // SAFETY: `info` describes the fake image above; the replacement
+        // fits every footprint it can touch.
+        let (soname_done, symbols, restored) =
+            unsafe { scrub_elf_metadata(&raw mut info, b"libnative_1.so") };
+        assert!(restored);
+        // SAFETY: read-only checks of our own page (perms restored to R).
+        unsafe {
+            let at =
+                |off: usize| CStr::from_ptr(page.add(strtab_off + off) as *const c_char).to_bytes();
+            assert!(soname_done);
+            assert_eq!(symbols, 1);
+            assert_eq!(at(soname_off), b"libnative_1.so");
+            assert_eq!(at(sym1_off), b"libnative_1.so");
+            assert_eq!(libc::munmap(page as *mut c_void, SIZE), 0);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    #[cfg(target_pointer_width = "64")]
+    fn elf_scrub_huge_segment_stays_bounded() {
+        const SIZE: usize = 4096;
+        // SAFETY: fresh anonymous page owned by this test.
+        let page = unsafe {
+            let page = libc::mmap(
+                std::ptr::null_mut(),
+                SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                -1,
+                0,
+            );
+            assert_ne!(
+                page,
+                libc::MAP_FAILED,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+            page as *mut u8
+        };
+
+        // SAFETY: hostile-declared segment over junk bytes: no tag matches
+        // and padding zeros terminate, so the walk stays inside the page.
+        unsafe {
+            (page.add(0) as *mut Phdr64).write(Phdr64 {
+                p_type: PT_DYNAMIC,
+                p_flags: 0,
+                p_offset: 0,
+                p_vaddr: 64,
+                p_paddr: 0,
+                p_filesz: u64::MAX,
+                p_memsz: 0,
+                p_align: 0,
+            });
+            std::ptr::write_bytes(page.add(64), 0xFF, 512);
+        }
+
+        let mut info = DlPhdrInfo {
+            addr: page as usize,
+            name: c"fake.so".as_ptr(),
+            phdr: page as *const c_void,
+            phnum: 1,
+        };
+        // SAFETY: `info` describes the fake image above.
+        let (soname_done, symbols, restored) =
+            unsafe { scrub_elf_metadata(&raw mut info, b"libnative_1.so") };
+        assert!(!soname_done);
+        assert_eq!(symbols, 0);
+        assert!(restored);
+        // SAFETY: cleanup our mapping.
+        unsafe {
             assert_eq!(libc::munmap(page as *mut c_void, SIZE), 0);
         }
     }
