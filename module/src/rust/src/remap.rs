@@ -135,12 +135,21 @@ fn maps_path_matches(path: &str, query: &str) -> bool {
     if query.contains('/') {
         // File load: exact staged path. Basename-only would rebuild a
         // foreign same-basename lib in another dir.
-        return path == query;
+        if path == query {
+            return true;
+        }
+        // Newlines arrive octal-escaped; try that form too.
+        return escaped_maps_query(query).is_some_and(|escaped| path == escaped);
     }
     path.rsplit_once('/').map_or(path, |(_, base)| base) == query
         || path
             .strip_prefix("/memfd:")
             .is_some_and(|name| name == query)
+}
+
+// The kernel's octal escape for a newline in a mapped pathname, if any.
+fn escaped_maps_query(query: &str) -> Option<String> {
+    query.contains('\n').then(|| query.replace('\n', "\\012"))
 }
 
 fn get_modules_by_name(m_name: &str) -> Vec<ProcMapsInfo> {
@@ -150,11 +159,14 @@ fn get_modules_by_name(m_name: &str) -> Vec<ProcMapsInfo> {
         return maps;
     };
 
+    let escaped = escaped_maps_query(m_name);
     let mut reader = BufReader::new(file);
     let mut line = String::with_capacity(256);
     while reader.read_line(&mut line).unwrap_or(0) > 0 {
-        // An exact match always contains the query, so this pre-screen is sound.
-        if !line.contains(m_name) {
+        // An exact match always contains the query, so this pre-screen is
+        // sound; the escaped form covers newline pathnames the same way.
+        let hit = line.contains(m_name) || escaped.as_deref().is_some_and(|q| line.contains(q));
+        if !hit {
             line.clear();
             continue;
         }
@@ -1546,6 +1558,66 @@ mod tests {
             );
             assert_eq!(prot_at(addr as usize), (libc::PROT_READ, true));
             assert_eq!(libc::munmap(addr, SIZE), 0);
+        }
+    }
+
+    #[test]
+    fn escaped_query_covers_newline_pathnames_only() {
+        assert_eq!(escaped_maps_query("/data/x/libfoo.so"), None);
+        assert_eq!(
+            escaped_maps_query("/data/x/a\nb.so"),
+            Some("/data/x/a\\012b.so".to_string())
+        );
+    }
+
+    #[test]
+    fn newline_path_matches_octal_escaped_maps_line() {
+        let info =
+            parse_maps_line("7ac49c2000-7ac4a26000 r--p 00000000 00:00 0 /data/x/a\\012b.so\n")
+                .expect("line");
+        assert_eq!(info.path, "/data/x/a\\012b.so");
+        assert!(maps_path_matches(&info.path, "/data/x/a\nb.so"));
+        assert!(!maps_path_matches(&info.path, "/data/x/a\nc.so"));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // mmap(2) has no Miri shim
+    fn newline_backed_mapping_is_found() {
+        use crate::test_support::TempDir;
+
+        let dir = TempDir::new("newline-map");
+        let file = dir.join("n\nl.so");
+        std::fs::write(&file, vec![0u8; 4096]).unwrap();
+        let path = file.to_str().unwrap().to_string();
+        // SAFETY: fresh file mapping owned by this test.
+        let address = unsafe {
+            let fd = libc::open(crate::sys::cstring(&path).unwrap().as_ptr(), libc::O_RDONLY);
+            assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+            let address = libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                fd,
+                0,
+            );
+            assert_ne!(
+                address,
+                libc::MAP_FAILED,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+            assert_eq!(libc::close(fd), 0);
+            address
+        };
+        let found = get_modules_by_name(&path);
+        assert!(
+            found.iter().any(|info| info.start == address as usize),
+            "newline-backed mapping must be found"
+        );
+        // SAFETY: cleanup our mapping.
+        unsafe {
+            assert_eq!(libc::munmap(address, 4096), 0);
         }
     }
 
