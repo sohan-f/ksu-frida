@@ -70,7 +70,12 @@ impl Default for TargetConfig {
 }
 
 pub fn load_config(module_dir: &str, app_name: &str) -> Option<TargetConfig> {
-    load_advanced_config(module_dir, app_name).or_else(|| load_simple_config(module_dir, app_name))
+    match load_advanced_config(module_dir, app_name) {
+        AdvancedOutcome::Resolved(cfg) => Some(cfg),
+        // Matched but invalid: never downgrade to legacy without gating.
+        AdvancedOutcome::Rejected => None,
+        AdvancedOutcome::Absent => load_simple_config(module_dir, app_name),
+    }
 }
 
 fn deserialize_libraries(value: &Value) -> Option<Vec<String>> {
@@ -254,18 +259,20 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|w| w[0] == first && w == needle)
 }
 
-fn load_advanced_config(module_dir: &str, app_name: &str) -> Option<TargetConfig> {
+fn load_advanced_config(module_dir: &str, app_name: &str) -> AdvancedOutcome {
     if app_name.is_empty() {
-        return None;
+        return AdvancedOutcome::Absent;
     }
-    let bytes = fs::read(format!("{module_dir}/config.json")).ok()?;
+    let Ok(bytes) = fs::read(format!("{module_dir}/config.json")) else {
+        return AdvancedOutcome::Absent;
+    };
 
     // Byte precheck skips the parse for non-targets. A miss is definitive
     // only without backslashes: `\uXXXX` escapes decode to characters
     // (e.g. `.`) that never appear literally, so files holding escapes
     // take the slow path and parse anyway.
     if !contains_bytes(&bytes, app_name.as_bytes()) && !bytes.contains(&b'\\') {
-        return None;
+        return AdvancedOutcome::Absent;
     }
 
     let doc: Value = match serde_json::from_slice(&bytes) {
@@ -277,18 +284,18 @@ fn load_advanced_config(module_dir: &str, app_name: &str) -> Option<TargetConfig
                 err.column(),
                 err
             ));
-            return None;
+            return AdvancedOutcome::Absent;
         }
     };
 
     if !doc.is_object() {
         loge("config expected a json root object");
-        return None;
+        return AdvancedOutcome::Absent;
     }
 
     let Some(targets) = doc.get("targets").and_then(Value::as_array) else {
         loge("expected config targets to be an array");
-        return None;
+        return AdvancedOutcome::Absent;
     };
 
     for target in targets {
@@ -297,11 +304,18 @@ fn load_advanced_config(module_dir: &str, app_name: &str) -> Option<TargetConfig
             continue;
         }
         if let Some(deserialized) = deserialize_target_config(target) {
-            return Some(deserialized);
+            return AdvancedOutcome::Resolved(deserialized);
         }
+        return AdvancedOutcome::Rejected;
     }
 
-    None
+    AdvancedOutcome::Absent
+}
+
+enum AdvancedOutcome {
+    Resolved(TargetConfig),
+    Rejected,
+    Absent,
 }
 
 #[cfg(test)]
@@ -357,6 +371,28 @@ mod tests {
         assert_eq!(other.start_up_delay_ms, 0);
         assert!(!other.child_gating.enabled);
         assert!(other.child_gating.injected_libraries.is_empty());
+    }
+
+    #[test]
+    fn matched_invalid_mode_suppresses_legacy_fallback() {
+        let dir = TempDir::new("matched-invalid");
+        fs::write(
+            dir.join("config.json"),
+            r#"{"targets":[{"app_name":"com.example.app","enabled":true,
+                "start_up_delay_ms":0,"injected_libraries":[],
+                "child_gating":{"enabled":true,"mode":"kil"}}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("target_packages"),
+            "com.example.app\ncom.legacy.app\n",
+        )
+        .unwrap();
+
+        // The matched-but-invalid target must not downgrade to legacy.
+        assert!(load_config(dir.to_str().unwrap(), "com.example.app").is_none());
+        // Unmatched apps still fall back to legacy.
+        assert!(load_config(dir.to_str().unwrap(), "com.legacy.app").is_some());
     }
 
     #[test]
