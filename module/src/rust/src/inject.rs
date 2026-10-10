@@ -17,6 +17,9 @@ const MODULE_DIR: &str = "/data/local/tmp/libsec";
 
 pub fn check_and_inject(app_name: &str) -> bool {
     let Some(cfg) = load_config(MODULE_DIR, app_name) else {
+        // Verbose only: unmatched processes (including secondary
+        // `package:process` ones, which need their own entries) stay silent.
+        logi_fmt(format_args!("No target configured for {app_name}"));
         return false;
     };
 

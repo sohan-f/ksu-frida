@@ -56,6 +56,11 @@ KsuFrida` to see if an error is logged.
 ### app_name
 The bundle id of the application you want to inject frida into.
 
+Secondary (private) processes declared with e.g. `android:process=":worker"`
+run as `package:worker` and do not match the bundle-id entry: give each
+process you want instrumented its own target entry with its full process
+name, and give each its own gadget port so their listeners never conflict.
+
 ### enabled
 If set to false, then this module will ignore this configuration.
 This is useful if you want to temporarily disable a target while maintaining the config.
