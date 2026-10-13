@@ -1,7 +1,7 @@
 {
-    "version": "17.23.2",
+    "version": "17.23.3",
     "sha256": {
-        "arm": "4a62daed3b1a17e95b3c3d16cd15948569bfacfa0ef6369115760256edb296bb",
-        "arm64": "a2cdc9d93f90ccd09bc05e1f37428fa5e88629f6084d83cb14faad2b7eaa592f"
+        "arm": "ac42d8faec2bad213a11ddc695a4165869c277b94e6e4813394ff6a0ddd68eea",
+        "arm64": "d8cdae77124a881e116fdf1fc991711e76030b649a003018f7425fb8cb990a69"
     }
 }
