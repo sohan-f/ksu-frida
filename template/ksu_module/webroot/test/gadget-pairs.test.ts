@@ -30,6 +30,7 @@ test("pair basenames isolate processes and sanitize hostile input", () => {
 test("parseGadgetPort accepts only the Frida range", () => {
     assert.equal(parseGadgetPort(27042), 27042);
     assert.equal(parseGadgetPort("27042"), 27042);
+    assert.equal(parseGadgetPort(" 27042 "), 27042);
     assert.equal(parseGadgetPort(1), 1);
     assert.equal(parseGadgetPort(65535), 65535);
     assert.equal(parseGadgetPort(0), null);
@@ -37,6 +38,8 @@ test("parseGadgetPort accepts only the Frida range", () => {
     assert.equal(parseGadgetPort(-1), null);
     assert.equal(parseGadgetPort(27.5), null);
     assert.equal(parseGadgetPort("abc"), null);
+    assert.equal(parseGadgetPort("27042junk"), null);
+    assert.equal(parseGadgetPort("+27042"), null);
     assert.equal(parseGadgetPort(""), null);
     assert.equal(parseGadgetPort(null), null);
     assert.equal(parseGadgetPort(undefined), null);

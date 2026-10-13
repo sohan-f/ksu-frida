@@ -91,7 +91,7 @@ test("pairsFromPackagesInfo skips errors, falls back to package", () => {
 });
 
 test("parsePorts keeps valid ports only", () => {
-    assert.deepEqual(parsePorts(["27042", "abc", "0", "65536", "-1"]), [27042]);
+    assert.deepEqual(parsePorts(["27042", "abc", "27042junk", "0", "65536", "-1"]), [27042]);
     assert.deepEqual(parsePorts(["1", "65535"]), [1, 65535]);
 });
 

@@ -612,8 +612,15 @@ function readAppsCache(): AppsCache | null {
         var raw = localStorage.getItem(APPS_CACHE_KEY);
         if (!raw) return null;
         var data = JSON.parse(raw);
-        if (!data || !Array.isArray(data.packages)) return null;
-        return data as AppsCache;
+        if (!data || !Array.isArray(data.packages) ||
+            !data.packages.every(function (p: unknown) { return typeof p === "string" && p.length > 0; })) return null;
+        var labels: Record<string, string> = {};
+        if (data.labels && typeof data.labels === "object" && !Array.isArray(data.labels)) {
+            Object.keys(data.labels).forEach(function (pkg) {
+                if (typeof data.labels[pkg] === "string") labels[pkg] = data.labels[pkg];
+            });
+        }
+        return { packages: data.packages, labels: labels };
     } catch (_) { return null; }
 }
 
@@ -660,7 +667,12 @@ async function listPackageNames(): Promise<string[]> {
             } catch (_) {
                 names = null;
             }
-            if (Array.isArray(names) && names.length > 0) return names;
+            if (Array.isArray(names)) {
+                names = names.filter(function (name): name is string {
+                    return typeof name === "string" && name.length > 0;
+                });
+                if (names.length > 0) return names;
+            }
             await delay(400);
         }
     }
@@ -2138,21 +2150,19 @@ async function refreshGadget() {
     var outcome = 0;
     var detail = "";
     try {
-        var r = await exec("mkdir -p " + dst + "; " +
-            "if [ -f " + GADGET_SRC + " ]; then " +
-            "rm -f " + dst + "/libsecmon.so.xz " + dst + "/libsecmon.so; " +
-            "cp -f " + GADGET_SRC + " " + dst + "/libsecmon.so.xz && " +
-            BUSYBOX_BIN + " unxz -f " + dst + "/libsecmon.so.xz && chmod 644 " + dst + "/libsecmon.so && echo GADGET_OK || echo GADGET_FAIL; " +
-            "else echo GADGET_SRC_MISSING; fi; " +
+        var r = await exec("D=" + dst + "; S=$D/.webui-refresh; B=" + BUSYBOX_BIN + "; " +
+            "mkdir -p \"$D\" && rm -rf \"$S\" && mkdir -p \"$S\" || exit 1; " +
+            "if [ ! -f " + GADGET_SRC + " ]; then echo GADGET_SRC_MISSING; rm -rf \"$S\"; exit 0; fi; " +
+            "cp -f " + GADGET_SRC + " \"$S/libsecmon.so.xz\" && \"$B\" unxz -f \"$S/libsecmon.so.xz\" && chmod 644 \"$S/libsecmon.so\" || { rm -rf \"$S\"; echo GADGET_FAIL; exit 1; }; " +
             "if [ -f " + GADGET32_SRC + " ]; then " +
-            "rm -f " + dst + "/libsecmon32.so.xz " + dst + "/libsecmon32.so; " +
-            "cp -f " + GADGET32_SRC + " " + dst + "/libsecmon32.so.xz && " +
-            BUSYBOX_BIN + " unxz -f " + dst + "/libsecmon32.so.xz && chmod 644 " + dst + "/libsecmon32.so && echo GADGET32_OK || echo GADGET32_FAIL; fi; " +
-            "echo " + SAVE_MARK);
+            "cp -f " + GADGET32_SRC + " \"$S/libsecmon32.so.xz\" && \"$B\" unxz -f \"$S/libsecmon32.so.xz\" && chmod 644 \"$S/libsecmon32.so\" || { rm -rf \"$S\"; echo GADGET32_FAIL; exit 1; }; fi; " +
+            "mv -f \"$S/libsecmon.so\" \"$D/libsecmon.so\" || { rm -rf \"$S\"; echo GADGET_FAIL; exit 1; }; " +
+            "if [ -f \"$S/libsecmon32.so\" ]; then mv -f \"$S/libsecmon32.so\" \"$D/libsecmon32.so\" || { rm -rf \"$S\"; echo GADGET32_FAIL; exit 1; }; fi; " +
+            "rm -rf \"$S\"; echo GADGET_OK; echo " + SAVE_MARK);
         var out = String(r.stdout || "");
         if (out.indexOf("GADGET_SRC_MISSING") !== -1) {
             outcome = 0;
-        } else if (out.indexOf("GADGET_OK") !== -1) {
+        } else if (r.errno === 0 && out.indexOf("GADGET_OK") !== -1) {
             outcome = 1;
             loadStatus();
         } else {

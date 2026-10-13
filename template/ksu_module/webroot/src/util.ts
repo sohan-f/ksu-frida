@@ -192,7 +192,9 @@ export function targetStatusCmd(names: string[]) {
 export function parsePorts(lines: string[]) {
     var ports: number[] = [];
     (lines || []).forEach(function (l: string) {
-        var p = parseInt(l, 10);
+        var text = String(l).trim();
+        if (!/^[0-9]+$/.test(text)) return;
+        var p = Number(text);
         if (p >= 1 && p <= 65535) ports.push(p);
     });
     return ports;
@@ -219,7 +221,8 @@ export function targetGadgetCfg(soName: string) {
 }
 
 export function parseGadgetPort(value: unknown): number | null {
-    var p = typeof value === "number" ? value : parseInt(String(value ?? ""), 10);
+    if (typeof value !== "number" && (typeof value !== "string" || !/^[0-9]+$/.test(value.trim()))) return null;
+    var p = typeof value === "number" ? value : Number(value.trim());
     if (typeof p !== "number" || !isFinite(p) || Math.floor(p) !== p) return null;
     if (p < 1 || p > 65535) return null;
     return p;
