@@ -46,21 +46,21 @@
             --scrim: rgba(0,0,0,.7);
             --shadow-strong: 0 8px 28px rgba(0,0,0,.6);
             /* M3 Standard motion (web fallback curves). Spatial carries
-               moves/resizes (damping 0.9, barely overshoots); effects
-               carries color/opacity (damping 1.0, never overshoots).
-               Fast = small parts, default = most. */
-            --ease-spatial-fast: cubic-bezier(0.27, 1.06, 0.18, 1.00);
-            --ease-spatial-default: cubic-bezier(0.27, 1.06, 0.18, 1.00);
-            --ease-effects-fast: cubic-bezier(0.31, 0.94, 0.34, 1.00);
-            --ease-effects-default: cubic-bezier(0.34, 0.80, 0.34, 1.00);
-            --ease-effects-slow: cubic-bezier(0.34, 0.88, 0.34, 1.00);
-            --ease-exit: cubic-bezier(0.30, 0.00, 0.80, 0.15);
-            --dur-spatial-fast: 350ms;
-            --dur-spatial-default: 500ms;
-            --dur-effects-fast: 150ms;
-            --dur-effects-default: 200ms;
-            --dur-effects-slow: 300ms;
-            --stagger-step: 35ms;
+               moves/resizes (soft landing, no overshoot); effects
+               carries color/opacity. Fast = small parts, default = most.
+               Durations run ~20% slow for a calmer feel. */
+            --ease-spatial-fast: cubic-bezier(0.30, 1.00, 0.22, 1.00);
+            --ease-spatial-default: cubic-bezier(0.30, 0.98, 0.22, 1.00);
+            --ease-effects-fast: cubic-bezier(0.30, 0.90, 0.30, 1.00);
+            --ease-effects-default: cubic-bezier(0.33, 0.85, 0.33, 1.00);
+            --ease-effects-slow: cubic-bezier(0.33, 0.90, 0.33, 1.00);
+            --ease-exit: cubic-bezier(0.32, 0.00, 0.72, 0.12);
+            --dur-spatial-fast: 420ms;
+            --dur-spatial-default: 600ms;
+            --dur-effects-fast: 180ms;
+            --dur-effects-default: 250ms;
+            --dur-effects-slow: 380ms;
+            --stagger-step: 45ms;
             color-scheme: dark;
         }
 
@@ -150,9 +150,9 @@
         }
 
         .container > .card:nth-child(2) { animation-delay: 0ms; }
-        .container > .card:nth-child(3) { animation-delay: 60ms; }
-        .container > .card:nth-child(4) { animation-delay: 120ms; }
-        .container > .card:nth-child(5) { animation-delay: 180ms; }
+        .container > .card:nth-child(3) { animation-delay: 70ms; }
+        .container > .card:nth-child(4) { animation-delay: 140ms; }
+        .container > .card:nth-child(5) { animation-delay: 210ms; }
 
         /* Status only reads out, so it stays chromeless; workflows keep cards. */
         .card.quiet {
@@ -187,7 +187,7 @@
             animation: row-in var(--dur-spatial-fast) var(--ease-spatial-fast) backwards;
         }
 
-        /* Stagger caps at 8 so long lists settle under ~600ms.
+        /* Stagger caps at 8 so long lists settle under ~750ms.
            JS marks rows from later renders .settled to skip animation. */
         #targets .target-row:nth-child(2) { animation-delay: calc(var(--stagger-step) * 1); }
         #targets .target-row:nth-child(3) { animation-delay: calc(var(--stagger-step) * 2); }
@@ -244,14 +244,14 @@
             white-space: nowrap;
             transition: background-color var(--dur-effects-default) var(--ease-effects-default),
                 color var(--dur-effects-default) var(--ease-effects-default),
-                transform var(--dur-spatial-fast) var(--ease-spatial-fast);
+                transform var(--dur-effects-fast) var(--ease-effects-fast);
         }
 
         .seg-btn:focus-visible { outline: 2px solid var(--accent-focus); outline-offset: -2px; }
 
         .seg-on { background: var(--accent); color: var(--accent-ink); }
 
-        .seg-btn:not(.seg-on):active { background: rgba(241,236,236,.07); transform: scale(.96); }
+        .seg-btn:not(.seg-on):active { background: rgba(241,236,236,.07); transform: scale(.97); }
 
         .lib-list { display: flex; flex-direction: column; gap: 8px; }
 
@@ -288,6 +288,11 @@
         #detail-body > :first-child { margin-top: 0; }
 
         .slotrow { display: flex; gap: 8px; align-items: center; padding-left: 12px; }
+
+        @keyframes slot-in { from { opacity: 0; transform: translateY(2px); } }
+
+        /* Slot hints fade-slide in once; cleared slots stay still. */
+        .slotrow > span:not(:empty) { animation: slot-in var(--dur-effects-default) var(--ease-effects-default); }
 
         .slotrow .btn { flex: 0 0 auto; }
 
@@ -334,10 +339,10 @@
             transition: background-color var(--dur-effects-default) var(--ease-effects-default),
                 opacity var(--dur-effects-default) var(--ease-effects-default),
                 border-color var(--dur-effects-default) var(--ease-effects-default),
-                transform var(--dur-spatial-fast) var(--ease-spatial-fast);
+                transform var(--dur-effects-fast) var(--ease-effects-fast);
         }
 
-        .btn:active { background: rgba(241,236,236,.06); transform: scale(.96); }
+        .btn:active { background: rgba(241,236,236,.06); transform: scale(.97); }
         .btn:focus-visible { outline: 2px solid var(--accent-focus); outline-offset: 1px; }
 
         .btn-sm { padding: 4px 12px; font-size: 12px; min-height: 32px; }
@@ -397,7 +402,7 @@
             border-radius: 50%;
             border: 2px solid rgba(241,236,236,.35);
             border-top-color: var(--text);
-            animation: spin .7s linear infinite;
+            animation: spin .8s linear infinite;
         }
 
         .btn-primary.busy::before {
@@ -414,7 +419,7 @@
             border-radius: 50%;
             border: 2px solid var(--text2);
             border-top-color: transparent;
-            animation: spin .7s linear infinite;
+            animation: spin .8s linear infinite;
         }
 
         .connect-block { margin-bottom: 12px; }
@@ -446,13 +451,8 @@
             from { opacity: .4; transform: scale(.94); }
         }
 
-        @keyframes pulse-soft {
-            0%, 100% { opacity: 1; }
-            50% { opacity: .55; }
-        }
-
-        /* Loading placeholders breathe; spinners keep linear rotation. */
-        .empty:has(.spinner) { animation: pulse-soft var(--dur-effects-slow) var(--ease-effects-slow) infinite; }
+        /* Loading state rides the spinner alone: no parent breathing,
+           cheaper on low-end WebViews and needs no :has support. */
 
         @media (prefers-reduced-motion: reduce) {
             *, *::before, *::after { transition: none !important; animation: none !important; }
@@ -507,7 +507,7 @@
             bottom: 3px;
             background: #c9c4b8;
             border-radius: 50%;
-            transition: transform var(--dur-spatial-fast) var(--ease-spatial-fast),
+            transition: transform var(--dur-effects-fast) var(--ease-effects-fast),
                 background-color var(--dur-effects-default) var(--ease-effects-default);
         }
 
@@ -593,12 +593,12 @@
             font-size: 13px;
             border-radius: 6px;
             transition: background-color var(--dur-effects-default) var(--ease-effects-default),
-                transform var(--dur-spatial-fast) var(--ease-spatial-fast);
+                transform var(--dur-effects-fast) var(--ease-effects-fast);
             animation: row-in var(--dur-spatial-fast) var(--ease-spatial-fast) backwards;
         }
 
         .app-row:hover { background: var(--surface2); }
-        .app-row:active { transform: scale(.98); }
+        .app-row:active { transform: scale(.99); }
 
         /* Long package lists skip off-screen rendering; intrinsic size
            keeps the scrollbar stable. Unsupported WebViews ignore it. */
@@ -611,16 +611,26 @@
            batches after first paint do too — entrance is open-only. */
         #app-list.settled .app-row { animation: none; }
 
-        /* Skeleton rows hold layout while labels/packages load. */
-        @keyframes shimmer { to { background-position: -200% 0; } }
+        /* Skeleton rows hold layout while labels/packages load. The sweep
+           rides transform only (compositor), never background-position. */
+        @keyframes skel-sweep { 60%, 100% { transform: translateX(100%); } }
 
         .skel {
             height: 53px;
             border-radius: 6px;
             margin-bottom: 4px;
-            background: linear-gradient(90deg, var(--surface2) 25%, var(--surface) 50%, var(--surface2) 75%);
-            background-size: 200% 100%;
-            animation: shimmer 1.2s linear infinite;
+            background: var(--surface2);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .skel::after {
+            content: "";
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(90deg, transparent 0%, var(--surface) 50%, transparent 100%);
+            transform: translateX(-100%);
+            animation: skel-sweep 1.8s var(--ease-effects-slow) infinite;
         }
 
         .app-row .app-label { font-size: 12px; color: var(--text2); word-break: break-all; }
@@ -689,8 +699,7 @@
         .pill, .pill::before {
             transition: color var(--dur-effects-default) var(--ease-effects-default),
                 background-color var(--dur-effects-default) var(--ease-effects-default),
-                border-color var(--dur-effects-default) var(--ease-effects-default),
-                box-shadow var(--dur-effects-default) var(--ease-effects-default);
+                border-color var(--dur-effects-default) var(--ease-effects-default);
         }
 
         .btnbar { display: flex; gap: 8px; align-items: center; margin-top: 12px; flex-wrap: wrap; }

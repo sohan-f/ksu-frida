@@ -116,6 +116,8 @@ let appsLoadPromise: Promise<void> | null = null;
 let appListFiltered: string[] = [];
 let appListRenderIndex = 0;
 let appListObserver: IntersectionObserver | null = null;
+let appListAnimated = false;
+let appSettleTimer: ReturnType<typeof setTimeout> | null = null;
 let appSearchTimer: ReturnType<typeof setTimeout> | null = null;
 let nativeIcons = false;
 let statusTimer: ReturnType<typeof setTimeout> | null = null;
@@ -998,7 +1000,7 @@ function removeLibPath(i: number, field: LibField, path: string, row?: HTMLEleme
     };
     if (row && row.isConnected) {
         row.classList.add("leaving");
-        setTimeout(done, 210);
+        setTimeout(done, 260);
     } else {
         done();
     }
@@ -1105,11 +1107,21 @@ function reducedMotion() {
 function openModal(id: string) {
     var m = getEl(id);
     var pending = modalTimers[id];
+    var wasClosing = m.classList.contains("closing");
     if (pending !== null) {
         clearTimeout(pending);
         modalTimers[id] = null;
     }
     m.classList.remove("closing");
+    if (wasClosing) {
+        // Reopening mid-exit: restart the enter motion, else it snaps.
+        var box = m.querySelector(".modal");
+        m.style.animation = "none";
+        if (box instanceof HTMLElement) box.style.animation = "none";
+        void m.offsetWidth;
+        m.style.animation = "";
+        if (box instanceof HTMLElement) box.style.animation = "";
+    }
     m.style.display = "flex";
 }
 
@@ -1130,12 +1142,13 @@ function closeModal(id: string, after?: () => void) {
         return;
     }
     m.classList.add("closing");
+    // Covers the sink exit plus slack.
     modalTimers[id] = setTimeout(function () {
         modalTimers[id] = null;
         m.classList.remove("closing");
         m.style.display = "none";
         if (after) after();
-    }, 210);
+    }, 260);
 }
 
 type LibField = "libs" | "child_libs";
@@ -1528,6 +1541,7 @@ function addTarget(pkg: string) {
 }
 
 function showAppList() {
+    appListAnimated = false;
     openModal("app-modal");
     textEl("app-search").value = "";
     fetchApps();
@@ -1540,6 +1554,7 @@ function showAppList() {
 function closeAppModal() {
     closeModal("app-modal");
     if (appListObserver) { appListObserver.disconnect(); appListObserver = null; }
+    if (appSettleTimer !== null) { clearTimeout(appSettleTimer); appSettleTimer = null; }
 }
 
 function openAppFromRow(e: MouseEvent) {
@@ -1581,6 +1596,7 @@ function renderAppBatch() {
 function renderAppList() {
     var list = getEl("app-list");
     if (appListObserver) { appListObserver.disconnect(); appListObserver = null; }
+    if (appSettleTimer !== null) { clearTimeout(appSettleTimer); appSettleTimer = null; }
 
     var q = textEl("app-search").value.trim().toLowerCase();
     appListFiltered = allApps.filter(function (pkg) {
@@ -1601,9 +1617,20 @@ function renderAppList() {
         if (entries[0] && entries[0].isIntersecting) renderAppBatch();
     }, { root: list, rootMargin: "300px" });
 
+    // First paint after open plays the entrance; rebuilds and scroll
+    // batches snap instead of replaying it.
+    if (appListAnimated) list.classList.add("settled");
+    else list.classList.remove("settled");
+
     renderAppBatch();
-    list.classList.add("settled");
     updateAppHint();
+    if (!appListAnimated) {
+        appListAnimated = true;
+        appSettleTimer = setTimeout(function () {
+            appSettleTimer = null;
+            getEl("app-list").classList.add("settled");
+        }, 650);
+    }
 }
 
 async function reloadAll() {
