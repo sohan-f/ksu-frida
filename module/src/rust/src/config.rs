@@ -111,6 +111,14 @@ fn deserialize_child_gating_config(value: &Value) -> Option<ChildGatingConfig> {
     };
     result.enabled = enabled;
 
+    // Disabled gating needs no mode; an irrelevant value must not reject the target.
+    if !enabled {
+        if let Some(libraries) = obj.get("injected_libraries") {
+            result.injected_libraries = deserialize_libraries(libraries)?;
+        }
+        return Some(result);
+    }
+
     let Some(mode) = obj.get("mode").and_then(Value::as_str) else {
         loge("invalid config: expected child_gating.mode members to be a string");
         return None;
@@ -592,6 +600,28 @@ mod tests {
         )
         .unwrap();
         assert!(load_config(dir.to_str().unwrap(), "a.b").is_none());
+    }
+
+    #[test]
+    fn disabled_gating_needs_no_mode() {
+        for gating in [
+            r#"{"enabled":false}"#,
+            r#"{"enabled":false,"mode":"kil"}"#,
+            r#"{"enabled":false,"mode":"freeze"}"#,
+        ] {
+            let dir = TempDir::new("gating-off");
+            fs::write(
+                dir.join("config.json"),
+                format!(
+                    r#"{{"targets":[{{"app_name":"a.b","enabled":true,
+                        "start_up_delay_ms":0,"injected_libraries":[],
+                        "child_gating":{gating}}}]}}"#,
+                ),
+            )
+            .unwrap();
+            let cfg = load_config(dir.to_str().unwrap(), "a.b").expect("config");
+            assert!(!cfg.child_gating.enabled);
+        }
     }
 
     #[test]
