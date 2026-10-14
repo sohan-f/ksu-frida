@@ -736,15 +736,20 @@ unsafe fn scrub_elf_metadata(info: *mut DlPhdrInfo, replacement: &[u8]) -> (bool
     };
 
     let nsyms = if hash != base {
-        // The count header must be readable before trusting it.
-        let Some(hash_end) = hash.checked_add(8) else {
-            return (false, 0, true);
-        };
-        if !range_is_readable(hash, hash_end) {
-            return (false, 0, true);
+        // Readable SysV count wins (even when huge — pinned); an unreadable
+        // header falls back to GNU so SONAME is still scrubbed below.
+        match hash.checked_add(8) {
+            Some(hash_end) if range_is_readable(hash, hash_end) => {
+                // SAFETY: 8 readable bytes validated above; unaligned-safe `u32` reads.
+                unsafe { (hash as *const u32).add(1).read_unaligned() as usize }
+            }
+            _ if gnu_hash != base => {
+                // SAFETY: `gnu_hash` names our own read-only table; the callee
+                // bounds every read by the header counts below.
+                unsafe { gnu_nsyms(gnu_hash) }
+            }
+            _ => 0,
         }
-        // SAFETY: 8 readable bytes validated above; unaligned-safe `u32` reads.
-        unsafe { (hash as *const u32).add(1).read_unaligned() as usize }
     } else if gnu_hash != base {
         // SAFETY: `gnu_hash` names our own read-only table; the callee
         // bounds every read by the header counts below.
