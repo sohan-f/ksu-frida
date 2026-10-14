@@ -205,7 +205,7 @@ pub fn enable_child_gating(
         let mut fork_trampoline: *mut c_void = std::ptr::null_mut();
         // SAFETY: `fork_addr` non-null from the lookup above, `fork_trampoline` lives in this frame.
         let rc = unsafe { ksufrida_dobby_hook(fork_addr, replacement, &raw mut fork_trampoline) };
-        if rc == 0 {
+        if rc == 0 && !fork_trampoline.is_null() {
             ORIG_FORK.store(fork_trampoline, Ordering::Release);
             fork_ok = true;
             logi("[child_gating] fork hook installed");
