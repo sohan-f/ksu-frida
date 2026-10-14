@@ -240,7 +240,7 @@ def buildWebUI = tasks.register("buildWebUI", Exec) {
     workingDir = webuiDir
     commandLine "sh", "-c", "npm ci --no-audit --no-fund && npm test && npm run build"
 
-    inputs.files("$webuiDir/main.ts", "$webuiDir/package.json", "$webuiDir/package-lock.json")
+    inputs.files("$webuiDir/main.ts", "$webuiDir/src/util.ts", "$webuiDir/index.html", "$webuiDir/package.json", "$webuiDir/package-lock.json", "$webuiDir/tsconfig.json")
     outputs.file("$webuiDir/main.js")
 }
 
