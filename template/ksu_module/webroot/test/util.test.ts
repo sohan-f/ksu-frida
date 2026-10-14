@@ -6,11 +6,14 @@ import {
     escHtml,
     gadgetUrlsForAbi,
     hashCheckSnippet,
+    isSafePairName,
     parseGadgetMeta,
     parseJson,
     parseLabelLines,
     parsePorts,
     pairsFromPackagesInfo,
+    pairSweepCmd,
+    sanitizeTargets,
     shQuote,
     splitMarked,
     targetStatusCmd,
@@ -117,4 +120,36 @@ test("gadget metadata wiring", () => {
     assert.equal(gadgetUrlsForAbi("x86", meta), null);
     assert.equal(gadgetUrlsForAbi("arm64-v8a", null), null);
     assert.equal(blockField('{"assets":{"arm":"U"}}', "assets", "arm"), "U");
+});
+
+test("sanitizeTargets drops nameless junk and normalizes types", () => {
+    const raw: any[] = [
+        { app_name: "com.a", enabled: 1 as any, start_up_delay_ms: "500", injected_libraries: [{ path: "/x.so" }, { path: 7 }, null] },
+        { app_name: "", enabled: true },
+        null,
+        "junk",
+        { app_name: "com.b", gadget_port: "99junk", child_gating: "yes" as any },
+        { app_name: "com.c", gadget_port: 27043 },
+    ];
+    const clean = sanitizeTargets(raw as any);
+    assert.equal(clean.length, 3);
+    assert.equal(clean[0].app_name, "com.a");
+    assert.equal(clean[0].enabled, true);
+    assert.equal(clean[0].start_up_delay_ms, 500);
+    assert.deepEqual(clean[0].injected_libraries, [{ path: "/x.so" }]);
+    assert.equal((clean[1] as any).gadget_port, undefined);
+    assert.equal((clean[1] as any).gadget_config, undefined);
+    assert.equal(clean[2].gadget_port, 27043);
+    assert.ok(typeof clean[2].gadget_config === "string" && (clean[2].gadget_config as string).includes("27043"));
+});
+
+test("pair sweep keeps only charset-safe basenames", () => {
+    assert.equal(isSafePairName("libsecmon_a.so"), true);
+    assert.equal(isSafePairName(""), false);
+    assert.equal(isSafePairName("a b"), false);
+    assert.equal(isSafePairName("a\"; rm -rf /; echo \""), false);
+    const cmd = pairSweepCmd("/d", ['libsecmon_a.so', 'evil"; rm -rf /; echo "'], ["libsecmon_a.config.so", "a b"]);
+    assert.ok(cmd.includes("libsecmon_a.so"));
+    assert.ok(!cmd.includes("evil"));
+    assert.ok(!cmd.includes("a b"));
 });

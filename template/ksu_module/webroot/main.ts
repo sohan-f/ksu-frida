@@ -42,6 +42,7 @@ import {
     parseLabelLines,
     parsePorts,
     pairsFromPackagesInfo,
+    sanitizeTargets,
     shQuote,
     splitMarked,
     targetGadgetCfg,
@@ -62,9 +63,11 @@ declare const ksu: {
     exec(cmd: string): unknown;
     exec(cmd: string, opts: string, callback: string): void;
     toast(message: string): void;
+    fullScreen?(isFullScreen: boolean): void;
     listPackages?(scope: string): unknown;
     listUserPackages?(): unknown;
     getPackagesInfo?(query: unknown): unknown;
+    moduleInfo?(): unknown;
 };
 
 
@@ -285,9 +288,9 @@ function appendVerboseRow(on: boolean, parent?: HTMLElement | DocumentFragment) 
 
 async function setVerbose(on: boolean) {
     if (on) {
-        await exec("touch " + VERBOSE_PATH + " && chmod 644 " + VERBOSE_PATH);
+        await exec("touch " + shQuote(VERBOSE_PATH) + " && chmod 644 " + shQuote(VERBOSE_PATH));
     } else {
-        await exec("rm -f " + VERBOSE_PATH);
+        await exec("rm -f " + shQuote(VERBOSE_PATH));
     }
 }
 
@@ -305,7 +308,7 @@ function startVersionScan(key: string) {
     versionScanning = true;
     var found = "";
     var script =
-        "strings -a " + GADGET_PATH + " 2>/dev/null | " +
+        "strings -a " + shQuote(GADGET_PATH) + " 2>/dev/null | " +
         "grep -E '^(1[6-9]|2[0-9])\\.[0-9]+\\.[0-9]+$' | head -1";
     runDetached(script, SCAN_FILE, function (body: string) {
         found = body.split("\n").filter(function (l: string) { return l && l !== DONE_MARK; })[0] || "";
@@ -336,12 +339,12 @@ async function loadStatus() {
 
 async function loadStatusNow(frag: DocumentFragment) {
     var cmd =
-        "v=$(grep -m1 '^version=' " + MODULE_PROP + " 2>/dev/null | cut -d= -f2); " +
+        "v=$(grep -m1 '^version=' " + shQuote(MODULE_PROP) + " 2>/dev/null | cut -d= -f2); " +
         "[ -n \"$v\" ] && echo \"MOD:$v\" || echo 'MOD:not installed'; " +
-        "if [ -f " + GADGET_PATH + " ]; then " +
-        "echo \"GADGETKEY:$(stat -c '%s:%Y' " + GADGET_PATH + " 2>/dev/null)\"; " +
+        "if [ -f " + shQuote(GADGET_PATH) + " ]; then " +
+        "echo \"GADGETKEY:$(stat -c '%s:%Y' " + shQuote(GADGET_PATH) + " 2>/dev/null)\"; " +
         "else echo 'GADGET:missing'; fi; " +
-        "if [ -f " + VERBOSE_PATH + " ]; then echo 'VERBOSE:on'; else echo 'VERBOSE:off'; fi; " +
+        "if [ -f " + shQuote(VERBOSE_PATH) + " ]; then echo 'VERBOSE:on'; else echo 'VERBOSE:off'; fi; " +
         "hv=$(logcat -d -s KsuFrida 2>/dev/null | grep -a 'Hide verify' | tail -n 20); " +
         "if echo \"$hv\" | grep -qa LEAK; then echo 'HIDEVERIFY:LEAK'; " +
         "elif [ -n \"$hv\" ]; then echo 'HIDEVERIFY:clean'; else echo 'HIDEVERIFY:nodata'; fi;";
@@ -719,12 +722,18 @@ async function resolveLabels(pkgs: string[], allowShell: boolean, fullSweep?: bo
 }
 
 // One native label chunk; null on any bridge failure so the caller
-// retries it instead of silently keeping the package name.
+// retries it instead of silently keeping the package name. Tries the README
+// array form first, then the `kernelsu` lib stringified form; results may be
+// a native array or a JSON string and both are accepted.
 function nativeLabelChunk(chunk: string[]): Map<string, string> | null {
     try {
         var getInfo = ksu.getPackagesInfo;
         if (!getInfo) return null;
-        return pairsFromPackagesInfo(parseJson(getInfo(JSON.stringify(chunk)), null));
+        try {
+            var direct = pairsFromPackagesInfo(parseJson((getInfo as (q: string[]) => unknown)(chunk), null));
+            if (direct.size > 0) return direct;
+        } catch (_) {}
+        return pairsFromPackagesInfo(parseJson((getInfo as (q: string) => unknown)(JSON.stringify(chunk)), null));
     } catch (_) {
         return null;
     }
@@ -1568,10 +1577,12 @@ function openAppFromRow(e: MouseEvent) {
 
 function appIconHtml(pkg: string, large?: boolean, eager?: boolean) {
     if (!nativeIcons) return "";
+    // No inline handlers (CSP `script-src 'self'`): broken icons are removed
+    // by the delegated capture-phase error listener registered on load.
     return '<img class="app-icon' + (large ? " app-icon-lg" : "") +
         '" src="ksu://icon/' + escHtml(pkg) + '" alt=""' +
         (eager ? ' loading="eager" fetchpriority="high"' : ' loading="lazy"') +
-        ' onerror="this.remove()">';
+        '>';
 }
 
 function appRowHtml(pkg: string) {
@@ -1690,7 +1701,9 @@ window.onload = function () {
         if (el && el.id === "lib-modal") closeLibPicker();
     };
     getEl("app-list").onclick = openAppFromRow;
-    getEl("app-list").addEventListener("error", function (e) {
+    // CSP-safe icon cleanup: `ksu://icon/` 404s off-device and for iconless
+    // packages; capture-phase delegation removes them without inline handlers.
+    document.addEventListener("error", function (e) {
         var img = e.target as HTMLElement | null;
         if (img && img.tagName === "IMG") img.remove();
     }, true);
@@ -1753,6 +1766,10 @@ let execMode = "auto";
 let probePromise: Promise<string> | null = null;
 
 // Managers differ in exec overloads; probe once and fall back rather than hang.
+// The async form mirrors the reference (`kernelsu` lib `exec`: `ksu.exec(cmd,
+// JSON.stringify(opts), callbackName)` with `(errno, stdout, stderr)`); the
+// `"{}"` below is `JSON.stringify({})`. The sync single-arg form is legacy
+// only and carries no errno, so failures there surface as output mismatches.
 
 function probeExec() {
     if (execMode !== "auto") return Promise.resolve(execMode);
@@ -1921,11 +1938,11 @@ const GADGET_MARK = "@@__KSUFRIDA_GADGET__";
 async function loadConfigs() {
     var r = await exec(
         "echo " + CONFIG_MARK + ";" +
-        "if [ -s " + CONFIG_PATH + " ]; then cat " + CONFIG_PATH + "; " +
-        "else cat /data/local/tmp/libsec/config.json.example 2>/dev/null; fi;" +
+        "if [ -s " + shQuote(CONFIG_PATH) + " ]; then cat " + shQuote(CONFIG_PATH) + "; " +
+        "else cat " + shQuote("/data/local/tmp/libsec/config.json.example") + " 2>/dev/null; fi;" +
         "echo;" +
         "echo " + GADGET_MARK + ";" +
-        "cat " + GADGET_CONFIG_PATH + " 2>/dev/null"
+        "cat " + shQuote(GADGET_CONFIG_PATH) + " 2>/dev/null"
     );
     var parts: Record<string, string[]> = {};
     var cur: string | null = null;
@@ -1948,6 +1965,9 @@ function applyConfigText(text: string) {
         }
     }
     if (!config.targets || !Array.isArray(config.targets)) config.targets = [];
+    // Hand-edited configs may hold any JSON; normalize types and drop nameless
+    // entries so junk never reaches shell commands or the next save.
+    config.targets = sanitizeTargets(config.targets);
     config.targets.forEach(function (t) {
         var p = parseGadgetPort(t.gadget_port);
         if (p === null) {
@@ -2022,11 +2042,11 @@ async function saveConfig() {
         var setup = entries.map(function (e) { return pairSetupCmd(LIBSEC_DIR, e); }).join("; ");
         // Pairs and manifest land before the config commit, so a committed
         // config never references pair files that were not written.
-        var r = await exec("{ OK=1; rm -f " + tmp + "; printf '%s\\n' " + shQuote(json) + " > " + tmp +
-            " && chmod 644 " + tmp + " || OK=0; " +
+        var r = await exec("{ OK=1; rm -f " + shQuote(tmp) + "; printf '%s\\n' " + shQuote(json) + " > " + shQuote(tmp) +
+            " && chmod 644 " + shQuote(tmp) + " || OK=0; " +
             (setup ? setup + "; " : "") +
             pairSweepCmd(LIBSEC_DIR, keepSo, keepCfg) + "; " +
-            "if [ \"$OK\" = 1 ]; then mv -f " + tmp + " " + CONFIG_PATH + " || OK=0; fi; " +
+            "if [ \"$OK\" = 1 ]; then mv -f " + shQuote(tmp) + " " + shQuote(CONFIG_PATH) + " || OK=0; fi; " +
             "if [ \"$OK\" = 1 ]; then " + pairManifestCmd(GADGET_PAIRS_PATH, entries) + "; fi; " +
             "if [ \"$OK\" = 1 ]; then echo " + SAVE_MARK + "; fi; } 2>&1");
         if (String(r.stdout).indexOf(SAVE_MARK) !== -1) {
@@ -2051,7 +2071,7 @@ async function checkLibraries() {
     config.targets.forEach(function (t) {
         function collect(libs: GatingLib[] | undefined) {
             (libs || []).forEach(function (l: GatingLib) {
-                if (l && l.path && !seen[l.path]) {
+                if (l && typeof l.path === "string" && l.path && !seen[l.path]) {
                     seen[l.path] = 1;
                     paths.push(l.path);
                 }
@@ -2138,8 +2158,8 @@ async function saveGadgetConfig() {
     var detail = "";
     try {
         var gadgetTmp = GADGET_CONFIG_PATH + ".tmp";
-        var r = await exec("{ rm -f " + shQuote(gadgetTmp) + "; printf '%s\\n' " + shQuote(content) + " > " + gadgetTmp +
-            " && chmod 644 " + gadgetTmp + " && rm -f " + shQuote(GADGET_CONFIG_PATH) + " && mv -f " + gadgetTmp + " " + GADGET_CONFIG_PATH + " && echo " + SAVE_MARK + "; } 2>&1");
+        var r = await exec("{ rm -f " + shQuote(gadgetTmp) + "; printf '%s\\n' " + shQuote(content) + " > " + shQuote(gadgetTmp) +
+            " && chmod 644 " + shQuote(gadgetTmp) + " && rm -f " + shQuote(GADGET_CONFIG_PATH) + " && mv -f " + shQuote(gadgetTmp) + " " + shQuote(GADGET_CONFIG_PATH) + " && echo " + SAVE_MARK + "; } 2>&1");
         if (String(r.stdout).indexOf(SAVE_MARK) !== -1) {
             ok = true;
             gadgetFileOk = true;
@@ -2177,12 +2197,12 @@ async function refreshGadget() {
     var outcome = 0;
     var detail = "";
     try {
-        var r = await exec("D=" + dst + "; S=$D/.webui-refresh; B=" + BUSYBOX_BIN + "; " +
+        var r = await exec("D=" + shQuote(dst) + "; S=$D/.webui-refresh; B=" + shQuote(BUSYBOX_BIN) + "; " +
             "mkdir -p \"$D\" && rm -rf \"$S\" && mkdir -p \"$S\" || exit 1; " +
-            "if [ ! -f " + GADGET_SRC + " ]; then echo GADGET_SRC_MISSING; rm -rf \"$S\"; exit 0; fi; " +
-            "cp -f " + GADGET_SRC + " \"$S/libsecmon.so.xz\" && \"$B\" unxz -f \"$S/libsecmon.so.xz\" && chmod 644 \"$S/libsecmon.so\" || { rm -rf \"$S\"; echo GADGET_FAIL; exit 1; }; " +
-            "if [ -f " + GADGET32_SRC + " ]; then " +
-            "cp -f " + GADGET32_SRC + " \"$S/libsecmon32.so.xz\" && \"$B\" unxz -f \"$S/libsecmon32.so.xz\" && chmod 644 \"$S/libsecmon32.so\" || { rm -rf \"$S\"; echo GADGET32_FAIL; exit 1; }; fi; " +
+            "if [ ! -f " + shQuote(GADGET_SRC) + " ]; then echo GADGET_SRC_MISSING; rm -rf \"$S\"; exit 0; fi; " +
+            "cp -f " + shQuote(GADGET_SRC) + " \"$S/libsecmon.so.xz\" && \"$B\" unxz -f \"$S/libsecmon.so.xz\" && chmod 644 \"$S/libsecmon.so\" || { rm -rf \"$S\"; echo GADGET_FAIL; exit 1; }; " +
+            "if [ -f " + shQuote(GADGET32_SRC) + " ]; then " +
+            "cp -f " + shQuote(GADGET32_SRC) + " \"$S/libsecmon32.so.xz\" && \"$B\" unxz -f \"$S/libsecmon32.so.xz\" && chmod 644 \"$S/libsecmon32.so\" || { rm -rf \"$S\"; echo GADGET32_FAIL; exit 1; }; fi; " +
             "mv -f \"$S/libsecmon.so\" \"$D/libsecmon.so\" || { rm -rf \"$S\"; echo GADGET_FAIL; exit 1; }; " +
             "if [ -f \"$S/libsecmon32.so\" ]; then mv -f \"$S/libsecmon32.so\" \"$D/libsecmon32.so\" || { rm -rf \"$S\"; echo GADGET32_FAIL; exit 1; }; fi; " +
             "rm -rf \"$S\"; echo GADGET_OK; echo " + SAVE_MARK);
@@ -2240,7 +2260,7 @@ async function downloadGadgetUpdate() {
     var u2 = companion ? companion.url : null;
     var h2 = companion ? companion.sha256 : null;
     var script =
-        "M=" + MODDIR + "/gadget; D=/data/local/tmp/libsec; S=" + GADGET_DL_DIR + "; B=" + BUSYBOX_BIN + "; V=" + shQuote(v) + "; " +
+        "M=" + shQuote(MODDIR + "/gadget") + "; D=" + shQuote("/data/local/tmp/libsec") + "; S=" + shQuote(GADGET_DL_DIR) + "; B=" + shQuote(BUSYBOX_BIN) + "; V=" + shQuote(v) + "; " +
         "rm -rf \"$S\"; mkdir -p \"$S\" \"$D\" \"$M\"; " +
         "if command -v curl >/dev/null 2>&1; then GET=\"curl -sLf --max-time 600 -o\"; else GET=\"wget -q -O\"; fi; " +
         "echo STAGE:download; OK=1; " +
@@ -2338,7 +2358,7 @@ async function checkGadgetUpdate() {
         gadgetUpdateUrls = {};
         gadgetUpdateVerified = false;
         var r = await exec(
-            "echo " + GVER_MARK + "; cat " + GADGET_VERSION_FILE + " 2>/dev/null; echo; " +
+            "echo " + GVER_MARK + "; cat " + shQuote(GADGET_VERSION_FILE) + " 2>/dev/null; echo; " +
             "echo " + ABI_MARK + "; getprop ro.product.cpu.abi; " +
             "echo " + META_MARK + "; curl -sL --max-time 20 " + GADGET_META_URL
         );
@@ -2348,7 +2368,7 @@ async function checkGadgetUpdate() {
         var abi = (parts[ABI_MARK] || []).join("").trim();
         var meta = parseGadgetMeta((parts[META_MARK] || []).join("\n"));
         if (!meta) {
-            var f = await exec("curl -sL --max-time 20 " + GADGET_API_URL + " | grep '\"tag_name\"'");
+            var f = await exec("curl -sL --max-time 20 " + GADGET_API_URL + " | grep -m1 '\"tag_name\"'");
             var t = /"tag_name"\s*:\s*"([^"]+)"/.exec(f.stdout || "");
             if (t && validVersion(t[1])) {
                 meta = {

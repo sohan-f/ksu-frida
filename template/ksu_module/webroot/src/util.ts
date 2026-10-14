@@ -1,4 +1,13 @@
 // Pure logic: no DOM, no bridge. Unit-tested via `npm test`.
+//
+// Bridge shapes below mirror the official reference (`kernelsu@3.0.2`
+// `index.js` over `js/README.md`): `ksu.exec(cmd, JSON.stringify(opts),
+// callback)` with `window[callback](errno, stdout, stderr)`,
+// `ksu.listPackages(type)` returning a JSON string, and
+// `ksu.getPackagesInfo(JSON.stringify(packages))` returning a JSON string.
+// This WebUI additionally tolerates managers that return/accept native
+// arrays (README prose form), so both shapes are accepted wherever a
+// bridge value is parsed or passed.
 export interface GatingLib {
     path: string;
 }
@@ -299,12 +308,16 @@ export function pairSetupCmd(dir: string, entry: PairEntry) {
 
 // Removes pair files no longer referenced. `keepSo`/`keepCfg` must be
 // basenames from `targetGadgetSo`/`targetGadgetCfg` (charset-safe, no spaces).
+// Entries outside `[A-Za-z0-9_.-]` are dropped so a hostile caller can never
+// break out of the `case` word list below.
 export function pairSweepCmd(dir: string, keepSo: string[], keepCfg: string[]) {
+    var safeSo = (keepSo || []).filter(isSafePairName);
+    var safeCfg = (keepCfg || []).filter(isSafePairName);
     return "{ for f in " + shQuote(dir) + "/libsecmon_*.so; do [ -e \"$f\" ] || continue; " +
         "case \"$f\" in " + shQuote(dir + "/libsecmon.so") + "|" + shQuote(dir + "/libsecmon32.so") + "|*.config.so) continue;; esac; " +
-        "b=${f##*/}; case \" " + keepSo.join(" ") + " \" in *\" $b \"*) ;; *) rm -f \"$f\" \"${f%.so}.config.so\";; esac; done; " +
+        "b=${f##*/}; case \" " + safeSo.join(" ") + " \" in *\" $b \"*) ;; *) rm -f \"$f\" \"${f%.so}.config.so\";; esac; done; " +
         "for f in " + shQuote(dir) + "/libsecmon_*.config.so; do [ -e \"$f\" ] || continue; " +
-        "b=${f##*/}; case \" " + keepCfg.join(" ") + " \" in *\" $b \"*) ;; *) rm -f \"$f\";; esac; done; } || OK=0";
+        "b=${f##*/}; case \" " + safeCfg.join(" ") + " \" in *\" $b \"*) ;; *) rm -f \"$f\";; esac; done; } || OK=0";
 }
 
 // Boot manifest: `<so> <src>` per line so service.sh never infers the arch
@@ -317,4 +330,64 @@ export function pairManifestCmd(pairsPath: string, entries: Array<{ so: string; 
         " && chmod 644 " + shQuote(pairsPath + ".tmp") +
         " && rm -f " + shQuote(pairsPath) +
         " && mv -f " + shQuote(pairsPath + ".tmp") + " " + shQuote(pairsPath) + " || OK=0";
+}
+
+// Pair basenames are produced by `targetGadgetSo` (`[A-Za-z0-9_.-]` only,
+// never empty). Anything else is rejected where names meet the shell.
+export function isSafePairName(name: unknown) {
+    return typeof name === "string" && name.length > 0 && /^[A-Za-z0-9_.-]+$/.test(name);
+}
+
+function asLibList(raw: unknown): GatingLib[] {
+    if (!Array.isArray(raw)) return [];
+    var out: GatingLib[] = [];
+    raw.forEach(function (lib) {
+        if (lib && typeof lib === "object" && typeof (lib as { path?: unknown }).path === "string") {
+            var p = (lib as { path: string }).path;
+            if (p) out.push({ path: p });
+        }
+    });
+    return out;
+}
+
+// Normalizes one loaded target in place. Hand-edited `config.json` may hold
+// any JSON; without this, junk types flow into shell commands and back to
+// disk on the next save. Returns false when the entry has no usable app
+// name and should be dropped.
+export function sanitizeTarget(t: Target): boolean {
+    if (!t || typeof t !== "object") return false;
+    if (typeof t.app_name !== "string" || !t.app_name) return false;
+    t.enabled = t.enabled !== false;
+    var delay = typeof t.start_up_delay_ms === "number" ? t.start_up_delay_ms : parseInt(String(t.start_up_delay_ms ?? ""), 10);
+    t.start_up_delay_ms = isFinite(delay) ? Math.max(0, Math.floor(delay)) : 0;
+    if (t.hide_maps !== undefined) t.hide_maps = t.hide_maps !== false;
+    if (t.scrub_elf_header !== undefined) t.scrub_elf_header = !!t.scrub_elf_header;
+    t.injected_libraries = asLibList(t.injected_libraries);
+    if (t.child_gating !== undefined) {
+        var g = t.child_gating;
+        if (!g || typeof g !== "object") {
+            delete t.child_gating;
+        } else {
+            g.enabled = !!g.enabled;
+            if (typeof g.mode !== "string" || !g.mode) g.mode = "freeze";
+            g.injected_libraries = asLibList(g.injected_libraries);
+        }
+    }
+    var p = parseGadgetPort(t.gadget_port);
+    if (p === null) {
+        delete t.gadget_port;
+        delete t.gadget_config;
+    } else {
+        t.gadget_port = p;
+        if (typeof t.gadget_config !== "string" || !t.gadget_config) {
+            t.gadget_config = JSON.stringify({ interaction: { type: "listen", address: "127.0.0.1", port: p, on_port_conflict: "pick-next" } }, null, 2);
+        }
+    }
+    return true;
+}
+
+// Drops nameless entries, normalizes the rest. Operates in place.
+export function sanitizeTargets(targets: Target[]): Target[] {
+    if (!Array.isArray(targets)) return [];
+    return targets.filter(function (t) { return sanitizeTarget(t); });
 }

@@ -150,8 +150,10 @@
         listPackages: function () { return JSON.stringify(PKGS); },
         getPackagesInfo: function (query) {
             var names = [];
-            try { names = JSON.parse(String(query)); } catch (_) {}
-            return JSON.stringify(names.map(function (p) {
+            if (Array.isArray(query)) names = query;
+            else try { names = JSON.parse(String(query)); } catch (_) {}
+            if (!Array.isArray(names)) names = [];
+            return JSON.stringify(names.filter(function (p) { return typeof p === "string"; }).map(function (p) {
                 return { packageName: p, appLabel: LABELS[p] || p };
             }));
         }

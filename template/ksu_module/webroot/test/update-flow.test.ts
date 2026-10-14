@@ -14,7 +14,7 @@ const MAIN = fs.readFileSync(path.join(ROOT, "main.ts"), "utf8");
 // source (string-aware scan, no duplication): from `var script =` to its
 // terminating semicolon, evaluated with fixture-bound variables.
 function extractInstallScript(vars: Record<string, unknown>): string {
-    const startMark = '    var script =\n        "M=" + MODDIR';
+    const startMark = '    var script =\n        "M=" + shQuote(MODDIR';
     const start = MAIN.indexOf(startMark);
     assert.notEqual(start, -1, "script assembly moved; update this extractor");
     let i = MAIN.indexOf('"', start);
