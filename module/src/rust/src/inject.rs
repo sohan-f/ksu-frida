@@ -343,7 +343,15 @@ fn copy_file_range_with(
             }
             Ok(0) => break,
             Ok(n) => {
-                remaining -= n;
+                // Defensive: the kernel never returns more than asked, but a
+                // short `remaining` must not wrap on a hostile return.
+                let Some(left) = remaining.checked_sub(n) else {
+                    loge_fmt(format_args!(
+                        "stage: kernel copy of {src} -> {dst} overran: {n} past {remaining} bytes"
+                    ));
+                    return RangeOutcome::Failed;
+                };
+                remaining = left;
                 first = false;
             }
         }
@@ -353,6 +361,15 @@ fn copy_file_range_with(
         loge_fmt(format_args!(
             "stage: short kernel copy of {src} -> {dst}: {} of {src_len} bytes",
             src_len - remaining
+        ));
+        return RangeOutcome::Failed;
+    }
+    // The source may have grown after the caller's stat: a truncated stage
+    // must fail rather than load half a library. `metadata` stats our own
+    // fd, so a path swap cannot fool the comparison.
+    if input.metadata().is_ok_and(|meta| meta.len() != src_len) {
+        loge_fmt(format_args!(
+            "stage: source changed during copy of {src}: expected {src_len} bytes"
         ));
         return RangeOutcome::Failed;
     }
@@ -1810,6 +1827,22 @@ mod tests {
             Ok(if calls == 1 { 4 } else { 6 })
         });
         assert!(matches!(outcome, RangeOutcome::Done));
+    }
+
+    #[test]
+    fn kernel_copy_rejects_overrunning_returns() {
+        let (_dir, input, output) = scripted_files("range-overrun");
+        let outcome = copy_file_range_with(&input, &output, "src", "dst", 10, |_, _, _| Ok(11));
+        assert!(matches!(outcome, RangeOutcome::Failed));
+    }
+
+    #[test]
+    fn kernel_copy_rejects_growth_after_stat() {
+        // Stale small stat against a 10-byte file: the copy covers the stat
+        // but the post-check sees the growth and fails closed.
+        let (_dir, input, output) = scripted_files("range-grown");
+        let outcome = copy_file_range_with(&input, &output, "src", "dst", 5, |_, _, _| Ok(5));
+        assert!(matches!(outcome, RangeOutcome::Failed));
     }
 
     #[test]
