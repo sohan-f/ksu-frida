@@ -90,7 +90,11 @@
             user-select: text;
         }
 
-        .container { width: 100%; max-width: 600px; padding-bottom: 80px; /* clears the fixed save pill */ }
+        .container { width: 100%; max-width: 600px; padding-bottom: 16px; transition: padding-bottom var(--dur-effects-default) var(--ease-effects-default); }
+
+        /* Clearance for the fixed save pill applies only while it is shown,
+           so the page does not end in a blank gap. Toggled with the pill. */
+        .container.has-pill { padding-bottom: 80px; }
 
         .header { margin: 2px 2px 12px; border-bottom: 1px solid var(--border); padding-bottom: 12px; }
         .header h1 { font-size: 17px; letter-spacing: .18em; font-weight: 700; line-height: 1.3; }

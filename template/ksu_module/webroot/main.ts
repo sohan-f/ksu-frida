@@ -1936,6 +1936,8 @@ function updateDirtyBadge() {
     var b = getEl("dirty-badge");
     getEl("dirty-wrap").classList.toggle("show", dirtyConfig);
     getEl("save-pill").classList.toggle("show", dirtyConfig);
+    var c = document.querySelector(".container");
+    if (c instanceof HTMLElement) c.classList.toggle("has-pill", dirtyConfig);
     if (dirtyConfig) {
         b.textContent = "Unsaved changes (targets)";
     }
