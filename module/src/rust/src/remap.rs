@@ -930,11 +930,14 @@ pub fn fuzz_maps_match(data: &[u8]) {
         let matched = maps_path_matches(&info.path, &query);
         if query.contains('/') {
             let stripped = info.path.strip_suffix(" (deleted)").unwrap_or(&info.path);
-            assert_eq!(
-                matched,
-                stripped == query,
-                "file queries must compare full paths"
-            );
+            // Mirror the file branch: raw, stripped, then the octal-escaped form.
+            let escaped = escaped_maps_query(&query);
+            let expected = stripped == query
+                || info.path == query
+                || escaped
+                    .as_deref()
+                    .is_some_and(|q| stripped == q || info.path == q);
+            assert_eq!(matched, expected, "file queries must compare full paths");
         }
     }
 }
