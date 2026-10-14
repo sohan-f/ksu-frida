@@ -87,7 +87,8 @@ fn parse_dev_inode(dev: &str, inode: &str) -> Option<(u32, u32, u64)> {
 #[inline]
 fn is_private_mapping(perms: &str) -> bool {
     // 4th char is p/s: shared mappings must keep sharing, never convert to private anon.
-    perms.as_bytes().get(3) != Some(&b's')
+    // Malformed perms fail closed as shared (skipped), never remapped.
+    perms.as_bytes().get(3) == Some(&b'p')
 }
 
 #[inline]
@@ -218,6 +219,21 @@ fn query_file_id(query: &str) -> Option<FileId> {
     })
 }
 
+/// Next maps line, lossy-decoded. Pathnames are arbitrary bytes (only `\n`
+/// is kernel-escaped), so a strict UTF-8 read would abort the whole scan
+/// on one hostile line; lossy lines simply never match our queries below.
+fn read_maps_line<'a>(
+    reader: &mut impl BufRead,
+    buf: &'a mut Vec<u8>,
+) -> Option<std::borrow::Cow<'a, str>> {
+    buf.clear();
+    match reader.read_until(b'\n', buf) {
+        Ok(0) => None,
+        Ok(_) => Some(String::from_utf8_lossy(buf)),
+        Err(_) => None,
+    }
+}
+
 fn get_modules_by_name(m_name: &str) -> Vec<ProcMapsInfo> {
     let mut maps = Vec::new();
 
@@ -228,23 +244,20 @@ fn get_modules_by_name(m_name: &str) -> Vec<ProcMapsInfo> {
     let escaped = escaped_maps_query(m_name);
     let query_id = query_file_id(m_name);
     let mut reader = BufReader::new(file);
-    let mut line = String::with_capacity(256);
-    while reader.read_line(&mut line).unwrap_or(0) > 0 {
+    let mut buf = Vec::with_capacity(256);
+    while let Some(line) = read_maps_line(&mut reader, &mut buf) {
         // An exact match always contains the query, so this pre-screen is
         // sound; the escaped form covers newline pathnames the same way.
         let hit = line.contains(m_name) || escaped.as_deref().is_some_and(|q| line.contains(q));
         if !hit {
-            line.clear();
             continue;
         }
         let Some(info) = parse_maps_line(&line) else {
-            line.clear();
             continue;
         };
         if maps_path_matches(&info.path, m_name) && identity_matches(&info, query_id) {
             maps.push(info);
         }
-        line.clear();
     }
 
     maps
@@ -825,15 +838,14 @@ pub(crate) fn mapped_range(start: usize) -> Option<(c_int, usize)> {
         return None;
     };
     let mut reader = BufReader::new(file);
-    let mut line = String::with_capacity(256);
-    while reader.read_line(&mut line).unwrap_or(0) > 0 {
+    let mut buf = Vec::with_capacity(256);
+    while let Some(line) = read_maps_line(&mut reader, &mut buf) {
         if let Some((s, e, prot)) = parse_maps_range(&line)
             && s <= start
             && start < e
         {
             return Some((prot, e));
         }
-        line.clear();
     }
     None
 }
@@ -1978,6 +1990,24 @@ mod tests {
     }
 
     #[test]
+    fn maps_reader_survives_non_utf8_lines() {
+        let mut bytes = b"7ac49c2000-7ac4a26000 r--p 00000000 00:00 0 /a\n".to_vec();
+        bytes.extend([0xff, 0xfe]);
+        bytes.extend(b" garbage\n");
+        bytes.extend(b"7ac4a26000-7ac4a27000 r--p 00000000 00:00 0 /b\n");
+        let mut reader = BufReader::new(&bytes[..]);
+        let mut buf = Vec::new();
+        let first = read_maps_line(&mut reader, &mut buf).expect("line");
+        assert!(first.contains("/a"));
+        // Invalid bytes decode lossy but the scan continues past them.
+        let second = read_maps_line(&mut reader, &mut buf).expect("line");
+        assert!(second.contains("garbage"));
+        let third = read_maps_line(&mut reader, &mut buf).expect("line");
+        assert!(third.contains("/b"));
+        assert!(read_maps_line(&mut reader, &mut buf).is_none());
+    }
+
+    #[test]
     fn maps_path_match_is_exact_and_handles_memfd_names() {
         assert!(maps_path_matches(
             "/data/app/libfoo.so",
@@ -2017,6 +2047,10 @@ mod tests {
         assert!(is_private_mapping("rw-p"));
         assert!(!is_private_mapping("rw-s"));
         assert!(!is_private_mapping("r--s"));
+        // Malformed perms fail closed as shared: never remap the unknown.
+        assert!(!is_private_mapping(""));
+        assert!(!is_private_mapping("r"));
+        assert!(!is_private_mapping("rw-"));
     }
 
     #[test]
