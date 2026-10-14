@@ -308,9 +308,11 @@
             vertical-align: 1px;
         }
 
-        .slotrow > span.status-ok::before { background: var(--success); box-shadow: 0 0 4px var(--success); }
-        .slotrow > span.status-warn::before { background: var(--warn); box-shadow: 0 0 4px var(--warn); }
-        .slotrow > span.status-err::before { background: var(--danger); box-shadow: 0 0 4px var(--danger); }
+        /* Status classes land on inner spans (see paintSlot), so the dots
+           below use descendant selectors, not child selectors. */
+        .slotrow span.status-ok::before { background: var(--success); box-shadow: 0 0 4px var(--success); }
+        .slotrow span.status-warn::before { background: var(--warn); box-shadow: 0 0 4px var(--warn); }
+        .slotrow span.status-err::before { background: var(--danger); box-shadow: 0 0 4px var(--danger); }
 
         .row {
             display: flex;
@@ -668,7 +670,7 @@
         .status-ok { color: var(--success); }
         .status-err { color: var(--danger); }
         .status-warn { color: var(--warn); }
-        .warn { color: var(--warn); font-size: 12px; margin-top: 6px; border-left: 2px solid var(--warn); padding-left: 8px; }
+        .warn { color: var(--warn); font-size: 12px; margin-top: 6px; border-left: 2px solid var(--warn); padding-left: 8px; overflow-wrap: anywhere; }
 
         .pill {
             display: inline-flex;

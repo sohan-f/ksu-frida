@@ -58,6 +58,10 @@
         });
     }
 
+    // Per-run completion nonces (see runDetached): launch commands carry
+    // `echo "<DONE_MARK>-<id>-<ts>"`; cats echo it back so polls complete.
+    var nonces = {};
+
     // Inverse of shQuote: reads one single-quoted shell token.
     function extractQuoted(cmd, at) {
         var out = "";
@@ -76,21 +80,28 @@
     function route(cmd) {
         cmd = String(cmd);
         if (cmd === "echo __KSU_PROBE__") return "__KSU_PROBE__";
-        if (/&\s*$/.test(cmd)) return "";
-        if (cmd.indexOf("cat ") === 0) {
-            if (cmd.indexOf(".webui-gadget-dl.tmp") !== -1) {
-                return "STAGE:download\nSTAGE:verify\nSTAGE:install\nRESULT:ok\n" + DONE_MARK + "\n";
-            }
-            if (cmd.indexOf(".webui-labels.tmp") !== -1) {
-                return PKGS.map(function (p) { return p + "|" + (LABELS[p] || p); }).join("\n") +
-                    "\n" + DONE_MARK + "\n";
-            }
-            if (cmd.indexOf(".webui-scan.tmp") !== -1) return "17.22.1\n" + DONE_MARK + "\n";
-            if (cmd.indexOf(".webui-packages.tmp") !== -1) {
-                return PKGS.map(function (p) { return "package:" + p; }).join("\n") +
-                    "\n" + DONE_MARK + "\n";
-            }
+        if (/&\s*$/.test(cmd)) {
+            var nm = cmd.match(/@@__KSUFRIDA_DONE__[^\s"]*/g);
+            var pm = /\} > '([^']*)'/.exec(cmd);
+            if (nm && pm) nonces[pm[1]] = nm[nm.length - 1];
             return "";
+        }
+        if (cmd.indexOf("cat ") === 0) {
+            var out = "";
+            if (cmd.indexOf(".webui-gadget-dl.tmp") !== -1) {
+                out = "STAGE:download\nSTAGE:verify\nSTAGE:install\nRESULT:ok\n" + DONE_MARK + "\n";
+            } else if (cmd.indexOf(".webui-labels.tmp") !== -1) {
+                out = PKGS.map(function (p) { return p + "|" + (LABELS[p] || p); }).join("\n") +
+                    "\n" + DONE_MARK + "\n";
+            } else if (cmd.indexOf(".webui-scan.tmp") !== -1) {
+                out = "17.22.1\n" + DONE_MARK + "\n";
+            } else if (cmd.indexOf(".webui-packages.tmp") !== -1) {
+                out = PKGS.map(function (p) { return "package:" + p; }).join("\n") +
+                    "\n" + DONE_MARK + "\n";
+            }
+            var cm = /'([^']*)'/.exec(cmd);
+            if (cm && nonces[cm[1]]) out += nonces[cm[1]] + "\n";
+            return out;
         }
         if (cmd.indexOf(CONFIG_MARK) !== -1) {
             return CONFIG_MARK + "\n" + state.config + "\n" + GADGET_MARK + "\n" + state.gadget + "\n";

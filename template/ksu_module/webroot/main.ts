@@ -41,6 +41,7 @@ import {
     parseJson,
     parseLabelLines,
     parsePorts,
+    parseTargetStatus,
     pairsFromPackagesInfo,
     sanitizeTargets,
     shQuote,
@@ -275,6 +276,7 @@ function appendVerboseRow(on: boolean, parent?: HTMLElement | DocumentFragment) 
     var input = document.createElement("input");
     input.type = "checkbox";
     input.checked = !!on;
+    input.setAttribute("aria-label", "Verbose logging");
     input.title = "Off: silent in logcat. On: KsuFrida lines for troubleshooting (applies to newly started processes).";
     input.onchange = function () { setVerbose(input.checked); };
     var span = document.createElement("span");
@@ -402,15 +404,7 @@ function targetNames() {
 
 
 function applyTargetStatus(stdout: string, names: string[]) {
-    targetStatus = {};
-    if (stdout) {
-        stdout.split("\n").forEach(function (line) {
-            var parts = line.trim().split(/\s+/);
-            if (parts.length === 2 && names.indexOf(parts[0]) !== -1) {
-                (targetStatus[parts[0]] = targetStatus[parts[0]] || []).push(parts[1]);
-            }
-        });
-    }
+    targetStatus = parseTargetStatus(stdout, names);
     updateStatusPills();
 }
 
@@ -505,8 +499,9 @@ function gadgetListenInfo(): GadgetListen {
     if (!ic || typeof ic !== "object") return { listen: false, base: base };
     var typed = ic as { type?: unknown; port?: unknown };
     if (typed.type && typed.type !== "listen") return { listen: false, base: base };
-    var p = parseInt(String(typed.port ?? ""), 10);
-    if (p > 0 && p < 65536) base = p;
+    // Strict decimal only: parseInt would take "27042junk" and hex/float forms.
+    var p = parseGadgetPort(typed.port);
+    if (p !== null) base = p;
     return { listen: true, base: base };
 }
 
@@ -883,18 +878,19 @@ function mkBtn(text: string, cls: string, onclick: () => void) {
     return b;
 }
 
-function makeSwitch(checked: boolean, field: string, idx: number) {
-    var label = document.createElement("label");
-    label.className = "switch";
+function makeSwitch(checked: boolean, field: string, idx: number, label?: string) {
+    var labelEl = document.createElement("label");
+    labelEl.className = "switch";
     var input = document.createElement("input");
     input.type = "checkbox";
+    if (label) input.setAttribute("aria-label", label);
     input.checked = !!checked;
     input.onchange = function () { updateField(idx, field, input.checked); };
     var span = document.createElement("span");
     span.className = "slider";
-    label.appendChild(input);
-    label.appendChild(span);
-    return label;
+    labelEl.appendChild(input);
+    labelEl.appendChild(span);
+    return labelEl;
 }
 
 function fieldBlock(labelText: string, inputEl: HTMLElement) {
@@ -1074,7 +1070,7 @@ function renderTargets() {
                 pillEls[t.app_name] = pill;
                 row.appendChild(left);
                 row.appendChild(pill);
-                row.appendChild(makeSwitch(t.enabled, "enabled", i));
+                row.appendChild(makeSwitch(t.enabled, "enabled", i, "Enable " + t.app_name));
                 row.onclick = function (e) {
                     var el = e.target as HTMLElement | null;
                     if (el && el.closest && el.closest(".switch")) return;
@@ -1132,6 +1128,12 @@ function openModal(id: string) {
         if (box instanceof HTMLElement) box.style.animation = "";
     }
     m.style.display = "flex";
+    // Focus the dialog for screen readers and Escape handling.
+    var dialog = m.querySelector(".modal");
+    if (dialog instanceof HTMLElement) {
+        if (!dialog.hasAttribute("tabindex")) dialog.setAttribute("tabindex", "-1");
+        try { dialog.focus({ preventScroll: true }); } catch (_) {}
+    }
 }
 
 // Exit plays first, then the overlay hides; reopening mid-exit wins.
@@ -1295,9 +1297,9 @@ function renderDetail() {
 
     var settings = document.createElement("div");
     settings.className = "settings";
-    settings.appendChild(settingRow("Hide maps", makeSwitch(t.hide_maps !== false, "hidemaps", i)));
-    settings.appendChild(settingRow("Scrub ELF header", makeSwitch(!!t.scrub_elf_header, "scrubhdr", i)));
-    settings.appendChild(settingRow("Child Gating", makeSwitch(!!(t.child_gating && t.child_gating.enabled), "child_enabled", i)));
+    settings.appendChild(settingRow("Hide maps", makeSwitch(t.hide_maps !== false, "hidemaps", i, "Hide maps")));
+    settings.appendChild(settingRow("Scrub ELF header", makeSwitch(!!t.scrub_elf_header, "scrubhdr", i, "Scrub ELF header")));
+    settings.appendChild(settingRow("Child Gating", makeSwitch(!!(t.child_gating && t.child_gating.enabled), "child_enabled", i, "Child Gating")));
     body.appendChild(settings);
 
     body.appendChild(buildChildPanel(t, i));
@@ -1390,7 +1392,7 @@ function renderDetail() {
             var copyConnect = document.createElement("button");
             copyConnect.className = "btn btn-sm";
             copyConnect.textContent = "Copy connect command";
-            copyConnect.onclick = function () { copyText(connectText, copyConnect); };
+            copyConnect.onclick = function () { copyText(connectText, copyConnect, "detail-status"); };
             connectBlock.appendChild(copyConnect);
             body.appendChild(fieldBlock("Connect to this target", connectBlock));
         } else if (interactionType === "script") {
@@ -1537,7 +1539,7 @@ function addTarget(pkg: string) {
         enabled: true,
         hide_maps: true,
         scrub_elf_header: false,
-        start_up_delay_ms: 0,
+        start_up_delay_ms: 500,
         injected_libraries: [{ path: "/data/local/tmp/libsec/libsecmon.so" }],
         child_gating: { enabled: false, mode: "freeze", injected_libraries: [] }
     });
@@ -1734,6 +1736,13 @@ window.onload = function () {
     document.addEventListener("visibilitychange", function () {
         if (!document.hidden) poll();
     });
+    // Escape closes the topmost dialog; lib overlays detail, detail over list.
+    document.addEventListener("keydown", function (e) {
+        if (e.key !== "Escape") return;
+        if (getEl("lib-modal").style.display === "flex") closeLibPicker();
+        else if (getEl("target-modal").style.display === "flex") closeDetail();
+        else if (getEl("app-modal").style.display === "flex") closeAppModal();
+    });
 };
 
 function scheduleStatus() {
@@ -1877,20 +1886,32 @@ function syncExec(cmd: string): ExecResult {
 async function runDetached(script: string, path: string, onBody: (body: string, done: boolean) => void, opts?: { timeout?: number; maxStale?: number }): Promise<boolean> {
     opts = opts || {};
     if (execMode === "none") return false;
-    await exec("rm -f " + shQuote(path) + "; { " + script + "; echo \"" + DONE_MARK + "\"; } > " + shQuote(path) +
+    // Per-run nonce after DONE_MARK: a stale tmp file from a killed run
+    // already holds the mark, so completion keys on the nonce alone.
+    var nonce = DONE_MARK + "-" + (++callbackId) + "-" + Date.now();
+    await exec("rm -f " + shQuote(path) + "; { " + script + "; echo \"" + DONE_MARK + "\"; echo \"" + nonce + "\"; } > " + shQuote(path) +
         " </dev/null 2>/dev/null &");
-    var deadline = Date.now() + (opts.timeout || 120000);
+    var timeout = opts.timeout || 120000;
+    var deadline = Date.now() + timeout;
+    var hiddenBudget = timeout;
     var maxStale = opts.maxStale == null ? 8 : opts.maxStale;
     var lastLen = -1;
     var stale = 0;
     var done = false;
     while (Date.now() < deadline) {
+        // Hidden WebViews throttle timers; neither burn the budget nor the shell.
+        if (document.hidden) {
+            await delay(POLL_INTERVAL_MS);
+            if (hiddenBudget > 0) { deadline += POLL_INTERVAL_MS; hiddenBudget -= POLL_INTERVAL_MS; }
+            continue;
+        }
         await delay(POLL_INTERVAL_MS);
         await awaitQuietWindow();
         var r = await exec("cat " + shQuote(path) + " 2>/dev/null");
         var text = (r.errno === 0 && r.stdout) || "";
-        done = text.indexOf(DONE_MARK) !== -1;
-        var body = done ? text : text.slice(0, text.lastIndexOf("\n") + 1);
+        done = text.indexOf(nonce) !== -1;
+        var body = (done ? text : text.slice(0, text.lastIndexOf("\n") + 1))
+            .split("\n").filter(function (l) { return l !== nonce; }).join("\n");
         if (body && onBody) onBody(body, done);
         if (done) break;
         if (text.length === lastLen) {
@@ -1920,14 +1941,15 @@ function updateDirtyBadge() {
     }
 }
 
-function copyText(text: string, btn?: HTMLButtonElement) {
+function copyText(text: string, btn?: HTMLButtonElement, slot?: string) {
+    var target = slot || "connect-status";
     if (navigator.clipboard && navigator.clipboard.writeText) {
         navigator.clipboard.writeText(text).then(
             function () { if (btn) flashEl(btn, "Copied"); },
-            function () { setSlotStatus("connect-status", "Copy failed. Select the text manually"); }
+            function () { setSlotStatus(target, "Copy failed. Select the text manually"); }
         );
     } else {
-        setSlotStatus("connect-status", "Select the text and copy manually");
+        setSlotStatus(target, "Select the text and copy manually");
     }
 }
 
@@ -2131,6 +2153,7 @@ function validateGadget() {
             : null;
     var hasInteraction = ic !== null;
     var itype: unknown = ic ? ic.type : null;
+    var listenPort: unknown = ic ? (ic as { port?: unknown }).port : null;
     if (!gadgetFileOk) {
         status.className = "status-warn";
         status.textContent = "Not found (default shown)";
@@ -2140,6 +2163,9 @@ function validateGadget() {
     } else if (itype !== "listen" && itype !== "script" && itype !== "connect") {
         status.className = "status-warn";
         status.textContent = "Unknown interaction type";
+    } else if (itype === "listen" && parseGadgetPort(listenPort) === null) {
+        status.className = "status-warn";
+        status.textContent = "Listen port out of range";
     } else {
         status.className = "status-ok";
         status.textContent = "Valid";

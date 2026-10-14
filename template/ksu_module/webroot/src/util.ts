@@ -209,6 +209,18 @@ export function parsePorts(lines: string[]) {
     return ports;
 }
 
+// Parses `<process> <pid>` lines from the status poll. The name runs to the
+// last blank (process names may hold spaces); the pid must be numeric.
+export function parseTargetStatus(stdout: string, names: string[]): Record<string, string[]> {
+    var out: Record<string, string[]> = {};
+    String(stdout || "").split("\n").forEach(function (line) {
+        var m = /^(.*)\s+([0-9]+)$/.exec(line.trim());
+        if (!m || names.indexOf(m[1]) === -1) return;
+        (out[m[1]] = out[m[1]] || []).push(m[2]);
+    });
+    return out;
+}
+
 // Per-target gadget pairs: a dedicated basename (plus sibling `.config.so`)
 // so Frida loads an isolated config per app. Names are built only with
 // `targetGadgetSo`, which keeps them inside `[A-Za-z0-9_.-]`.

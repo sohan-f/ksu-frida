@@ -11,6 +11,7 @@ import {
     parseJson,
     parseLabelLines,
     parsePorts,
+    parseTargetStatus,
     pairsFromPackagesInfo,
     pairSweepCmd,
     sanitizeTargets,
@@ -96,6 +97,20 @@ test("pairsFromPackagesInfo skips errors, falls back to package", () => {
 test("parsePorts keeps valid ports only", () => {
     assert.deepEqual(parsePorts(["27042", "abc", "27042junk", "0", "65536", "-1"]), [27042]);
     assert.deepEqual(parsePorts(["1", "65535"]), [1, 65535]);
+});
+
+test("parseTargetStatus splits on the last blank, needs numeric pids", () => {
+    assert.deepEqual(
+        parseTargetStatus("com.a 12\ncom.a 34\n", ["com.a"]),
+        { "com.a": ["12", "34"] },
+    );
+    assert.deepEqual(
+        parseTargetStatus("com.a:my proc 99\n", ["com.a:my proc"]),
+        { "com.a:my proc": ["99"] },
+    );
+    assert.deepEqual(parseTargetStatus("com.a nope\n", ["com.a"]), {});
+    assert.deepEqual(parseTargetStatus("com.other 7\n", ["com.a"]), {});
+    assert.deepEqual(parseTargetStatus("", ["com.a"]), {});
 });
 
 test("targetStatusCmd quotes names and matches exactly", () => {
