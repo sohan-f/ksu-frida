@@ -519,12 +519,13 @@ fn with_config_suffix(path: &str) -> String {
         Some((dir, base)) => (Some(dir), base),
         None => (None, path),
     };
-    let Some((stem, rest)) = base.rsplit_once(".so") else {
+    // Suffix-anchored: mid-name `.so` (e.g. `a.soa`, `lib.so.bak`) takes no sibling.
+    let Some(stem) = base.strip_suffix(".so") else {
         return path.to_string();
     };
     match dir {
-        Some(dir) => format!("{dir}/{stem}.config.so{rest}"),
-        None => format!("{stem}.config.so{rest}"),
+        Some(dir) => format!("{dir}/{stem}.config.so"),
+        None => format!("{stem}.config.so"),
     }
 }
 
@@ -1362,6 +1363,10 @@ mod tests {
             "/dir.so/libx.config.so"
         );
         assert_eq!(with_config_suffix("./libx.so"), "./libx.config.so");
+        // Mid-name `.so` takes no sibling; only a true suffix does.
+        assert_eq!(with_config_suffix("a.soa"), "a.soa");
+        assert_eq!(with_config_suffix("lib.so.bak"), "lib.so.bak");
+        assert_eq!(with_config_suffix("lib.so.1"), "lib.so.1");
     }
 
     #[test]
