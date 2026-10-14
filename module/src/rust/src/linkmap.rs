@@ -880,9 +880,13 @@ fn run_scrub(search: &mut ScrubSearch) {
 #[cold]
 unsafe extern "C" fn log_names_callback(
     info: *mut DlPhdrInfo,
-    _size: usize,
+    size: usize,
     _data: *mut c_void,
 ) -> c_int {
+    // Only `dlpi_name` is read; it predates every later field.
+    if size < std::mem::offset_of!(DlPhdrInfo, name) + size_of::<*const c_char>() {
+        return 0;
+    }
     // SAFETY: linker entry is valid for a field read; null precedes any string deref.
     if unsafe { (*info).name.is_null() } {
         return 0;
@@ -1156,6 +1160,25 @@ mod tests {
             free_cstring(only, 43);
         }
         assert!(!search.found);
+    }
+
+    #[test]
+    fn undersized_phdr_info_is_not_logged() {
+        let only = raw_cstring("/system/lib/libc.so");
+        let mut only_entry = entry(only);
+        // SAFETY: live owned string; undersized `size` must stop before any field read.
+        unsafe {
+            assert_eq!(
+                log_names_callback(
+                    &raw mut only_entry,
+                    std::mem::offset_of!(DlPhdrInfo, name) - 1,
+                    std::ptr::null_mut()
+                ),
+                0
+            );
+            assert_eq!(CStr::from_ptr(only).to_bytes(), b"/system/lib/libc.so");
+            free_cstring(only, 19);
+        }
     }
 
     #[test]
