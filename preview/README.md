@@ -5,7 +5,7 @@ See and click the WebUI on your computer. No device, no flashing.
 ```shell
 cd template/ksu_module/webroot
 npm run preview
-# open http://localhost:8090/
+# open http://localhost:8090/ (binds 0.0.0.0, so LAN devices can use your machine's IP too)
 ```
 
 The `preview` script rebuilds `main.js`, then serves `webroot/` with

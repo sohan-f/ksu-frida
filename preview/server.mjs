@@ -50,6 +50,6 @@ const server = http.createServer((req, res) => {
     send(res, 200, type, fs.readFileSync(file));
 });
 
-server.listen(port, () => {
-    console.log("KsuFrida WebUI preview at http://localhost:" + port + "/");
+server.listen(port, "0.0.0.0", () => {
+    console.log("KsuFrida WebUI preview at http://0.0.0.0:" + port + "/");
 });
