@@ -118,6 +118,9 @@ jobs:
         with:
           workspaces: module/src/rust -> target
 
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+
       - name: Build
         run: |
           chmod +x ./gradlew
