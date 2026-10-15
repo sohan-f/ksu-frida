@@ -450,9 +450,11 @@
 
         @keyframes sink { to { opacity: 0; transform: translateY(8px) scale(.98); } }
 
-        .modal-overlay.closing { animation: fade-out var(--dur-effects-fast) var(--ease-exit); }
+        /* `forwards` holds the exit end state until JS sets display:none;
+           without it the scrim/dialog snap back to visible before hiding. */
+        .modal-overlay.closing { animation: fade-out var(--dur-effects-fast) var(--ease-exit) forwards; }
 
-        .modal-overlay.closing .modal { animation: sink var(--dur-effects-default) var(--ease-exit); }
+        .modal-overlay.closing .modal { animation: sink var(--dur-effects-default) var(--ease-exit) forwards; }
 
         @keyframes pill-pop {
             from { opacity: .4; transform: scale(.94); }
@@ -571,7 +573,7 @@
                 padding-bottom: calc(16px + env(safe-area-inset-bottom, 0px));
                 animation: sheet-in var(--dur-spatial-fast) var(--ease-spatial-fast);
             }
-            .modal-overlay.closing .modal { animation: sheet-out var(--dur-effects-default) var(--ease-exit); }
+            .modal-overlay.closing .modal { animation: sheet-out var(--dur-effects-default) var(--ease-exit) forwards; }
         }
 
         .modal-body {
