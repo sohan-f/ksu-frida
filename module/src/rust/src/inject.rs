@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use crate::child_gating::enable_child_gating;
 use crate::config::{TargetConfig, load_config};
+use crate::history::{HideOutcome, StageSource};
 use crate::linkmap::scrub_dlpi_name;
 use crate::log::{basename, loge_fmt, logi, logi_fmt};
 use crate::remap::remap_lib;
@@ -14,6 +15,7 @@ use crate::sys::{RTLD_NOW, cstring, dlerror_string, dlopen};
 use crate::xdl::{XDL_TRY_FORCE_LOAD, xdl_open};
 
 const MODULE_DIR: &str = "/data/local/tmp/libsec";
+const HISTORY_PATH: &str = "/data/local/tmp/libsec/.history";
 
 pub fn check_and_inject(app_name: &str) -> bool {
     let Some(cfg) = load_config(MODULE_DIR, app_name) else {
@@ -920,7 +922,34 @@ fn unlink_staged(staged_lib_path: &str) {
     }
 }
 
-pub fn inject_lib(lib_path: &str, log_context: &str, hide_maps: bool, scrub_header: bool) {
+fn note_history(app_name: &str, lib_path: &str, src: StageSource, loaded: bool, hide: HideOutcome) {
+    // Gate first: formatting allocates, and fork children must never alloc.
+    if !crate::log::verbose() {
+        return;
+    }
+    // SAFETY: `getpid(2)` cannot fail.
+    let pid = unsafe { libc::getpid() } as u32;
+    let ts_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let record = crate::history::format_record(
+        pid,
+        ts_secs,
+        src,
+        crate::history::load_result(loaded, hide),
+        app_name,
+        basename(lib_path),
+    );
+    crate::history::append_record(HISTORY_PATH, &record);
+}
+
+pub fn inject_lib(
+    lib_path: &str,
+    log_context: &str,
+    hide_maps: bool,
+    scrub_header: bool,
+) -> Option<HideOutcome> {
     // The linker derives the loaded path from the fd, resolving symlinks:
     // hide and verify must use the target path, not a configured alias.
     let resolved = resolve_lib_path(lib_path);
@@ -934,7 +963,12 @@ fn resolve_lib_path(lib_path: &str) -> String {
         .unwrap_or_else(|_| lib_path.to_string())
 }
 
-fn inject_lib_resolved(lib_path: &str, log_context: &str, hide_maps: bool, scrub_header: bool) {
+fn inject_lib_resolved(
+    lib_path: &str,
+    log_context: &str,
+    hide_maps: bool,
+    scrub_header: bool,
+) -> Option<HideOutcome> {
     let base = basename(lib_path);
     let c_path = match cstring(lib_path) {
         Ok(c_path) => c_path,
@@ -942,7 +976,7 @@ fn inject_lib_resolved(lib_path: &str, log_context: &str, hide_maps: bool, scrub
             loge_fmt(format_args!(
                 "{log_context}refusing library path with interior NUL {lib_path:?}: {err}"
             ));
-            return;
+            return None;
         }
     };
 
@@ -952,8 +986,7 @@ fn inject_lib_resolved(lib_path: &str, log_context: &str, hide_maps: bool, scrub
         logi_fmt(format_args!(
             "{log_context}Injected {base} with handle {handle:p}"
         ));
-        hide_or_show(lib_path, log_context, hide_maps, scrub_header);
-        return;
+        return Some(hide_or_show(lib_path, log_context, hide_maps, scrub_header));
     }
     let xdl_err = dlerror_string();
 
@@ -963,8 +996,7 @@ fn inject_lib_resolved(lib_path: &str, log_context: &str, hide_maps: bool, scrub
         logi_fmt(format_args!(
             "{log_context}Injected {base} with handle {handle:p} (dlopen fallback)"
         ));
-        hide_or_show(lib_path, log_context, hide_maps, scrub_header);
-        return;
+        return Some(hide_or_show(lib_path, log_context, hide_maps, scrub_header));
     }
     let dlopen_err = dlerror_string();
 
@@ -974,9 +1006,15 @@ fn inject_lib_resolved(lib_path: &str, log_context: &str, hide_maps: bool, scrub
     loge_fmt(format_args!(
         "{log_context}Failed to inject {base} (dlopen): {dlopen_err}"
     ));
+    None
 }
 
-fn hide_or_show(lib_path: &str, log_context: &str, hide_maps: bool, scrub_header: bool) {
+fn hide_or_show(
+    lib_path: &str,
+    log_context: &str,
+    hide_maps: bool,
+    scrub_header: bool,
+) -> HideOutcome {
     if hide_maps {
         remap_lib(lib_path, scrub_header);
     } else {
@@ -984,16 +1022,17 @@ fn hide_or_show(lib_path: &str, log_context: &str, hide_maps: bool, scrub_header
             "{log_context}Map hiding disabled for {}",
             basename(lib_path)
         ));
+        return HideOutcome::Disabled;
     }
     scrub_dlpi_name(lib_path);
-    verify_hiding(lib_path, log_context, hide_maps);
+    verify_hiding(lib_path, log_context, hide_maps)
 }
 
-fn verify_hiding(lib_path: &str, log_context: &str, hide_maps: bool) {
+fn verify_hiding(lib_path: &str, log_context: &str, hide_maps: bool) -> HideOutcome {
     // Advisory only: expected-visible when hiding is off, and skipped
     // entirely when quiet so the default path pays nothing.
     if !hide_maps || !crate::log::verbose() {
-        return;
+        return HideOutcome::Disabled;
     }
     let base = basename(lib_path);
     // Linker first (in-memory walk), maps second (file scan), threads last
@@ -1002,53 +1041,62 @@ fn verify_hiding(lib_path: &str, log_context: &str, hide_maps: bool) {
         loge_fmt(format_args!(
             "{log_context}Hide verify LEAK (linker) for {base}"
         ));
+        HideOutcome::LeakLinker
     } else if crate::remap::maps_show(lib_path) {
         loge_fmt(format_args!(
             "{log_context}Hide verify LEAK (maps) for {base}"
         ));
+        HideOutcome::LeakMaps
     } else if let Some(name) = crate::thread_names::first_blocked_thread_name() {
         loge_fmt(format_args!(
             "{log_context}Hide verify LEAK (threads) for {base}: {name}"
         ));
+        HideOutcome::LeakThreads
     } else {
         logi_fmt(format_args!("{log_context}Hide verify clean for {base}"));
+        HideOutcome::Clean
     }
 }
 
 #[cfg(any(target_os = "android", test))]
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
-fn hide_or_show_memfd(log_context: &str, hide_maps: bool, scrub_header: bool) {
+fn hide_or_show_memfd(log_context: &str, hide_maps: bool, scrub_header: bool) -> HideOutcome {
     use crate::linkmap::scrub_memfd;
     use crate::remap::remap_memfd;
     if hide_maps {
         remap_memfd(scrub_header);
     } else {
         logi_fmt(format_args!("{log_context}Map hiding disabled for memfd"));
+        return HideOutcome::Disabled;
     }
     scrub_memfd();
-    verify_hiding_memfd(log_context, hide_maps);
+    verify_hiding_memfd(log_context, hide_maps)
 }
 
 #[cfg(any(target_os = "android", test))]
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
-fn verify_hiding_memfd(log_context: &str, hide_maps: bool) {
+fn verify_hiding_memfd(log_context: &str, hide_maps: bool) -> HideOutcome {
     if !hide_maps || !crate::log::verbose() {
-        return;
+        return HideOutcome::Disabled;
     }
     if crate::linkmap::is_memfd_linker_visible() {
         loge_fmt(format_args!(
             "{log_context}Hide verify LEAK (linker) for memfd"
         ));
+        HideOutcome::LeakLinker
     } else if crate::remap::maps_show(crate::sys::MEMFD_NAME) {
         loge_fmt(format_args!(
             "{log_context}Hide verify LEAK (maps) for memfd"
         ));
+        HideOutcome::LeakMaps
     } else if let Some(name) = crate::thread_names::first_blocked_thread_name() {
         loge_fmt(format_args!(
             "{log_context}Hide verify LEAK (threads) for memfd: {name}"
         ));
+        HideOutcome::LeakThreads
     } else {
         logi_fmt(format_args!("{log_context}Hide verify clean for memfd"));
+        HideOutcome::Clean
     }
 }
 
@@ -1124,18 +1172,18 @@ fn try_memfd_inject(
     log_context: &str,
     hide_maps: bool,
     scrub_header: bool,
-) -> bool {
+) -> Option<HideOutcome> {
     use crate::sys::{ANDROID_DLEXT_FORCE_LOAD, ANDROID_DLEXT_USE_LIBRARY_FD};
 
     let Some(fd) = write_memfd(src_lib_path) else {
-        return false;
+        return None;
     };
     let c_path = match cstring(src_lib_path) {
         Ok(c_path) => c_path,
         Err(_) => {
             // SAFETY: `fd` is ours from above.
             unsafe { libc::close(fd) };
-            return false;
+            return None;
         }
     };
     let info = crate::sys::AndroidDlextInfo {
@@ -1162,18 +1210,19 @@ fn try_memfd_inject(
             "{log_context}memfd load failed for {src_lib_path}: {}",
             dlerror_string()
         ));
-        return false;
+        return None;
     }
     logi_fmt(format_args!(
         "{log_context}Injected {src_lib_path} from memfd with handle {handle:p}"
     ));
-    hide_or_show_memfd(log_context, hide_maps, scrub_header);
-    true
+    Some(hide_or_show_memfd(log_context, hide_maps, scrub_header))
 }
 
 #[cfg(not(any(target_os = "android", test)))]
 #[allow(dead_code)]
-fn hide_or_show_memfd(_log_context: &str, _hide_maps: bool, _scrub_header: bool) {}
+fn hide_or_show_memfd(_log_context: &str, _hide_maps: bool, _scrub_header: bool) -> HideOutcome {
+    HideOutcome::Disabled
+}
 
 #[cfg(not(target_os = "android"))]
 fn try_memfd_inject(
@@ -1181,8 +1230,8 @@ fn try_memfd_inject(
     _log_context: &str,
     _hide_maps: bool,
     _scrub_header: bool,
-) -> bool {
-    false
+) -> Option<HideOutcome> {
+    None
 }
 
 // stage=false injects the source directly; only gated children stage.
@@ -1203,6 +1252,13 @@ pub(crate) fn stage_and_inject(
         loge_fmt(format_args!(
             "{log_context}Sibling config unreadable, skipping injection to preserve sidecar: {src_cfg}"
         ));
+        note_history(
+            app_name,
+            lib_path,
+            StageSource::None,
+            false,
+            HideOutcome::Disabled,
+        );
         return false;
     }
     // Non-regular sources would hang (fifo) or confuse the loader below.
@@ -1210,12 +1266,20 @@ pub(crate) fn stage_and_inject(
         loge_fmt(format_args!(
             "{log_context}Skipping injection for non-file source: {lib_path}"
         ));
+        note_history(
+            app_name,
+            lib_path,
+            StageSource::None,
+            false,
+            HideOutcome::Disabled,
+        );
         return false;
     }
     // A present sibling config must load from files (see prefers_file_staging).
     if !prefers_file_staging(lib_path)
-        && try_memfd_inject(lib_path, log_context, hide_maps, scrub_header)
+        && let Some(hide) = try_memfd_inject(lib_path, log_context, hide_maps, scrub_header)
     {
+        note_history(app_name, lib_path, StageSource::Memfd, true, hide);
         return true;
     }
     let do_stage = stage || lib_needs_file_staging(lib_path);
@@ -1232,6 +1296,13 @@ pub(crate) fn stage_and_inject(
             "{log_context}Staging {} failed; skipping injection",
             basename(lib_path)
         ));
+        note_history(
+            app_name,
+            lib_path,
+            StageSource::None,
+            false,
+            HideOutcome::Disabled,
+        );
         return false;
     }
     let inject_path = staged.as_deref().unwrap_or(lib_path);
@@ -1240,7 +1311,18 @@ pub(crate) fn stage_and_inject(
         "{log_context}Injecting {}",
         basename(inject_path)
     ));
-    inject_lib(inject_path, log_context, hide_maps, scrub_header);
+    let hide = inject_lib(inject_path, log_context, hide_maps, scrub_header);
+    note_history(
+        app_name,
+        inject_path,
+        if staged.is_some() {
+            StageSource::Staged
+        } else {
+            StageSource::File
+        },
+        hide.is_some(),
+        hide.unwrap_or(HideOutcome::Disabled),
+    );
 
     if let Some(staged) = staged.as_deref() {
         unlink_staged(staged);

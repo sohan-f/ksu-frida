@@ -3,6 +3,7 @@
 
 mod child_gating;
 mod config;
+mod history;
 mod inject;
 mod jni;
 mod linkmap;
