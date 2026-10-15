@@ -4,9 +4,11 @@ import {
     blockField,
     cmpVersions,
     escHtml,
+    findDuplicateGadgetPorts,
     gadgetUrlsForAbi,
     hashCheckSnippet,
     isSafePairName,
+    nextFreeGadgetPort,
     parseGadgetMeta,
     parseJson,
     parseLabelLines,
@@ -21,6 +23,7 @@ import {
     validReleaseUrl,
     validSha256,
     validVersion,
+    wildcardPrefix,
 } from "../src/util";
 
 const B = "/data/adb/ksu/bin/busybox";
@@ -118,6 +121,47 @@ test("targetStatusCmd quotes names and matches exactly", () => {
     assert.ok(cmd.includes("-e 'com.a.b'"));
     assert.ok(cmd.includes("-e 'evil'\\''x'"));
     assert.ok(cmd.includes("case \"$n\" in 'com.a.b'|'evil'\\''x')"));
+});
+
+test("wildcardPrefix accepts one trailing star only", () => {
+    assert.equal(wildcardPrefix("com.foo*"), "com.foo");
+    assert.equal(wildcardPrefix("*"), null);
+    assert.equal(wildcardPrefix("com.foo"), null);
+    assert.equal(wildcardPrefix("com.*foo"), null);
+    assert.equal(wildcardPrefix("com.foo**"), null);
+    assert.equal(wildcardPrefix("*com.foo"), null);
+    assert.equal(wildcardPrefix(null), null);
+});
+
+test("targetStatusCmd expands wildcards to prefix patterns", () => {
+    const cmd = targetStatusCmd(["com.foo*"]);
+    assert.ok(cmd.includes("-e 'com.foo'"));
+    assert.ok(!cmd.includes("-e 'com.foo*'"));
+    assert.ok(cmd.includes("case \"$n\" in 'com.foo'*)"));
+});
+
+test("parseTargetStatus collects wildcard processes under the pattern", () => {
+    assert.deepEqual(
+        parseTargetStatus("com.foo 12\ncom.foo:push 34\ncom.bar 56\n", ["com.foo*"]),
+        { "com.foo*": ["12", "34"] },
+    );
+    assert.deepEqual(
+        parseTargetStatus("com.foo 12\n", ["com.foo", "com.foo*"]),
+        { "com.foo": ["12"], "com.foo*": ["12"] },
+    );
+    assert.deepEqual(parseTargetStatus("com.foobar 7\n", ["com.foo"]), {});
+});
+
+test("nextFreeGadgetPort fills the lowest gap from the base", () => {
+    assert.equal(nextFreeGadgetPort([]), 27042);
+    assert.equal(nextFreeGadgetPort([{ gadget_port: 27042 }]), 27043);
+    assert.equal(nextFreeGadgetPort([{ gadget_port: 27043 }]), 27042);
+    assert.equal(
+        nextFreeGadgetPort([{ gadget_port: 27042 }, { gadget_port: 27043 }], 27043),
+        27044,
+    );
+    assert.equal(nextFreeGadgetPort([{ gadget_port: "99junk" }]), 27042);
+    assert.deepEqual(findDuplicateGadgetPorts([{ gadget_port: 1 }, { gadget_port: 1 }]), [1]);
 });
 
 test("hashCheckSnippet expands shell paths, quotes the digest", () => {

@@ -32,6 +32,7 @@ import {
     findDuplicateGadgetPorts,
     gadgetUrlsForAbi,
     hashCheckSnippet,
+    nextFreeGadgetPort,
     pairManifestCmd,
     pairSetupCmd,
     pairStemCollisions,
@@ -53,6 +54,7 @@ import {
     validReleaseUrl,
     validSha256,
     validVersion,
+    wildcardPrefix,
     DONE_MARK,
     LABEL_FILE,
     SCAN_FILE,
@@ -444,10 +446,16 @@ function setPill(pill: HTMLElement, text: string, cls: string) {
     if (pill.className !== cls) pill.className = cls;
 }
 
+function targetPkg(t: Target) {
+    var pkg = (t.app_name || "").split(":")[0];
+    if (pkg.slice(-1) === "*") pkg = pkg.slice(0, -1);
+    return pkg;
+}
+
 function stopApp(i: number) {
     var t = config.targets[i];
     if (!t) return;
-    var pkg = t.app_name.split(":")[0];
+    var pkg = targetPkg(t);
     if ((targetStatus[t.app_name] || []).length === 0) {
         setSlotStatus("detail-status", pkg + " is already stopped", { fade: true });
         return;
@@ -463,7 +471,7 @@ function stopApp(i: number) {
 function startApp(i: number) {
     var t = config.targets[i];
     if (!t) return;
-    var pkg = t.app_name.split(":")[0];
+    var pkg = targetPkg(t);
     if ((targetStatus[t.app_name] || []).length > 0) {
         setSlotStatus("detail-status", pkg + " is already running", { fade: true });
         return;
@@ -585,6 +593,34 @@ async function refreshConnect() {
         renderConnect(info, parsePorts(r.stdout ? r.stdout.split("\n") : []));
     } finally {
         setBusy("btn-connect", false);
+    }
+}
+
+async function refreshLogs() {
+    setBusy("btn-logs", true);
+    try {
+        var r = await exec("logcat -d -s KsuFrida 2>/dev/null | tail -n 200");
+        var body = getEl("log-body");
+        if (execMode === "none") {
+            body.className = "empty";
+            body.textContent = "Shell access unavailable (ksu.exec missing).";
+            return;
+        }
+        if (r.errno !== 0) {
+            setSlotStatus("log-status", "Log read failed", { cls: "status-err", tag: "logs", retry: refreshLogs });
+            return;
+        }
+        var text = (r.stdout || "").trim();
+        clearSlotIf("log-status", "logs");
+        if (!text) {
+            body.className = "empty";
+            body.textContent = "No KsuFrida lines. Enable verbose logging, restart the target, then refresh.";
+            return;
+        }
+        body.className = "cmd";
+        body.textContent = text;
+    } finally {
+        setBusy("btn-logs", false);
     }
 }
 
@@ -1277,6 +1313,15 @@ function renderDetail() {
     bar.appendChild(mkBtn("Start", "btn btn-sm btn-primary", function () { startApp(i); }));
     body.appendChild(bar);
 
+    var wildcard = wildcardPrefix(t.app_name);
+    if (wildcard !== null) {
+        var wildNote = document.createElement("div");
+        wildNote.className = "sub";
+        wildNote.textContent = "Wildcard target: matches " + wildcard + " and its processes (e.g. " + wildcard + ":push). Status lists every match.";
+        wildNote.style.marginTop = "8px";
+        body.appendChild(wildNote);
+    }
+
     var statusWrap = document.createElement("div");
     statusWrap.className = "collapse";
     statusWrap.id = "detail-status-wrap";
@@ -1338,24 +1383,27 @@ function renderDetail() {
                 gadgetPort.value = t.gadget_port ? String(t.gadget_port) : "";
                 return;
             }
-            t.gadget_port = p;
-            if (!t.gadget_config) t.gadget_config = defaultTargetGadget(p);
-            else {
-                try {
-                    var current = JSON.parse(t.gadget_config);
-                    if (current.interaction && current.interaction.type === "listen") current.interaction.port = p;
-                    t.gadget_config = JSON.stringify(current, null, 2);
-                } catch (_) {}
-            }
-            (t.injected_libraries || []).forEach(function (lib) {
-                if (lib.path === GADGET_PATH) lib.path = LIBSEC_DIR + "/" + targetGadgetSo(t.app_name);
-                else if (lib.path === GADGET32_PATH) lib.path = LIBSEC_DIR + "/" + targetGadgetSo(t.app_name, true);
-            });
+            applyGadgetPort(t, p);
         }
         markDirty("cfg");
         renderDetail();
     };
-    body.appendChild(fieldBlock("Dedicated gadget port (optional)", gadgetPort));
+    var portWrap = document.createElement("div");
+    portWrap.appendChild(gadgetPort);
+    var portRow = document.createElement("div");
+    portRow.className = "btnrow";
+    portRow.appendChild(mkBtn("Assign next free port", "btn btn-sm", function () {
+        var p = nextFreeGadgetPort(config.targets.filter(function (o) { return o !== t; }));
+        if (p === null) {
+            setSlotStatus("detail-status", "No free port left between 27042 and 65535", { cls: "status-err" });
+            return;
+        }
+        applyGadgetPort(config.targets[i], p);
+        markDirty("cfg");
+        renderDetail();
+    }));
+    portWrap.appendChild(portRow);
+    body.appendChild(fieldBlock("Dedicated gadget port (optional)", portWrap));
 
     if (t.gadget_port) {
         var myPort: number = t.gadget_port;
@@ -1427,6 +1475,22 @@ function defaultTargetGadget(port: number) {
     return JSON.stringify({ interaction: { type: "listen", address: "127.0.0.1", port: port, on_port_conflict: "pick-next" } }, null, 2);
 }
 
+function applyGadgetPort(t: Target, port: number) {
+    t.gadget_port = port;
+    if (!t.gadget_config) t.gadget_config = defaultTargetGadget(port);
+    else {
+        try {
+            var current = JSON.parse(t.gadget_config);
+            if (current.interaction && current.interaction.type === "listen") current.interaction.port = port;
+            t.gadget_config = JSON.stringify(current, null, 2);
+        } catch (_) {}
+    }
+    (t.injected_libraries || []).forEach(function (lib) {
+        if (lib.path === GADGET_PATH) lib.path = LIBSEC_DIR + "/" + targetGadgetSo(t.app_name);
+        else if (lib.path === GADGET32_PATH) lib.path = LIBSEC_DIR + "/" + targetGadgetSo(t.app_name, true);
+    });
+}
+
 function settingRow(labelText: string, control: HTMLElement) {
     var r = document.createElement("div");
     r.className = "setting-row";
@@ -1443,7 +1507,7 @@ function buildModeSeg(t: Target, i: number) {
     var seg = document.createElement("div");
     seg.className = "seg";
     seg.setAttribute("role", "radiogroup");
-    ["freeze", "kill", "inject"].forEach(function (m) {
+    ["freeze", "stop", "kill", "inject"].forEach(function (m) {
         var b = document.createElement("button");
         b.className = "seg-btn" + (cur === m ? " seg-on" : "");
         b.textContent = m.charAt(0).toUpperCase() + m.slice(1);
@@ -1711,6 +1775,7 @@ window.onload = function () {
     }, true);
     getEl("btn-status").onclick = loadStatus;
     getEl("btn-connect").onclick = function () { refreshConnect(); };
+    getEl("btn-logs").onclick = function () { refreshLogs(); };
 
     getEl("app-search").oninput = function () {
         if (appSearchTimer !== null) clearTimeout(appSearchTimer);

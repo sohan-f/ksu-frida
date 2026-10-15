@@ -61,6 +61,14 @@ run as `package:worker` and do not match the bundle-id entry: give each
 process you want instrumented its own target entry with its full process
 name, and give each its own gadget port so their listeners never conflict.
 
+A trailing `*` opts into prefix matching: `"app_name": "com.example.package*"`
+covers the base package and its child processes. The match is a plain
+prefix, so it also covers `com.example.package2`; keep the prefix as
+specific as needed. Exact names never match by prefix, so
+`com.example.package` alone does not cover
+`com.example.package:worker` or `com.example.package2`. When both an
+exact and a wildcard entry match, the exact entry wins.
+
 ### enabled
 If set to false, then this module will ignore this configuration.
 This is useful if you want to temporarily disable a target while maintaining the config.
@@ -124,8 +132,8 @@ without child gating.
 By enabling this feature by setting `enabled` to true, you can configure how to deal
 with these child processes.
 
-There are currently 3 modes in how child gating operates. You can determine by
-setting the mode to either `freeze`, `kill` or `inject`.
+There are currently 4 modes in how child gating operates. You can determine by
+setting the mode to either `freeze`, `stop`, `kill` or `inject`.
 
 Using any of the child gating mode can cause issues properly shutting down the application even with a force close.
 This can cause issues restarting the app. Manually killing the app can resolve this.
@@ -136,6 +144,11 @@ adb shell su -c 'kill -9 $(pidof com.example.package)'
 ### freeze
 The child process will not return from the fork. This means that no code will
 run within the child process but the process itself stays alive.
+
+### stop
+The child process stops itself (`SIGSTOP`) right after the fork and stays
+stopped until resumed with `kill -CONT <pid>`. Attach your debugger while
+it is parked, then continue it to let the fork return normally.
 
 ### kill
 The child process will be killed as soon as it is forked. No code will

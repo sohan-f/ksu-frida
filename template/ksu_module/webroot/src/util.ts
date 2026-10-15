@@ -189,12 +189,34 @@ export function hashCheckSnippet(shellPath: string, hash: string, busyboxBin: st
         "[ \"$H\" = " + shQuote(hash.toLowerCase()) + " ]; }";
 }
 
+// One trailing `*` marks a package-prefix target (`com.foo*` covers the
+// base package and its `:process` children). Anything else holding `*`
+// is not a wildcard; callers treat it literally.
+export function wildcardPrefix(name: unknown): string | null {
+    if (typeof name !== "string" || name.length < 2) return null;
+    if (name.charAt(name.length - 1) !== "*") return null;
+    var prefix = name.slice(0, -1);
+    if (!prefix || prefix.indexOf("*") !== -1) return null;
+    return prefix;
+}
+
 export function targetStatusCmd(names: string[]) {
+    var exact: string[] = [];
+    var prefixes: string[] = [];
+    (names || []).forEach(function (n) {
+        var prefix = wildcardPrefix(n);
+        if (prefix !== null) prefixes.push(prefix);
+        else exact.push(n);
+    });
+    var greps = exact.map(function (n) { return "-e " + shQuote(n); })
+        .concat(prefixes.map(function (p) { return "-e " + shQuote(p); }));
+    var cases = exact.map(shQuote)
+        .concat(prefixes.map(function (p) { return shQuote(p) + "*"; }));
     return "for c in $(grep -a -l -F " +
-        names.map(function (n) { return "-e " + shQuote(n); }).join(" ") +
+        greps.join(" ") +
         " /proc/[0-9]*/cmdline 2>/dev/null); do " +
         "n=$(tr '\\0' '\\n' 2>/dev/null < \"$c\" | head -1); " +
-        "case \"$n\" in " + names.map(shQuote).join("|") + ") " +
+        "case \"$n\" in " + cases.join("|") + ") " +
         "p=${c#/proc/}; echo \"$n ${p%%/cmdline}\";; esac; done";
 }
 
@@ -211,12 +233,26 @@ export function parsePorts(lines: string[]) {
 
 // Parses `<process> <pid>` lines from the status poll. The name runs to the
 // last blank (process names may hold spaces); the pid must be numeric.
+// Wildcard targets collect every process under their prefix, keyed by the
+// target pattern so pills keep working for `com.foo*` entries.
 export function parseTargetStatus(stdout: string, names: string[]): Record<string, string[]> {
     var out: Record<string, string[]> = {};
+    var prefixes: Array<{ pattern: string; prefix: string }> = [];
+    (names || []).forEach(function (n) {
+        var prefix = wildcardPrefix(n);
+        if (prefix !== null) prefixes.push({ pattern: n, prefix: prefix });
+    });
     String(stdout || "").split("\n").forEach(function (line) {
         var m = /^(.*)\s+([0-9]+)$/.exec(line.trim());
-        if (!m || names.indexOf(m[1]) === -1) return;
-        (out[m[1]] = out[m[1]] || []).push(m[2]);
+        if (!m) return;
+        var name: string = m[1];
+        var pid: string = m[2];
+        if (names.indexOf(name) !== -1) (out[name] = out[name] || []).push(pid);
+        prefixes.forEach(function (w) {
+            if (name.indexOf(w.prefix) === 0 && name !== w.pattern) {
+                (out[w.pattern] = out[w.pattern] || []).push(pid);
+            }
+        });
     });
     return out;
 }
@@ -276,6 +312,21 @@ export function findDuplicateGadgetPorts(targets: Array<{ gadget_port?: unknown 
     });
     dups.sort(function (a, b) { return a - b; });
     return dups;
+}
+
+// Smallest port at or above `base` no target holds, or null when the
+// range is exhausted. Backs the "assign next free port" button.
+export function nextFreeGadgetPort(targets: Array<{ gadget_port?: unknown }>, base?: number): number | null {
+    var start = parseGadgetPort(base) || 27042;
+    var used: Record<number, boolean> = {};
+    (targets || []).forEach(function (t) {
+        var p = parseGadgetPort(t && t.gadget_port);
+        if (p !== null) used[p] = true;
+    });
+    for (var p = start; p <= 65535; p++) {
+        if (!used[p]) return p;
+    }
+    return null;
 }
 
 // Distinct app names sanitizing to one pair basename (e.g. `a:b` vs `a_b`).
