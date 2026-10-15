@@ -293,11 +293,6 @@ fn load_advanced_config(module_dir: &str, app_name: &str) -> AdvancedOutcome {
         return AdvancedOutcome::Absent;
     };
 
-    // Byte precheck skips the parse for non-targets. A miss is definitive
-    // only without backslashes or wildcards: `\uXXXX` escapes decode to
-    // characters (e.g. `.`) that never appear literally, and a `com.foo*`
-    // entry never holds the full `com.foo:remote` name, so files holding
-    // either take the slow path and parse anyway.
     if !contains_bytes(&bytes, app_name.as_bytes())
         && !bytes.contains(&b'\\')
         && !bytes.contains(&b'*')
@@ -328,8 +323,6 @@ fn load_advanced_config(module_dir: &str, app_name: &str) -> AdvancedOutcome {
         return AdvancedOutcome::Absent;
     };
 
-    // Exact targets win over wildcards so a `com.foo` entry keeps
-    // precedence when both it and `com.foo*` are configured.
     for target in targets {
         // Name match first: a malformed unrelated entry must stay silent.
         if target.get("app_name").and_then(Value::as_str) != Some(app_name) {

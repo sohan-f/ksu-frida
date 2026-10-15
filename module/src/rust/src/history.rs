@@ -2,7 +2,6 @@
 
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use crate::log::loge_fmt;
 
@@ -63,9 +62,6 @@ fn trunc(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
-// One `\x1f`-separated line per injection, space-padded to 255 bytes plus
-// `\n`: fixed-size so the WebUI can `tail -c` whole records. App and lib
-// come last and may hold spaces; only `\x1f` separates fields.
 pub fn format_record(
     pid: u32,
     ts_secs: u64,
@@ -118,19 +114,11 @@ pub fn parse_record(line: &str) -> Option<ParsedRecord> {
     Some(record)
 }
 
-// Best-effort `O_APPEND` write, verbose-gated like all logging (fork
-// children stay silent through the same gate). Caps the file at 256
-// records; a full file restarts rather than growing without bound.
-// Concurrent appends may lose records but never corrupt them.
 pub fn append_record(path: &str, record: &[u8; RECORD_LEN]) {
     if !crate::log::verbose() {
         return;
     }
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o666)
-        .open(path);
+    let file = fs::OpenOptions::new().create(true).append(true).open(path);
     let mut file = match file {
         Ok(file) => file,
         Err(err) => {
@@ -146,7 +134,6 @@ pub fn append_record(path: &str, record: &[u8; RECORD_LEN]) {
             .create(true)
             .write(true)
             .truncate(true)
-            .mode(0o666)
             .open(path)
         {
             Ok(f) => file = f,
@@ -159,9 +146,6 @@ pub fn append_record(path: &str, record: &[u8; RECORD_LEN]) {
     if let Err(err) = file.write_all(record) {
         loge_fmt(format_args!("history: write failed: {err}"));
     }
-    // Creators own the file under their umask; stay world-appendable so
-    // later app UIDs can add records. Non-owners fail here harmlessly.
-    let _ = file.set_permissions(fs::Permissions::from_mode(0o666));
 }
 
 #[cfg(test)]

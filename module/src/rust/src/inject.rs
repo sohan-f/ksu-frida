@@ -15,7 +15,7 @@ use crate::sys::{RTLD_NOW, cstring, dlerror_string, dlopen};
 use crate::xdl::{XDL_TRY_FORCE_LOAD, xdl_open};
 
 const MODULE_DIR: &str = "/data/local/tmp/libsec";
-const HISTORY_PATH: &str = "/data/local/tmp/libsec/.history";
+const HISTORY_FILE: &str = ".history";
 
 pub fn check_and_inject(app_name: &str) -> bool {
     let Some(cfg) = load_config(MODULE_DIR, app_name) else {
@@ -927,6 +927,9 @@ fn note_history(app_name: &str, lib_path: &str, src: StageSource, loaded: bool, 
     if !crate::log::verbose() {
         return;
     }
+    let Some(path) = cache_dir_for(app_name).map(|dir| format!("{dir}/{HISTORY_FILE}")) else {
+        return;
+    };
     // SAFETY: `getpid(2)` cannot fail.
     let pid = unsafe { libc::getpid() } as u32;
     let ts_secs = std::time::SystemTime::now()
@@ -941,7 +944,7 @@ fn note_history(app_name: &str, lib_path: &str, src: StageSource, loaded: bool, 
         app_name,
         basename(lib_path),
     );
-    crate::history::append_record(HISTORY_PATH, &record);
+    crate::history::append_record(&path, &record);
 }
 
 pub fn inject_lib(
