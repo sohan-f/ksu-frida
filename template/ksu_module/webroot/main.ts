@@ -13,6 +13,7 @@ const GADGET_API_URL = "https://api.github.com/repos/sohan-f/knox-frida-patcher/
 const GADGET_DL_DIR = "/data/local/tmp/libsec/.webui-gadget-dl";
 const GADGET_DL_LOG = "/data/local/tmp/libsec/.webui-gadget-dl.tmp";
 const VERBOSE_PATH = "/data/local/tmp/libsec/verbose";
+const HISTORY_PATH = "/data/local/tmp/libsec/.history";
 const LIBSEC_DIR = "/data/local/tmp/libsec";
 const GADGET32_PATH = "/data/local/tmp/libsec/libsecmon32.so";
 const DEFAULT_GADGET = '{"interaction":{"type":"listen","address":"127.0.0.1","port":27042,"on_port_conflict":"pick-next"}}';
@@ -21,13 +22,16 @@ const DEFAULT_GADGET = '{"interaction":{"type":"listen","address":"127.0.0.1","p
 import {
     AppConfig,
     ChildGating,
+    DoctorData,
     ExecResult,
     GadgetMeta,
     GadgetUrls,
     GatingLib,
+    HistoryEntry,
     Target,
     blockField,
     cmpVersions,
+    elfArch,
     escHtml,
     findDuplicateGadgetPorts,
     gadgetUrlsForAbi,
@@ -37,8 +41,10 @@ import {
     pairSetupCmd,
     pairStemCollisions,
     pairSweepCmd,
+    parseDoctorOutput,
     parseGadgetMeta,
     parseGadgetPort,
+    parseHistoryLine,
     parseJson,
     parseLabelLines,
     parsePorts,
@@ -622,6 +628,49 @@ async function refreshLogs() {
     } finally {
         setBusy("btn-logs", false);
     }
+}
+
+async function refreshHistory() {
+    setBusy("btn-history", true);
+    try {
+        var r = await exec("tail -c 51200 " + shQuote(HISTORY_PATH) + " 2>/dev/null");
+        var body = getEl("history-body");
+        body.innerHTML = "";
+        if (execMode === "none") {
+            body.className = "empty";
+            body.textContent = "Shell access unavailable (ksu.exec missing).";
+            return;
+        }
+        var entries: HistoryEntry[] = [];
+        (r.stdout || "").split("\n").forEach(function (line) {
+            var e = parseHistoryLine(line);
+            if (e) entries.push(e);
+        });
+        clearSlotIf("history-status", "history");
+        if (entries.length === 0) {
+            body.className = "empty";
+            body.textContent = "No injections recorded. Enable verbose logging and restart a target.";
+            return;
+        }
+        entries.slice(-20).reverse().forEach(function (e) {
+            var row = document.createElement("div");
+            row.className = "slotrow";
+            var s = document.createElement("span");
+            if (e.result === "clean") s.className = "status-ok";
+            else if (e.result.indexOf("leak") === 0 || e.result === "failed") s.className = "status-err";
+            s.textContent = e.app + " · pid " + e.pid + " · " + e.lib + " · " + e.src + " · " + e.result +
+                " · " + new Date(e.ts * 1000).toLocaleString();
+            row.appendChild(s);
+            body.appendChild(row);
+        });
+    } finally {
+        setBusy("btn-history", false);
+    }
+}
+
+async function clearHistory() {
+    await exec("rm -f " + shQuote(HISTORY_PATH));
+    refreshHistory();
 }
 
 async function poll() {
@@ -1776,6 +1825,9 @@ window.onload = function () {
     getEl("btn-status").onclick = loadStatus;
     getEl("btn-connect").onclick = function () { refreshConnect(); };
     getEl("btn-logs").onclick = function () { refreshLogs(); };
+    getEl("btn-doctor").onclick = function () { runDoctor(); };
+    getEl("btn-history").onclick = function () { refreshHistory(); };
+    getEl("btn-clear-history").onclick = function () { clearHistory(); };
 
     getEl("app-search").oninput = function () {
         if (appSearchTimer !== null) clearTimeout(appSearchTimer);
@@ -2183,6 +2235,164 @@ async function checkLibraries() {
     }
     if (JSON.stringify(Object.keys(missingPaths).sort()) !== before) scheduleRenderTargets();
     scheduleStatus();
+}
+
+function doctorCmd(libs: string[], cfgs: Array<{ port: number | null; path: string }>) {
+    var parts: string[] = [];
+    parts.push("echo \"ABI:$(getprop ro.product.cpu.abi 2>/dev/null)\"");
+    if (libs.length > 0) {
+        parts.push("for f in " + libs.map(shQuote).join(" ") + "; do " +
+            "if [ -f \"$f\" ]; then m=$(od -A n -t x1 -j 18 -N 2 \"$f\" 2>/dev/null | tr -d ' \\n'); " +
+            "echo \"LIB|$f|$m\"; else echo \"LIB|$f|MISSING\"; fi; done");
+    }
+    cfgs.forEach(function (c) {
+        parts.push("echo " + shQuote("CFG|" + (c.port === null ? "shared" : c.port) + "|" + c.path) +
+            "; cat " + shQuote(c.path) + " 2>/dev/null");
+    });
+    return parts.join("; ");
+}
+
+async function runDoctor() {
+    setBusy("btn-doctor", true);
+    try {
+        var libs: string[] = [];
+        var seen: Record<string, boolean> = {};
+        config.targets.forEach(function (t) {
+            [(t.injected_libraries || []), (t.child_gating && t.child_gating.injected_libraries) || []].forEach(
+                function (list) {
+                    list.forEach(function (l) {
+                        if (l && l.path && !seen[l.path]) {
+                            seen[l.path] = true;
+                            libs.push(l.path);
+                        }
+                    });
+                });
+        });
+        var cfgs: Array<{ port: number | null; path: string }> = [{ port: null, path: GADGET_CONFIG_PATH }];
+        config.targets.forEach(function (t) {
+            var p = parseGadgetPort(t.gadget_port);
+            if (p === null) return;
+            cfgs.push({ port: p, path: LIBSEC_DIR + "/" + targetGadgetCfg(targetGadgetSo(t.app_name)) });
+            var uses32 = (t.injected_libraries || []).some(function (lib) {
+                var base = (lib.path || "").split("/").pop() || "";
+                return base === "libsecmon32.so" || base === targetGadgetSo(t.app_name, true);
+            });
+            if (uses32) {
+                cfgs.push({ port: p, path: LIBSEC_DIR + "/" + targetGadgetCfg(targetGadgetSo(t.app_name, true)) });
+            }
+        });
+        var r = await exec(doctorCmd(libs, cfgs));
+        if (execMode === "none") {
+            renderDoctorRows([{ tone: "status-err", text: "Shell access unavailable (ksu.exec missing)." }]);
+            return;
+        }
+        renderDoctor(parseDoctorOutput(r.stdout || ""));
+    } finally {
+        setBusy("btn-doctor", false);
+    }
+}
+
+function renderDoctor(data: DoctorData) {
+    var rows: Array<{ tone: UpdateTone; text: string }> = [];
+    if (dirtyConfig) {
+        rows.push({ tone: "status-warn", text: "Unsaved target changes: disk checks reflect the last save." });
+    }
+    findDuplicateGadgetPorts(config.targets).forEach(function (p) {
+        rows.push({ tone: "status-err", text: "Duplicate gadget port " + p + ": give each target its own port." });
+    });
+    var owners: Record<string, string[]> = {};
+    config.targets.forEach(function (t) {
+        [(t.injected_libraries || []), (t.child_gating && t.child_gating.injected_libraries) || []].forEach(
+            function (list) {
+                list.forEach(function (l) {
+                    if (l && l.path) (owners[l.path] = owners[l.path] || []).push(t.app_name);
+                });
+            });
+        if (t.enabled && (t.start_up_delay_ms || 0) < 100) {
+            rows.push({
+                tone: "status-warn",
+                text: t.app_name + ": start-up delay " + (t.start_up_delay_ms || 0) +
+                    "ms is below 100ms and can wedge app startup.",
+            });
+        }
+        var p = parseGadgetPort(t.gadget_port);
+        if (p !== null) {
+            var err = validateTargetGadgetJson(t.gadget_config || defaultTargetGadget(p), p);
+            if (err) rows.push({ tone: "status-err", text: t.app_name + ": " + err + "." });
+        }
+    });
+    var archNote = data.abi !== "arm64-v8a" && data.abi !== "armeabi-v7a";
+    if (archNote) {
+        rows.push({ tone: "status-warn", text: "Unrecognized device ABI \"" + (data.abi || "unknown") + "\": skipping arch match." });
+    }
+    data.libs.forEach(function (lib) {
+        var who = (owners[lib.path] || []).join(", ") || lib.path;
+        if (lib.mach === "MISSING") {
+            rows.push({ tone: "status-err", text: who + ": library missing: " + lib.path + "." });
+            return;
+        }
+        var arch = elfArch(lib.mach);
+        if (arch === null) {
+            if (!lib.mach) {
+                rows.push({ tone: "status-warn", text: who + ": ELF header unreadable for " + lib.path + "." });
+            } else {
+                rows.push({ tone: "status-err", text: who + ": not an ARM library: " + lib.path + "." });
+            }
+            return;
+        }
+        if (archNote) {
+            rows.push({ tone: "status-ok", text: who + ": " + (arch === "arm64" ? "64" : "32") + "-bit library: " + lib.path + "." });
+        } else if (data.abi === "arm64-v8a" && arch === "arm") {
+            rows.push({ tone: "status-warn", text: who + ": 32-bit library " + lib.path + " loads only into 32-bit processes." });
+        } else if (data.abi === "armeabi-v7a" && arch === "arm64") {
+            rows.push({ tone: "status-err", text: who + ": 64-bit library " + lib.path + " on a 32-bit device." });
+        } else {
+            rows.push({ tone: "status-ok", text: who + ": " + (arch === "arm64" ? "64" : "32") + "-bit library: " + lib.path + "." });
+        }
+    });
+    data.cfgs.forEach(function (cfg) {
+        if (!cfg.body) {
+            if (cfg.port !== "shared") {
+                rows.push({ tone: "status-warn", text: "Pair config missing on disk: " + cfg.path + " (save targets to install)." });
+            }
+            return;
+        }
+        if (cfg.port === "shared") {
+            try {
+                JSON.parse(cfg.body);
+            } catch (e) {
+                rows.push({ tone: "status-err", text: "Shared gadget config is not valid JSON." });
+            }
+            return;
+        }
+        var port = parseInt(cfg.port, 10);
+        var perr = validateTargetGadgetJson(cfg.body, port);
+        if (perr) rows.push({ tone: "status-err", text: cfg.path + ": " + perr + "." });
+    });
+    var errs = rows.filter(function (r) { return r.tone === "status-err"; }).length;
+    var warns = rows.filter(function (r) { return r.tone === "status-warn"; }).length;
+    rows.unshift({
+        tone: errs > 0 ? "status-err" : warns > 0 ? "status-warn" : "status-ok",
+        text: errs > 0 || warns > 0
+            ? errs + " error(s), " + warns + " warning(s)."
+            : "All checks passed.",
+    });
+    renderDoctorRows(rows);
+}
+
+function renderDoctorRows(rows: Array<{ tone: UpdateTone; text: string }>) {
+    var body = getEl("doctor-body");
+    body.innerHTML = "";
+    body.className = "";
+    rows.forEach(function (r) {
+        var row = document.createElement("div");
+        row.className = "slotrow";
+        var s = document.createElement("span");
+        s.className = r.tone;
+        s.textContent = r.text;
+        row.appendChild(s);
+        body.appendChild(row);
+    });
 }
 
 function applyGadgetText(text: string) {

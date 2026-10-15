@@ -3,13 +3,16 @@ import assert from "node:assert/strict";
 import {
     blockField,
     cmpVersions,
+    elfArch,
     escHtml,
     findDuplicateGadgetPorts,
     gadgetUrlsForAbi,
     hashCheckSnippet,
     isSafePairName,
     nextFreeGadgetPort,
+    parseDoctorOutput,
     parseGadgetMeta,
+    parseHistoryLine,
     parseJson,
     parseLabelLines,
     parsePorts,
@@ -164,6 +167,27 @@ test("nextFreeGadgetPort fills the lowest gap from the base", () => {
     assert.deepEqual(findDuplicateGadgetPorts([{ gadget_port: 1 }, { gadget_port: 1 }]), [1]);
 });
 
+test("elfArch reads little-endian machine bytes", () => {
+    assert.equal(elfArch("b700"), "arm64");
+    assert.equal(elfArch("2800"), "arm");
+    assert.equal(elfArch(" B700 "), "arm64");
+    assert.equal(elfArch("0300"), null);
+    assert.equal(elfArch(""), null);
+    assert.equal(elfArch("MISSING"), null);
+    assert.equal(elfArch(null), null);
+});
+
+test("parseHistoryLine keeps spaced names, rejects fragments", () => {    const sep = "";
+    const line = ["1", "4242", "1700000000", "memfd", "clean", "com.foo:my proc", "libsecmon.so"].join(sep);
+    assert.deepEqual(parseHistoryLine(line + "   "), {
+        pid: "4242", ts: 1700000000, src: "memfd", result: "clean", app: "com.foo:my proc", lib: "libsecmon.so",
+    });
+    assert.equal(parseHistoryLine("1" + sep + "42"), null);
+    assert.equal(parseHistoryLine(["2", "42", "1", "a", "b", "c", "d"].join(sep)), null);
+    assert.equal(parseHistoryLine(["1", "NaN", "1", "a", "b", "c", "d"].join(sep)), null);
+    assert.equal(parseHistoryLine(""), null);
+});
+
 test("hashCheckSnippet expands shell paths, quotes the digest", () => {
     const s = hashCheckSnippet('"$S/f.so.xz"', "AB".repeat(32), B);
     assert.ok(s.includes('sha256sum "$S/f.so.xz"'));
@@ -211,4 +235,28 @@ test("pair sweep keeps only charset-safe basenames", () => {
     assert.ok(cmd.includes("libsecmon_a.so"));
     assert.ok(!cmd.includes("evil"));
     assert.ok(!cmd.includes("a b"));
+});
+
+test("parseDoctorOutput splits abi, libs, and cfg bodies", () => {
+    const d = parseDoctorOutput(
+        "ABI:arm64-v8a\n" +
+        "LIB|/a/lib.so|b700\n" +
+        "LIB|/b/missing.so|MISSING\n" +
+        "CFG|shared|/d/libsecmon.config.so\n" +
+        '{"a":1}\n' +
+        "CFG|27043|/d/libsecmon_x.config.so\n" +
+        "{\n" +
+        '"port": 1\n' +
+        "}\n",
+    );
+    assert.equal(d.abi, "arm64-v8a");
+    assert.deepEqual(d.libs, [
+        { path: "/a/lib.so", mach: "b700" },
+        { path: "/b/missing.so", mach: "MISSING" },
+    ]);
+    assert.equal(d.cfgs.length, 2);
+    assert.equal(d.cfgs[0].port, "shared");
+    assert.equal(d.cfgs[0].body, '{"a":1}');
+    assert.equal(d.cfgs[1].body, '{\n"port": 1\n}');
+    assert.deepEqual(parseDoctorOutput(""), { abi: "", libs: [], cfgs: [] });
 });

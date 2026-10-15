@@ -329,6 +329,90 @@ export function nextFreeGadgetPort(targets: Array<{ gadget_port?: unknown }>, ba
     return null;
 }
 
+// ELF machine of two little-endian bytes (`od -A n -t x1 -j 18 -N 2` with
+// blanks stripped): `b700` is AArch64, `2800` is 32-bit ARM.
+export function elfArch(hex: unknown): "arm64" | "arm" | null {
+    var h = String(hex == null ? "" : hex).trim().toLowerCase();
+    if (h === "b700") return "arm64";
+    if (h === "2800") return "arm";
+    return null;
+}
+
+// One `\x1f`-separated history line (`1\x1fpid\x1fts\x1fsrc\x1fresult…`,
+// space-padded to 256 bytes by the module). Leading partial chunks from
+// `tail -c` fail the field count and are skipped by the caller.
+export interface HistoryEntry {
+    pid: string;
+    ts: number;
+    src: string;
+    result: string;
+    app: string;
+    lib: string;
+}
+
+export function parseHistoryLine(line: string): HistoryEntry | null {
+    var fields = String(line == null ? "" : line).replace(/\s+$/, "").split("");
+    if (fields.length !== 7 || fields[0] !== "1") return null;
+    var ts = Number(fields[2]);
+    if (!fields[1] || !/^[0-9]+$/.test(fields[1]) || !isFinite(ts)) return null;
+    if (!fields[3] || !fields[4] || !fields[5] || !fields[6]) return null;
+    return { pid: fields[1], ts: ts, src: fields[3], result: fields[4], app: fields[5], lib: fields[6] };
+}
+
+export interface DoctorLib {
+    path: string;
+    mach: string;
+}
+
+export interface DoctorCfg {
+    port: string;
+    path: string;
+    body: string;
+}
+
+export interface DoctorData {
+    abi: string;
+    libs: DoctorLib[];
+    cfgs: DoctorCfg[];
+}
+
+// One shell roundtrip serves the target doctor: `ABI:<abi>` plus
+// `LIB|<path>|<machine|MISSING>` lines, then `CFG|<port|shared>|<path>`
+// headers each followed by that file's raw JSON lines.
+export function parseDoctorOutput(stdout: string): DoctorData {
+    var data: DoctorData = { abi: "", libs: [], cfgs: [] };
+    var cur: DoctorCfg | null = null;
+    String(stdout || "").split("\n").forEach(function (raw) {
+        var line = raw.replace(/\r$/, "");
+        if (line.indexOf("ABI:") === 0) {
+            data.abi = line.slice(4).trim();
+            cur = null;
+            return;
+        }
+        if (line.indexOf("LIB|") === 0) {
+            var rest = line.slice(4);
+            var cut = rest.lastIndexOf("|");
+            if (cut > 0) data.libs.push({ path: rest.slice(0, cut), mach: rest.slice(cut + 1) });
+            cur = null;
+            return;
+        }
+        if (line.indexOf("CFG|") === 0) {
+            var head = line.slice(4);
+            var sep = head.indexOf("|");
+            if (sep > 0) {
+                cur = { port: head.slice(0, sep), path: head.slice(sep + 1), body: "" };
+                data.cfgs.push(cur);
+            } else {
+                cur = null;
+            }
+            return;
+        }
+        if (cur) cur.body += (cur.body ? "\n" : "") + line;
+    });
+    data.cfgs.forEach(function (c) { c.body = c.body.trim(); });
+    return data;
+}
+
 // Distinct app names sanitizing to one pair basename (e.g. `a:b` vs `a_b`).
 // Only port-enabled targets materialize pair files, so only they can clash.
 export function pairStemCollisions(targets: Array<{ app_name?: unknown; gadget_port?: unknown }>): string[] {
