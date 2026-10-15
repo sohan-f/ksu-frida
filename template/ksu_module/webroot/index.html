@@ -3,8 +3,12 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' ksu: data:; style-src 'unsafe-inline'; script-src 'self'; font-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' ksu: data:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'">
     <title>KsuFrida</title>
+    <!-- Manager-served stylesheet: requesting it turns on edge-to-edge drawing
+         and defines --safe-area-inset-* so the page background fills the system
+         bars. A plain 404 off-manager (e.g. the desktop preview) is harmless. -->
+    <link rel="stylesheet" type="text/css" href="/internal/insets.css">
     <style>
         /* Roboto Flex variable (latin) is bundled so the offline WebUI needs
            no network. OFL-1.1, (c) Google; source: github.com/google/fonts. */
@@ -72,6 +76,8 @@
             background: var(--bg);
             color: var(--text);
             padding: 16px;
+            padding-top: calc(16px + var(--safe-area-inset-top, env(safe-area-inset-top, 0px)));
+            padding-bottom: calc(16px + var(--safe-area-inset-bottom, env(safe-area-inset-bottom, 0px)));
             line-height: 1.45;
             display: flex;
             justify-content: center;
@@ -363,7 +369,7 @@
         .savepill {
             position: fixed;
             left: 50%;
-            bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+            bottom: calc(16px + var(--safe-area-inset-bottom, env(safe-area-inset-bottom, 0px)));
             transform: translate(-50%, 8px) scale(.96);
             display: flex;
             opacity: 0;
@@ -570,7 +576,7 @@
                 border-left: none;
                 border-right: none;
                 border-bottom: none;
-                padding-bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+                padding-bottom: calc(16px + var(--safe-area-inset-bottom, env(safe-area-inset-bottom, 0px)));
                 animation: sheet-in var(--dur-spatial-fast) var(--ease-spatial-fast);
             }
             .modal-overlay.closing .modal { animation: sheet-out var(--dur-effects-default) var(--ease-exit) forwards; }
