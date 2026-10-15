@@ -198,11 +198,12 @@ frida -H 127.0.0.1:27043 -n Gadget
 ## Activity history
 
 While verbose logging is on, every injection appends one 256-byte record to
-`/data/local/tmp/libsec/.history`: app, pid, library, load path (`memfd`,
-`staged`, or `file`), and the hide-verify result. The WebUI Activity card
-shows recent records, answering "did it inject?" without logcat.
+a `.history` file in that app's own cache dir: app, pid, library, load path
+(`memfd`, `staged`, or `file`), and the hide-verify result. The WebUI
+Activity card shows recent records, answering "did it inject?" without
+logcat.
 
 The file is off by default (it names injected apps, so it stays a
-diagnostic aid, not a stealth feature), holds at most 256 records, and is
-world-appendable so every app UID can record. Fork children never write.
-Clear it from the WebUI or with `rm /data/local/tmp/libsec/.history`.
+diagnostic aid, not a stealth feature) and holds at most 256 records per
+app. Fork children never write. Clear it from the WebUI or by deleting the
+`.history` files under the app cache dirs.

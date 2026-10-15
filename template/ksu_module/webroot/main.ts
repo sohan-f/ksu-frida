@@ -13,7 +13,6 @@ const GADGET_API_URL = "https://api.github.com/repos/sohan-f/knox-frida-patcher/
 const GADGET_DL_DIR = "/data/local/tmp/libsec/.webui-gadget-dl";
 const GADGET_DL_LOG = "/data/local/tmp/libsec/.webui-gadget-dl.tmp";
 const VERBOSE_PATH = "/data/local/tmp/libsec/verbose";
-const HISTORY_PATH = "/data/local/tmp/libsec/.history";
 const LIBSEC_DIR = "/data/local/tmp/libsec";
 const GADGET32_PATH = "/data/local/tmp/libsec/libsecmon32.so";
 const DEFAULT_GADGET = '{"interaction":{"type":"listen","address":"127.0.0.1","port":27042,"on_port_conflict":"pick-next"}}';
@@ -633,7 +632,8 @@ async function refreshLogs() {
 async function refreshHistory() {
     setBusy("btn-history", true);
     try {
-        var r = await exec("tail -c 51200 " + shQuote(HISTORY_PATH) + " 2>/dev/null");
+        var r = await exec("for d in /data/user/0/*/.cache /data/data/*/.cache; do " +
+            "f=\"$d/.history\"; [ -f \"$f\" ] && cat \"$f\"; done 2>/dev/null | tail -c 51200");
         var body = getEl("history-body");
         body.innerHTML = "";
         if (execMode === "none") {
@@ -646,13 +646,14 @@ async function refreshHistory() {
             var e = parseHistoryLine(line);
             if (e) entries.push(e);
         });
+        entries.sort(function (a, b) { return b.ts - a.ts; });
         clearSlotIf("history-status", "history");
         if (entries.length === 0) {
             body.className = "empty";
             body.textContent = "No injections recorded. Enable verbose logging and restart a target.";
             return;
         }
-        entries.slice(-20).reverse().forEach(function (e) {
+        entries.slice(0, 20).forEach(function (e) {
             var row = document.createElement("div");
             row.className = "slotrow";
             var s = document.createElement("span");
@@ -670,7 +671,7 @@ async function refreshHistory() {
 }
 
 async function clearHistory() {
-    await exec("rm -f " + shQuote(HISTORY_PATH));
+    await exec("rm -f /data/user/0/*/.cache/.history /data/data/*/.cache/.history 2>/dev/null");
     refreshHistory();
 }
 

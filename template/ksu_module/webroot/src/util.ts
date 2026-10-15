@@ -189,9 +189,6 @@ export function hashCheckSnippet(shellPath: string, hash: string, busyboxBin: st
         "[ \"$H\" = " + shQuote(hash.toLowerCase()) + " ]; }";
 }
 
-// One trailing `*` marks a package-prefix target (`com.foo*` covers the
-// base package and its `:process` children). Anything else holding `*`
-// is not a wildcard; callers treat it literally.
 export function wildcardPrefix(name: unknown): string | null {
     if (typeof name !== "string" || name.length < 2) return null;
     if (name.charAt(name.length - 1) !== "*") return null;
@@ -233,8 +230,6 @@ export function parsePorts(lines: string[]) {
 
 // Parses `<process> <pid>` lines from the status poll. The name runs to the
 // last blank (process names may hold spaces); the pid must be numeric.
-// Wildcard targets collect every process under their prefix, keyed by the
-// target pattern so pills keep working for `com.foo*` entries.
 export function parseTargetStatus(stdout: string, names: string[]): Record<string, string[]> {
     var out: Record<string, string[]> = {};
     var prefixes: Array<{ pattern: string; prefix: string }> = [];
@@ -314,8 +309,6 @@ export function findDuplicateGadgetPorts(targets: Array<{ gadget_port?: unknown 
     return dups;
 }
 
-// Smallest port at or above `base` no target holds, or null when the
-// range is exhausted. Backs the "assign next free port" button.
 export function nextFreeGadgetPort(targets: Array<{ gadget_port?: unknown }>, base?: number): number | null {
     var start = parseGadgetPort(base) || 27042;
     var used: Record<number, boolean> = {};
@@ -329,8 +322,6 @@ export function nextFreeGadgetPort(targets: Array<{ gadget_port?: unknown }>, ba
     return null;
 }
 
-// ELF machine of two little-endian bytes (`od -A n -t x1 -j 18 -N 2` with
-// blanks stripped): `b700` is AArch64, `2800` is 32-bit ARM.
 export function elfArch(hex: unknown): "arm64" | "arm" | null {
     var h = String(hex == null ? "" : hex).trim().toLowerCase();
     if (h === "b700") return "arm64";
@@ -338,9 +329,6 @@ export function elfArch(hex: unknown): "arm64" | "arm" | null {
     return null;
 }
 
-// One `\x1f`-separated history line (`1\x1fpid\x1fts\x1fsrc\x1fresult…`,
-// space-padded to 256 bytes by the module). Leading partial chunks from
-// `tail -c` fail the field count and are skipped by the caller.
 export interface HistoryEntry {
     pid: string;
     ts: number;
@@ -376,9 +364,6 @@ export interface DoctorData {
     cfgs: DoctorCfg[];
 }
 
-// One shell roundtrip serves the target doctor: `ABI:<abi>` plus
-// `LIB|<path>|<machine|MISSING>` lines, then `CFG|<port|shared>|<path>`
-// headers each followed by that file's raw JSON lines.
 export function parseDoctorOutput(stdout: string): DoctorData {
     var data: DoctorData = { abi: "", libs: [], cfgs: [] };
     var cur: DoctorCfg | null = null;
