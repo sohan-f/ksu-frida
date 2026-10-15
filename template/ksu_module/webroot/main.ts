@@ -46,6 +46,7 @@ import {
     parseHistoryLine,
     parseJson,
     parseLabelLines,
+    parsePackageNameList,
     parsePorts,
     parseTargetStatus,
     pairsFromPackagesInfo,
@@ -704,7 +705,10 @@ function readAppsCache(): AppsCache | null {
         var labels: Record<string, string> = {};
         if (data.labels && typeof data.labels === "object" && !Array.isArray(data.labels)) {
             Object.keys(data.labels).forEach(function (pkg) {
-                if (typeof data.labels[pkg] === "string") labels[pkg] = data.labels[pkg];
+                var label = data.labels[pkg];
+                // A label equal to its package name is the signature of the
+                // old fake-fill; drop it so the row is resolved again.
+                if (typeof label === "string" && label && label !== pkg) labels[pkg] = label;
             });
         }
         return { packages: data.packages, labels: labels };
@@ -726,15 +730,15 @@ function sortApps() {
     });
 }
 
-function nativeListFn(): (() => unknown) | null {
+// The manager injects `ksu` late, so bridge lookups return null only when the
+// interface is genuinely absent, never because it has not appeared yet.
+function bridgeListFn(): ((scope: string) => unknown) | null {
     if (typeof ksu === "undefined") return null;
     if (typeof ksu.listPackages === "function") {
-        const list: (scope: string) => unknown = ksu.listPackages;
-        return function () { return list("user"); };
+        return function (scope: string) { return ksu.listPackages!(scope); };
     }
     if (typeof ksu.listUserPackages === "function") {
-        const listUser: () => unknown = ksu.listUserPackages;
-        return function () { return listUser(); };
+        return function (_scope: string) { return ksu.listUserPackages!(); };
     }
     return null;
 }
@@ -744,23 +748,13 @@ function nativeLabelsAvailable() {
 }
 
 async function listPackageNames(): Promise<string[]> {
-    // Cold WebViews answer empty at first; retry before shell fallback.
-    var fn = nativeListFn();
+    var fn = bridgeListFn();
     if (fn) {
-        for (var attempt = 0; attempt < 6; attempt++) {
-            var names: string[] | null = null;
-            try {
-                names = parseJson<string[] | null>(fn(), null);
-            } catch (_) {
-                names = null;
-            }
-            if (Array.isArray(names)) {
-                names = names.filter(function (name): name is string {
-                    return typeof name === "string" && name.length > 0;
-                });
-                if (names.length > 0) return names;
-            }
-            await delay(400);
+        // Cold WebViews answer empty at first; retry before shell fallback.
+        for (var attempt = 0; attempt < 8; attempt++) {
+            var names = parsePackageNameList(fn("user"));
+            if (names.length > 0) return names;
+            await delay(350);
         }
     }
 
@@ -803,26 +797,19 @@ async function resolveLabels(pkgs: string[], allowShell: boolean, fullSweep?: bo
     return labelsChain;
 }
 
-// One native label chunk; null on any bridge failure so the caller
-// retries it instead of silently keeping the package name. Tries the README
-// array form first, then the `kernelsu` lib stringified form; results may be
-// a native array or a JSON string and both are accepted.
+// One native label chunk through the stringified query form the manager's
+// Java bridge takes (`getPackagesInfo(String)`); null on any bridge failure
+// so the caller retries it. Rows the manager could not label are dropped by
+// the parser and stay missing instead of becoming their own package name.
 function nativeLabelChunk(chunk: string[]): Map<string, string> | null {
+    if (!nativeLabelsAvailable()) return null;
+    var raw: unknown;
     try {
-        var getInfo = ksu.getPackagesInfo;
-        if (!getInfo) return null;
-        try {
-            var direct = pairsFromPackagesInfo(parseJson((getInfo as (q: string[]) => unknown)(chunk), null));
-            if (direct.size > 0) return direct;
-        } catch (_) {}
-        return pairsFromPackagesInfo(parseJson((getInfo as (q: string) => unknown)(JSON.stringify(chunk)), null));
+        raw = ksu.getPackagesInfo!(JSON.stringify(chunk));
     } catch (_) {
         return null;
     }
-}
-
-function labeledCount(pkgs: string[]) {
-    return pkgs.filter(function (p) { return !!appLabels[p]; }).length;
+    return pairsFromPackagesInfo(parseJson<unknown>(raw, null));
 }
 
 async function resolveLabelsNow(pkgs: string[], allowShell: boolean, fullSweep?: boolean) {
@@ -833,7 +820,7 @@ async function resolveLabelsNow(pkgs: string[], allowShell: boolean, fullSweep?:
         labelsPending = true;
         updateAppHint();
         try {
-            // Two passes: the second retries errored chunks once.
+            // Two passes: the second re-asks for rows the manager skipped.
             for (var pass = 0; pass < 2; pass++) {
                 var todo = missing.filter(function (p) { return !appLabels[p]; });
                 if (todo.length === 0) break;
@@ -849,9 +836,10 @@ async function resolveLabelsNow(pkgs: string[], allowShell: boolean, fullSweep?:
             updateAppHint();
             if (isAppModalOpen()) renderAppList();
         }
-        // Native resolved something: done. Total native failure falls
-        // through to shell below instead of stranding package names.
-        if (labeledCount(missing) > 0) return;
+        // Whatever is still missing was never labeled by the manager; the
+        // shell tier below gets that remainder instead of stranding it.
+        missing = missing.filter(function (p) { return !appLabels[p]; });
+        if (missing.length === 0) return;
     }
 
     if (!allowShell) return;
@@ -918,9 +906,7 @@ async function fetchApps(force?: boolean) {
             appsLoading = false;
             updateAppHint();
 
-            await resolveLabels(allApps, false);
-
-            if (isAppModalOpen() && !nativeLabelsAvailable()) resolveLabels(allApps, true, true);
+            await resolveLabels(allApps, true, true);
         } catch (e) {
             console.error("fetchApps failed", e);
         } finally {
@@ -1672,7 +1658,7 @@ function showAppList() {
     textEl("app-search").value = "";
     fetchApps();
     renderAppList();
-    if (!nativeLabelsAvailable() && !labelsTried && !labelsPending && allApps.length > 0) {
+    if (!labelsTried && !labelsPending && allApps.length > 0) {
         resolveLabels(allApps, true, true);
     }
 }

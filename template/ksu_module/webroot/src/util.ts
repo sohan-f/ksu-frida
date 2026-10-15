@@ -5,9 +5,9 @@
 // callback)` with `window[callback](errno, stdout, stderr)`,
 // `ksu.listPackages(type)` returning a JSON string, and
 // `ksu.getPackagesInfo(JSON.stringify(packages))` returning a JSON string.
-// This WebUI additionally tolerates managers that return/accept native
-// arrays (README prose form), so both shapes are accepted wherever a
-// bridge value is parsed or passed.
+// Only the stringified query form is used: the manager's Java bridge takes a
+// `String`, so a native array argument is a dead roundtrip, not a shortcut.
+// List and info results still tolerate native arrays (README prose form).
 export interface GatingLib {
     path: string;
 }
@@ -72,6 +72,18 @@ export const SCAN_FILE = "/data/local/tmp/libsec/.webui-scan.tmp";
 export const PKGS_FILE = "/data/local/tmp/libsec/.webui-packages.tmp";
 export const POLL_INTERVAL_MS = 1000;
 
+// `listPackages` result (JSON string or native array) to package names.
+// Junk entries are dropped so an unusable answer reads as empty, not fake.
+export function parsePackageNameList(raw: unknown): string[] {
+    var list = parseJson<unknown>(raw, null);
+    if (!Array.isArray(list)) return [];
+    var out: string[] = [];
+    list.forEach(function (p) {
+        if (typeof p === "string" && p) out.push(p);
+    });
+    return out;
+}
+
 export function parseLabelLines(body: string) {
     var pairs = new Map<string, string>();
     body.split("\n").forEach(function (line: string) {
@@ -88,16 +100,19 @@ export interface PackagesInfoRow {
     error?: unknown;
 }
 
-// Native getPackagesInfo rows to label pairs. Error rows stay missing
-// so the caller retries them; labels fall back to the package name.
+// Native getPackagesInfo rows to label pairs. A row only lands when the
+// manager resolved a real label: error rows, junk rows, and rows without
+// `appLabel` stay missing so the caller retries them instead of caching the
+// package name as its own label.
 export function pairsFromPackagesInfo(info: unknown) {
     var pairs = new Map<string, string>();
     if (!Array.isArray(info)) return pairs;
     (info as PackagesInfoRow[]).forEach(function (it) {
         if (!it || typeof it !== "object" || it.error) return;
         if (typeof it.packageName !== "string" || !it.packageName) return;
-        pairs.set(it.packageName,
-            typeof it.appLabel === "string" && it.appLabel ? it.appLabel : it.packageName);
+        if (typeof it.appLabel !== "string") return;
+        var label = it.appLabel.replace(/^\s+|\s+$/g, "");
+        if (label) pairs.set(it.packageName, label);
     });
     return pairs;
 }

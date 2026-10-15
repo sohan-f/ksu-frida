@@ -15,6 +15,7 @@ import {
     parseHistoryLine,
     parseJson,
     parseLabelLines,
+    parsePackageNameList,
     parsePorts,
     parseTargetStatus,
     pairsFromPackagesInfo,
@@ -83,21 +84,32 @@ test("parseLabelLines skips marks and malformed rows", () => {
     assert.equal(m.has("broken"), false);
 });
 
-test("pairsFromPackagesInfo skips errors, falls back to package", () => {
+test("pairsFromPackagesInfo keeps only rows with a resolved label", () => {
     const m = pairsFromPackagesInfo([
         { packageName: "com.a", appLabel: "A" },
         { packageName: "com.b" },
         { packageName: "com.c", appLabel: "", error: "x" },
         { packageName: "com.d", appLabel: "D", error: "x" },
+        { packageName: "com.e", appLabel: "  " },
+        { packageName: "com.f", appLabel: " F " },
         null,
         "junk",
     ]);
     assert.equal(m.get("com.a"), "A");
-    assert.equal(m.get("com.b"), "com.b");
+    assert.equal(m.has("com.b"), false);
     assert.equal(m.has("com.c"), false);
     assert.equal(m.has("com.d"), false);
+    assert.equal(m.has("com.e"), false);
+    assert.equal(m.get("com.f"), "F");
     assert.equal(pairsFromPackagesInfo(null).size, 0);
     assert.equal(pairsFromPackagesInfo("[]").size, 0);
+});
+
+test("parsePackageNameList accepts string and native array forms", () => {
+    assert.deepEqual(parsePackageNameList('["com.a","com.b"]'), ["com.a", "com.b"]);
+    assert.deepEqual(parsePackageNameList(["com.a", 7, "", null]), ["com.a"]);
+    assert.deepEqual(parsePackageNameList("not json"), []);
+    assert.deepEqual(parsePackageNameList(null), []);
 });
 
 test("parsePorts keeps valid ports only", () => {
