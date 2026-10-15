@@ -656,8 +656,9 @@ async function refreshHistory() {
             var row = document.createElement("div");
             row.className = "slotrow";
             var s = document.createElement("span");
-            if (e.result === "clean") s.className = "status-ok";
-            else if (e.result.indexOf("leak") === 0 || e.result === "failed") s.className = "status-err";
+            s.className = "sub";
+            if (e.result === "clean") s.className += " status-ok";
+            else if (e.result.indexOf("leak") === 0 || e.result === "failed") s.className += " status-err";
             s.textContent = e.app + " · pid " + e.pid + " · " + e.lib + " · " + e.src + " · " + e.result +
                 " · " + new Date(e.ts * 1000).toLocaleString();
             row.appendChild(s);
@@ -2388,7 +2389,7 @@ function renderDoctorRows(rows: Array<{ tone: UpdateTone; text: string }>) {
         var row = document.createElement("div");
         row.className = "slotrow";
         var s = document.createElement("span");
-        s.className = r.tone;
+        s.className = "sub " + r.tone;
         s.textContent = r.text;
         row.appendChild(s);
         body.appendChild(row);
