@@ -67,7 +67,7 @@ fn enable_atfork_reset() {
     });
 }
 
-// Kill/Freeze/Pass allocate nothing and log nothing: the child inherits every lock held at fork time.
+// Kill/Stop/Freeze/Pass allocate nothing and log nothing: the child inherits every lock held at fork time.
 // Inject reuses parent-prepared strings and stays silent (child-quiet logs cover
 // every verbose gate); staging allocs and dlopen remain, so it stays best-effort.
 fn run_child_action(action: ChildMode, libraries: &[String], app_name: &str) -> libc::pid_t {
@@ -79,6 +79,12 @@ fn run_child_action(action: ChildMode, libraries: &[String], app_name: &str) -> 
         ChildMode::Freeze => loop {
             thread::sleep(Duration::from_secs(3600));
         },
+        ChildMode::Stop => {
+            // SAFETY: `raise(3)` sends to the calling thread with no alloc; SIGSTOP
+            // parks the child until `kill -CONT`, then the fork returns normally.
+            unsafe { libc::raise(libc::SIGSTOP) };
+            0
+        }
         ChildMode::Inject => {
             if libraries.is_empty() {
                 return 0;
@@ -333,6 +339,7 @@ mod tests {
     fn child_mode_parse_matches_the_config_names() {
         assert_eq!(ChildMode::parse("kill"), Some(ChildMode::Kill));
         assert_eq!(ChildMode::parse("freeze"), Some(ChildMode::Freeze));
+        assert_eq!(ChildMode::parse("stop"), Some(ChildMode::Stop));
         assert_eq!(ChildMode::parse("inject"), Some(ChildMode::Inject));
         assert_eq!(ChildMode::parse(""), None);
         assert_eq!(ChildMode::parse("kilo"), None);
@@ -480,5 +487,36 @@ mod tests {
             libc::WIFSIGNALED(status),
             "the freeze child must still have been alive to kill"
         );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn stop_child_parks_until_continued() {
+        // SAFETY: plain fork; only the calling thread exists in the child.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork(2)");
+        if child == 0 {
+            run_child_action(ChildMode::Stop, &[], "");
+            // SAFETY: child-only path; resumed after SIGCONT lands here.
+            unsafe { libc::_exit(7) };
+        }
+
+        let mut status = 0;
+        // SAFETY: `WUNTRACED` reports the expected SIGSTOP so the child never runs free.
+        let seen = unsafe { libc::waitpid(child, &raw mut status, libc::WUNTRACED) };
+        assert_eq!(seen, child);
+        assert!(
+            libc::WIFSTOPPED(status),
+            "the stop child must park instead of exiting"
+        );
+        // SAFETY: the child is ours and currently stopped.
+        unsafe { libc::kill(child, libc::SIGCONT) };
+        // SAFETY: blocking reap of our own child; it exits after resume.
+        unsafe { libc::waitpid(child, &raw mut status, 0) };
+        assert!(
+            libc::WIFEXITED(status),
+            "the resumed stop child must exit normally"
+        );
+        assert_eq!(libc::WEXITSTATUS(status), 7);
     }
 }

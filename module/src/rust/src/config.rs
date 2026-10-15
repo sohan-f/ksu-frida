@@ -13,6 +13,7 @@ pub const MAX_START_UP_DELAY_MS: u64 = 60_000;
 pub enum ChildMode {
     Kill,
     Freeze,
+    Stop,
     Inject,
     #[default]
     Pass,
@@ -31,6 +32,7 @@ impl std::str::FromStr for ChildMode {
         match mode {
             "kill" => Ok(Self::Kill),
             "freeze" => Ok(Self::Freeze),
+            "stop" => Ok(Self::Stop),
             "inject" => Ok(Self::Inject),
             _ => Err(()),
         }
@@ -124,7 +126,7 @@ fn deserialize_child_gating_config(value: &Value) -> Option<ChildGatingConfig> {
         return None;
     };
     let Some(mode) = ChildMode::parse(mode) else {
-        loge("invalid config: unknown child_gating.mode; expected kill, freeze, or inject");
+        loge("invalid config: unknown child_gating.mode; expected kill, freeze, stop, or inject");
         return None;
     };
     result.mode = mode;
@@ -174,6 +176,10 @@ fn deserialize_target_config(value: &Value) -> Option<TargetConfig> {
         loge("expected config target to have a valid app_name");
         return None;
     };
+    if app_name.contains('*') && wildcard_prefix(app_name).is_none() {
+        loge("invalid config: app_name wildcards must be one trailing *");
+        return None;
+    }
     result.app_name = app_name.to_string();
 
     // Optional fields default fail-closed; only wrong types reject the target.
@@ -267,6 +273,18 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|w| w[0] == first && w == needle)
 }
 
+fn wildcard_prefix(pattern: &str) -> Option<&str> {
+    let prefix = pattern.strip_suffix('*')?;
+    (!prefix.is_empty() && !prefix.contains('*')).then_some(prefix)
+}
+
+fn target_matches(pattern: &str, app_name: &str) -> bool {
+    match wildcard_prefix(pattern) {
+        Some(prefix) => app_name.starts_with(prefix),
+        None => pattern == app_name,
+    }
+}
+
 fn load_advanced_config(module_dir: &str, app_name: &str) -> AdvancedOutcome {
     if app_name.is_empty() {
         return AdvancedOutcome::Absent;
@@ -276,10 +294,14 @@ fn load_advanced_config(module_dir: &str, app_name: &str) -> AdvancedOutcome {
     };
 
     // Byte precheck skips the parse for non-targets. A miss is definitive
-    // only without backslashes: `\uXXXX` escapes decode to characters
-    // (e.g. `.`) that never appear literally, so files holding escapes
-    // take the slow path and parse anyway.
-    if !contains_bytes(&bytes, app_name.as_bytes()) && !bytes.contains(&b'\\') {
+    // only without backslashes or wildcards: `\uXXXX` escapes decode to
+    // characters (e.g. `.`) that never appear literally, and a `com.foo*`
+    // entry never holds the full `com.foo:remote` name, so files holding
+    // either take the slow path and parse anyway.
+    if !contains_bytes(&bytes, app_name.as_bytes())
+        && !bytes.contains(&b'\\')
+        && !bytes.contains(&b'*')
+    {
         return AdvancedOutcome::Absent;
     }
 
@@ -306,9 +328,24 @@ fn load_advanced_config(module_dir: &str, app_name: &str) -> AdvancedOutcome {
         return AdvancedOutcome::Absent;
     };
 
+    // Exact targets win over wildcards so a `com.foo` entry keeps
+    // precedence when both it and `com.foo*` are configured.
     for target in targets {
         // Name match first: a malformed unrelated entry must stay silent.
         if target.get("app_name").and_then(Value::as_str) != Some(app_name) {
+            continue;
+        }
+        if let Some(deserialized) = deserialize_target_config(target) {
+            return AdvancedOutcome::Resolved(deserialized);
+        }
+        return AdvancedOutcome::Rejected;
+    }
+
+    for target in targets {
+        let Some(pattern) = target.get("app_name").and_then(Value::as_str) else {
+            continue;
+        };
+        if wildcard_prefix(pattern).is_none() || !target_matches(pattern, app_name) {
             continue;
         }
         if let Some(deserialized) = deserialize_target_config(target) {
@@ -715,5 +752,74 @@ mod tests {
         assert!(!contains_bytes(hay, b"com.example.approx"));
         assert!(!contains_bytes(b"short", b"much longer needle"));
         assert!(!contains_bytes(b"", b"a"));
+    }
+
+    #[test]
+    fn wildcard_matches_package_processes() {
+        let dir = TempDir::new("wildcard");
+        fs::write(
+            dir.join("config.json"),
+            r#"{"targets":[{"app_name":"com.foo*","enabled":true,
+                "start_up_delay_ms":0,"injected_libraries":[]}]}"#,
+        )
+        .unwrap();
+        assert!(load_config(dir.to_str().unwrap(), "com.foo").is_some());
+        assert!(load_config(dir.to_str().unwrap(), "com.foo:remote").is_some());
+        assert!(load_config(dir.to_str().unwrap(), "com.bar").is_none());
+    }
+
+    #[test]
+    fn exact_name_never_matches_foreign_package() {
+        let dir = TempDir::new("no-implicit");
+        fs::write(
+            dir.join("config.json"),
+            r#"{"targets":[{"app_name":"com.foo","enabled":true,
+                "start_up_delay_ms":0,"injected_libraries":[]}]}"#,
+        )
+        .unwrap();
+        assert!(load_config(dir.to_str().unwrap(), "com.foo:remote").is_none());
+        assert!(load_config(dir.to_str().unwrap(), "com.foobar").is_none());
+    }
+
+    #[test]
+    fn exact_target_wins_over_wildcard() {
+        let dir = TempDir::new("exact-wins");
+        fs::write(
+            dir.join("config.json"),
+            r#"{"targets":[
+                {"app_name":"com.foo*","enabled":true,
+                "start_up_delay_ms":111,"injected_libraries":[]},
+                {"app_name":"com.foo","enabled":true,
+                "start_up_delay_ms":222,"injected_libraries":[]}]}"#,
+        )
+        .unwrap();
+        let cfg = load_config(dir.to_str().unwrap(), "com.foo").expect("config");
+        assert_eq!(cfg.start_up_delay_ms, 222);
+        let child = load_config(dir.to_str().unwrap(), "com.foo:push").expect("child");
+        assert_eq!(child.start_up_delay_ms, 111);
+    }
+
+    #[test]
+    fn misplaced_stars_are_rejected() {
+        for pattern in ["*", "com.foo**", "com.*foo", "*com.foo"] {
+            assert!(wildcard_prefix(pattern).is_none(), "{pattern}");
+            assert!(!target_matches(pattern, "com.foo"), "{pattern}");
+        }
+        assert_eq!(wildcard_prefix("com.foo*"), Some("com.foo"));
+        assert!(target_matches("com.foo*", "com.foo"));
+        assert!(target_matches("com.foo*", "com.foo:remote"));
+        assert!(!target_matches("com.foo*", "com.bar"));
+    }
+
+    #[test]
+    fn wildcard_match_survives_the_byte_precheck() {
+        let dir = TempDir::new("wildcard-precheck");
+        fs::write(
+            dir.join("config.json"),
+            r#"{"targets":[{"app_name":"com.foo*","enabled":true,
+                "start_up_delay_ms":0,"injected_libraries":[]}]}"#,
+        )
+        .unwrap();
+        assert!(load_config(dir.to_str().unwrap(), "com.foo:remote").is_some());
     }
 }
