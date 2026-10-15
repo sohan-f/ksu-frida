@@ -121,6 +121,8 @@ const APPS_CACHE_KEY = "ksufrida.apps.v1";
 const GADGET_VERSION_KEY = "ksufrida.gadgetver.v1";
 const APP_BATCH = 50;
 const LABEL_CHUNK = 100;
+// Kept in sync with the `.pressed` rules in index.html.
+const PRESSED_SELECTOR = ".target-row, .btn, .seg-btn, .app-row";
 let appsLoading = false;
 let labelsPending = false;
 let labelsTried = false;
@@ -1804,6 +1806,14 @@ window.onload = function () {
         if (el && el.id === "lib-modal") closeLibPicker();
     };
     getEl("app-list").onclick = openAppFromRow;
+    // Pressed-state lifecycle shared by rows and buttons; see .pressed rules.
+    document.addEventListener("pointerdown", function (e) {
+        var el = e.target as HTMLElement | null;
+        var hit = el && el.closest ? el.closest(PRESSED_SELECTOR) : null;
+        if (hit) hit.classList.add("pressed");
+    }, true);
+    document.addEventListener("pointerup", clearPressed, true);
+    document.addEventListener("pointercancel", clearPressed, true);
     // CSP-safe icon cleanup: `ksu://icon/` 404s off-device and for iconless
     // packages; capture-phase delegation removes them without inline handlers.
     document.addEventListener("error", function (e) {
@@ -1853,6 +1863,11 @@ window.onload = function () {
 function scheduleStatus() {
     if (statusTimer) return;
     statusTimer = setTimeout(function () { statusTimer = null; loadStatus(); }, 80);
+}
+
+function clearPressed() {
+    var els = document.querySelectorAll(PRESSED_SELECTOR);
+    for (var i = 0; i < els.length; i++) els[i].classList.remove("pressed");
 }
 
 function scheduleRenderTargets() {

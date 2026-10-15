@@ -214,7 +214,10 @@
             from { opacity: 0; transform: translateY(8px) scale(.985); }
         }
 
-        .target-row:active { border-color: var(--border-strong); background: var(--surface); }
+        /* Pressed look is a class, not :active: Chromium's Android WebView
+           leaves :active stuck after a tap until the next touch.
+           Pressed-selector list must stay in sync with PRESSED_SELECTOR. */
+        .target-row.pressed { border-color: var(--border-strong); background: var(--surface); }
 
         .target-row:last-child { margin-bottom: 0; }
 
@@ -262,7 +265,7 @@
 
         .seg-on { background: var(--accent); color: var(--accent-ink); }
 
-        .seg-btn:not(.seg-on):active { background: rgba(241,236,236,.07); transform: scale(.97); }
+        .seg-btn:not(.seg-on).pressed { background: rgba(241,236,236,.07); transform: scale(.97); }
 
         .lib-list { display: flex; flex-direction: column; gap: 8px; }
 
@@ -355,12 +358,12 @@
                 transform var(--dur-effects-fast) var(--ease-effects-fast);
         }
 
-        .btn:active { background: rgba(241,236,236,.06); transform: scale(.97); }
+        .btn.pressed { background: rgba(241,236,236,.06); transform: scale(.97); }
         .btn:focus-visible { outline: 2px solid var(--accent-focus); outline-offset: 1px; }
 
         .btn-sm { padding: 4px 12px; font-size: 12px; min-height: 32px; }
         .btn-primary { background: var(--accent); border-color: transparent; color: var(--accent-ink); }
-        .btn-primary:active { background: var(--accent-pressed); }
+        .btn-primary.pressed { background: var(--accent-pressed); }
         .btn-danger { background: var(--danger-container); border-color: var(--danger-border); color: var(--danger-ink); }
         .btn-success { background: var(--success-container); border-color: var(--success-border); color: var(--success-ink); }
         .btn:disabled { opacity: .55; cursor: wait; }
@@ -552,6 +555,12 @@
             flex-direction: column;
         }
 
+        /* Dialogs are focused programmatically (tabindex="-1", Escape
+           handling) and are never tab-reachable, so the UA focus ring is
+           only a stray first-open border: the ring shows until the first
+           tap, because :focus-visible then still matches script focus. */
+        .modal:focus { outline: none; }
+
         /* Compact phones: dialogs dock to a bottom sheet (M3: modal
            sheets are mobile-only, 28dp top radius, scrim dismisses). */
         @keyframes sheet-in {
@@ -613,7 +622,7 @@
         }
 
         .app-row:hover { background: var(--surface2); }
-        .app-row:active { transform: scale(.99); }
+        .app-row.pressed { transform: scale(.99); }
 
         /* Long package lists skip off-screen rendering; intrinsic size
            keeps the scrollbar stable. Unsupported WebViews ignore it. */
